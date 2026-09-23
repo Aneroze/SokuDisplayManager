@@ -108,6 +108,9 @@ static void logf(const char *fmt, ...) {
 	fflush(g_logFile);
 }
 
+// forward declarations (definitions live further down)
+static void installKeyboardHook();
+
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
 static Direct3DCreate9_t oDirect3DCreate9 = nullptr;
@@ -292,6 +295,7 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
                                      IDirect3DDevice9 **out) {
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+	installKeyboardHook();   // we're on the game's UI thread here - the right thread to hook
 	applyFullscreenParams(pp);
 	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	if (SUCCEEDED(hr) && out && *out) {
@@ -349,31 +353,37 @@ static void loadConfig() {
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
-// Polled with edge detection on a background thread (only while this game has foreground focus). The
-// change is applied live - it only affects the post-process output size, so no device reset is needed.
+// A WH_KEYBOARD hook on the game's UI thread (the same technique WindowResizer uses for its Alt+number
+// hotkeys). This fires for the game's own key messages, so it works in exclusive fullscreen - unlike a
+// GetAsyncKeyState poll, which the exclusive-fullscreen input path doesn't cooperate with. The change is
+// applied live: it only affects the post-process output size, so no device reset is needed.
+static HHOOK g_kbHook = nullptr;
+
+// lParam bit 30 = previous key state, bit 31 = transition. Both 0 means a fresh key-down (not a repeat
+// or a release).
+#define IS_FRESH_KEYDOWN(lp) (((lp) & (1 << 30)) == 0 && ((lp) & (1 << 31)) == 0)
+
 static void applyHotkey(int digit) {
 	if (digit == 0) { g_mode = MODE_FIT; logf("hotkey: Alt+0 -> FitToScreen"); }
 	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> IntegerScaling x%d", digit, digit); }
 	computeOutput();   // native size already known once we've gone fullscreen; no-op before then
 }
 
-static DWORD WINAPI hotkeyThread(LPVOID) {
-	const int vk[5] = { '0', '1', '2', '3', '4' };
-	bool prev[5] = { false, false, false, false, false };
-	while (true) {
-		bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-		DWORD fgpid = 0;
-		HWND fg = GetForegroundWindow();
-		if (fg) GetWindowThreadProcessId(fg, &fgpid);
-		bool focused = (fgpid == GetCurrentProcessId());
-		for (int i = 0; i < 5; i++) {
-			bool down = alt && focused && (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
-			if (down && !prev[i]) applyHotkey(i);
-			prev[i] = down;
-		}
-		Sleep(25);
+static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
+	if (code == HC_ACTION && wParam >= '0' && wParam <= '4' &&
+	    IS_FRESH_KEYDOWN(lParam) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+		applyHotkey((int)(wParam - '0'));
+		return 1; // eat the key so it doesn't leak to the game / system menu
 	}
-	return 0;
+	return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+// Install the keyboard hook on whatever thread calls this. CreateDevice runs on the game's UI thread, so
+// installing from there targets the right thread (as WindowResizer installs from CreateWindowExA).
+static void installKeyboardHook() {
+	if (g_kbHook) return;
+	g_kbHook = SetWindowsHookExA(WH_KEYBOARD, keyboardHook, g_module, GetCurrentThreadId());
+	logf("keyboard hook %s", g_kbHook ? "installed" : "FAILED");
 }
 
 static void setupHooks() {
@@ -394,10 +404,8 @@ extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hParentModule) {
 	g_module = hMyModule;
 	loadConfig();
-	if (g_enabled) {
-		setupHooks();
-		CloseHandle(CreateThread(nullptr, 0, hotkeyThread, nullptr, 0, nullptr));
-	}
+	if (g_enabled)
+		setupHooks();   // the keyboard hook is installed later, from CreateDevice (on the UI thread)
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	logf("ExclusiveFullscreen initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d",
