@@ -12,6 +12,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **Alt+1**…**Alt+6** — set IntegerScaling ×1…×6 in fullscreen, or resize the window to that scale (640×480 × N) when windowed.
 - **Alt+0** — FitToScreen.
 - **Alt+P** — toggle always-on-top.
+- **Alt+F** — cycle the upscale filter (Auto → Point → Linear) live.
 
 ## Install
 
@@ -41,7 +42,7 @@ All options live in `DisplayManager.ini`:
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
 
-The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`.
+The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`, `CycleFilter`.
 
 With `Borderless` available, this mod is a superset of WindowResizer — window sizing/positioning, borderless *and* exclusive fullscreen, always-on-top, and crisp integer scaling.
 

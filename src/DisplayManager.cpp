@@ -91,7 +91,7 @@ static FILE   *g_logFile   = nullptr;
 
 // Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
 // also what a commented-out / missing ini line produces).
-enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_COUNT };
+enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;      // the modifier held with each hotkey key
@@ -563,7 +563,7 @@ static void loadConfig() {
 	else                                                                    g_modifier = MODK_ALT;
 
 	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
-	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop" };
+	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);  // "" = disabled
@@ -724,6 +724,13 @@ static void doAction(int act) {
 		applyTopmost();
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
+	case ACT_FILTER: {
+		g_filterCfg = (g_filterCfg + 1) % 3;   // Auto -> Point -> Linear -> Auto
+		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
+		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear" : "Auto";
+		logf("hotkey: filter -> %s", n);
+		break;
+	}
 	}
 }
 
