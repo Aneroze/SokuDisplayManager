@@ -8,7 +8,10 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
 - **CustomResolution** — an exact size in pixels.
 
-**Hotkeys** (live, in-game) mean "N×" in both contexts: **Alt+1**…**Alt+4** set IntegerScaling ×1…×4 in fullscreen, or resize the window to that scale (640×480 × N) when windowed — so it also works as a WindowResizer-style window sizer. **Alt+0** = FitToScreen (fullscreen).
+**Hotkeys** (live, in-game; all rebindable in the `[Hotkeys]` ini section):
+- **Alt+1**…**Alt+6** — set IntegerScaling ×1…×6 in fullscreen, or resize the window to that scale (640×480 × N) when windowed.
+- **Alt+0** — FitToScreen.
+- **Alt+P** — toggle always-on-top.
 
 ## Install
 
@@ -32,7 +35,13 @@ All options live in `DisplayManager.ini`:
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
-| `Log` | `0` | Set to `1` to write an `DisplayManager.log` next to the ini for troubleshooting. |
+| `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
+| `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Warning:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays or a transparent background. |
+| `TransparentBackground` | `0` | Borderless only. Makes the border area (the `BackgroundColor`) see-through to the desktop via a color-key. Pick a `BackgroundColor` the game never draws (e.g. `FF00FF`) to avoid see-through holes. |
+
+The `[Hotkeys]` section rebinds each hotkey (Alt + the given letter/digit; blank disables): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`.
+
+With `Borderless` available, this mod is a superset of WindowResizer — window sizing/positioning, borderless *and* exclusive fullscreen, always-on-top, and crisp integer scaling.
 
 Only the value for the active `Mode` matters; the others are ignored. Hotkey changes apply immediately and are not written back to the ini (set the `Mode` there for your startup default).
 

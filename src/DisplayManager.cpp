@@ -81,8 +81,14 @@ static bool    g_resizable = true;     // add a drag-resize border to the window
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
 static int     g_posX      = -1;       // spawn position (-1 = don't move the window, the mod's old behavior)
 static int     g_posY      = -1;
+static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
+static bool    g_transparent = false;  // borderless only: make the border area (BackgroundColor) see-through
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
+
+// Hotkeys (Alt + the configured key). VK codes; 0 disables that hotkey.
+enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_COUNT };
+static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 
 // ---- runtime state -------------------------------------------------------------------------------
 static bool      g_createDeviceHooked = false;
@@ -97,6 +103,14 @@ static IDirect3DSurface9 *g_capture = nullptr;  // offscreen RT holding the grab
 static bool g_haveWin = false;
 static UINT g_winW = 640, g_winH = 480;
 static HWND g_hwnd = nullptr;   // the game's window (from present params), for windowed resizing
+static bool g_topmost = false;          // always-on-top toggle (Alt+P)
+// Borderless-mode state: g_wantFullscreen tracks the game's real intent (from pp.Windowed before we
+// override it) so we can tell a forced-windowed borderless-fullscreen apart from a genuine windowed
+// request. Saved styles restore the normal window when leaving borderless fullscreen.
+static bool g_wantFullscreen = false;
+static bool g_borderlessActive = false;
+static bool g_styleSaved = false;
+static LONG g_savedStyle = 0, g_savedExStyle = 0;
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -120,6 +134,25 @@ static void installKeyboardHook();
 static void installWndProc();
 static void setWindowScaled(int n, bool applyPos);
 static void onWindowedEntry(bool firstTime);
+static void enterBorderlessFullscreen();
+static void applyTopmost();
+
+// Overwrite `len` bytes at `addr` with NOPs (used only in borderless mode to stop the game deriving its
+// fullscreen flag from present.Windowed, so we can own that flag ourselves).
+static void patchNop(DWORD addr, int len) {
+	DWORD old;
+	VirtualProtect((void *)addr, len, PAGE_EXECUTE_READWRITE, &old);
+	for (int i = 0; i < len; i++) ((BYTE *)addr)[i] = 0x90;
+	VirtualProtect((void *)addr, len, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), (void *)addr, len);
+}
+
+// In borderless mode we present a windowed device, but the game must still believe it is fullscreen so
+// its Alt+Enter toggle flips the right way. We write the flag (0x8998B0) ourselves; the game's own write
+// to it is NOP'd (see setupHooks).
+static void writeFsFlag(bool fs) {
+	if (g_borderless) *(BYTE *)0x008998B0 = fs ? 1 : 0;
+}
 
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
@@ -198,9 +231,16 @@ static void computeOutput() {
 static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (!g_enabled || !pp) { g_active = false; return; }
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
+	g_wantFullscreen = !pp->Windowed;                    // the game's real intent (before we override it)
+
+	const D3DDISPLAYMODE *dm = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
+	UINT w = dm->Width, h = dm->Height;
+
+	// Border/letterbox format & backbuffer target used by both fullscreen paths.
+	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : (D3DFORMAT)dm->Format;
 
 	if (pp->Windowed) {
-		// Remember the game's own windowed size the first time we see it (before we ever meddle).
+		// The game wants a normal window. Remember its canonical size the first time (before we meddle).
 		if (!g_haveWin && pp->BackBufferWidth && pp->BackBufferHeight &&
 		    pp->BackBufferWidth <= 4096 && pp->BackBufferHeight <= 4096) {
 			g_winW = pp->BackBufferWidth; g_winH = pp->BackBufferHeight; g_haveWin = true;
@@ -211,16 +251,26 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 		return;
 	}
 
-	const D3DDISPLAYMODE *dm = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
-	UINT w = dm->Width, h = dm->Height;
-	pp->BackBufferWidth  = w;
-	pp->BackBufferHeight = h;
-	pp->FullScreen_RefreshRateInHz = dm->RefreshRate;
-	g_bbW = w; g_bbH = h;
-	g_bbFormat = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat
-	                                                      : (D3DFORMAT)dm->Format;
-	g_active = true;
-	logf("fullscreen -> native %ux%u @%uHz fmt=%d", w, h, dm->RefreshRate, (int)g_bbFormat);
+	// The game wants fullscreen.
+	if (g_borderless) {
+		// Borderless: a windowed device with a native-sized backbuffer; we cover the monitor with a
+		// borderless window ourselves (done after the reset, in enterBorderlessFullscreen). No exclusive
+		// mode-set, so no low-latency direct-flip - but it composites over the desktop (needed for a
+		// transparent background) and is friendlier to alt-tab / overlays.
+		pp->Windowed = TRUE;
+		pp->BackBufferWidth  = w;
+		pp->BackBufferHeight = h;
+		pp->FullScreen_RefreshRateInHz = 0;
+		g_borderlessActive = true;
+		logf("borderless fullscreen -> native %ux%u (windowed device)", w, h);
+	} else {
+		// Exclusive: true fullscreen at the native mode (no monitor rescale, gets Independent Flip).
+		pp->BackBufferWidth  = w;
+		pp->BackBufferHeight = h;
+		pp->FullScreen_RefreshRateInHz = dm->RefreshRate;
+		logf("exclusive fullscreen -> native %ux%u @%uHz", w, h, dm->RefreshRate);
+	}
+	g_bbW = w; g_bbH = h; g_bbFormat = fmt; g_active = true;
 	computeOutput();
 }
 
@@ -269,13 +319,17 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
-	bool wasWindowed = pp && pp->Windowed;
 	applyFullscreenParams(pp);
 	HRESULT hr = oReset(dev, pp);
-	if (SUCCEEDED(hr) && g_active)
-		createCapture(dev);
-	if (SUCCEEDED(hr) && wasWindowed)
-		onWindowedEntry(false);     // returning to windowed: re-apply the remembered window scale
+	if (SUCCEEDED(hr)) {
+		if (g_active)
+			createCapture(dev);
+		if (g_wantFullscreen) {
+			if (g_borderless) enterBorderlessFullscreen();
+		} else {
+			onWindowedEntry(false); // returning to windowed: restore frame + remembered window scale
+		}
+	}
 	g_presentLogged = false;
 	return hr;
 }
@@ -309,7 +363,6 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
                                      IDirect3DDevice9 **out) {
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
-	bool windowed = pp && pp->Windowed;
 	installKeyboardHook();   // we're on the game's UI thread here - the right thread to hook
 	applyFullscreenParams(pp);
 	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
@@ -318,8 +371,11 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 		if (g_active)
 			createCapture(*out);
 		installWndProc();               // subclass the window for drag-resize aspect locking
-		if (windowed)
+		if (g_wantFullscreen) {
+			if (g_borderless) enterBorderlessFullscreen();
+		} else {
 			onWindowedEntry(true);      // first windowed spawn: apply saved scale + spawn position
+		}
 	}
 	return hr;
 }
@@ -356,6 +412,16 @@ static D3DCOLOR parseColor(const char *s, D3DCOLOR fallback) {
 	return D3DCOLOR_XRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
 }
 
+// Parse a hotkey key (a single letter or digit) into a virtual-key code. A-Z / 0-9 have VK == ASCII of
+// the uppercase character. Empty = 0 = disabled.
+static int parseKey(const char *s) {
+	while (*s == ' ' || *s == '\t') s++;
+	char c = *s;
+	if (c >= 'a' && c <= 'z') c -= 32;
+	if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return (unsigned char)c;
+	return 0;
+}
+
 static void loadConfig() {
 	GetModuleFileNameA(g_module, g_iniPath, 1024);
 	PathRemoveFileSpecA(g_iniPath);
@@ -383,12 +449,26 @@ static void loadConfig() {
 	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
 	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
 	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
+	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
+	g_transparent  = GetPrivateProfileIntA("Display", "TransparentBackground", 0, g_iniPath) != 0;
 
 	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
 	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
+
+	// [Hotkeys] - each is Alt + the configured key (single letter/digit; blank disables it).
+	struct { int act; const char *name; const char *def; } hk[] = {
+		{ ACT_FIT, "FitToScreen", "0" }, { ACT_S1, "Scale1", "1" }, { ACT_S2, "Scale2", "2" },
+		{ ACT_S3, "Scale3", "3" }, { ACT_S4, "Scale4", "4" }, { ACT_S5, "Scale5", "5" },
+		{ ACT_S6, "Scale6", "6" }, { ACT_TOP, "AlwaysOnTop", "P" },
+	};
+	for (auto &h : hk) {
+		char k[16] = {0};
+		GetPrivateProfileStringA("Hotkeys", h.name, h.def, k, sizeof(k), g_iniPath);
+		g_hotkeyVk[h.act] = parseKey(k);
+	}
 }
 
 // Persist the current scaling settings (Mode + IntegerScaling) to the ini so the next launch restores
@@ -439,10 +519,27 @@ static void setWindowScaled(int n, bool applyPos) {
 	     (flags & SWP_NOMOVE) ? "" : " +spawn-pos");
 }
 
-// Apply the remembered window scale on entering windowed mode; on the first spawn also honor the
-// configured spawn position.
+static void applyTopmost() {
+	if (g_hwnd)
+		SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// Apply the remembered window scale on entering (real) windowed mode; on the first spawn also honor the
+// configured spawn position. If we were in borderless fullscreen, restore the normal window frame first.
 static void onWindowedEntry(bool firstTime) {
+	if (g_styleSaved && g_hwnd) {
+		LONG ex = GetWindowLongA(g_hwnd, GWL_EXSTYLE) & ~WS_EX_LAYERED;
+		SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
+		SetWindowLongA(g_hwnd, GWL_EXSTYLE, ex);
+		SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+		g_styleSaved = false;
+	}
+	g_borderlessActive = false;
+	writeFsFlag(false);
 	setWindowScaled(g_intScale, firstTime);
+	applyTopmost();
 }
 
 // Subclassed window procedure: while windowed and resizable, lock a drag-resize to the source aspect
@@ -480,22 +577,70 @@ static void installWndProc() {
 	logf("wndproc subclassed (resizable=%d)", g_resizable);
 }
 
-// "Alt+N" means "N x" in both contexts: it sets the scaling choice (so it carries between modes), then
-// applies it to whichever mode is active right now - the fullscreen output size, or the window size.
-static void applyHotkey(int digit) {
-	if (digit == 0) { g_mode = MODE_FIT;     logf("hotkey: Alt+0 -> FitToScreen"); }
-	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> x%d", digit, digit); }
-	if (g_active)
-		computeOutput();               // fullscreen: re-scale the centered output live
-	else if (digit >= 1)
-		setWindowScaled(digit, false); // windowed: resize the window to N x
+// Turn the game's window into a borderless popup covering its monitor (used in borderless-fullscreen
+// mode). Optionally makes the background color see-through (layered color-key) so the desktop shows.
+static void enterBorderlessFullscreen() {
+	if (!g_hwnd) return;
+	if (!g_styleSaved) {
+		g_savedStyle   = GetWindowLongA(g_hwnd, GWL_STYLE);
+		g_savedExStyle = GetWindowLongA(g_hwnd, GWL_EXSTYLE);
+		g_styleSaved = true;
+	}
+	LONG style = (g_savedStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX |
+	                               WS_SYSMENU | WS_BORDER | WS_DLGFRAME)) | WS_POPUP;
+	LONG ex = g_savedExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
+	if (g_transparent) ex |= WS_EX_LAYERED;
+	SetWindowLongA(g_hwnd, GWL_STYLE, style);
+	SetWindowLongA(g_hwnd, GWL_EXSTYLE, ex);
+
+	MONITORINFO mi = { sizeof(mi) };
+	GetMonitorInfo(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+	int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_TOP,
+	             mi.rcMonitor.left, mi.rcMonitor.top, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	if (g_transparent) {
+		BYTE r = (g_bgColor >> 16) & 0xFF, g = (g_bgColor >> 8) & 0xFF, b = g_bgColor & 0xFF;
+		SetLayeredWindowAttributes(g_hwnd, RGB(r, g, b), 0, LWA_COLORKEY);
+	}
+	g_borderlessActive = true;
+	writeFsFlag(true);
+	logf("borderless window %dx%d at (%d,%d) transparent=%d topmost=%d",
+	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_transparent, g_topmost);
+}
+
+// Run a hotkey action. "Scale N" means "N x": it sets the scaling choice (so it carries between modes),
+// then applies it to whichever mode is active - the fullscreen output, or the window size.
+static void doAction(int act) {
+	switch (act) {
+	case ACT_FIT:
+		g_mode = MODE_FIT;
+		if (g_active) computeOutput();
+		logf("hotkey: FitToScreen");
+		break;
+	case ACT_S1: case ACT_S2: case ACT_S3: case ACT_S4: case ACT_S5: case ACT_S6: {
+		int n = act - ACT_S1 + 1;
+		g_mode = MODE_INTEGER; g_intScale = n;
+		if (g_active) computeOutput();          // fullscreen: re-scale the centered output live
+		else          setWindowScaled(n, false); // windowed: resize the window to N x
+		logf("hotkey: x%d", n);
+		break;
+	}
+	case ACT_TOP:
+		g_topmost = !g_topmost;
+		applyTopmost();
+		logf("hotkey: always-on-top=%d", g_topmost);
+		break;
+	}
 }
 
 static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
-	if (code == HC_ACTION && wParam >= '0' && wParam <= '4' &&
-	    IS_FRESH_KEYDOWN(lParam) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
-		applyHotkey((int)(wParam - '0'));
-		return 1; // eat the key so it doesn't leak to the game / system menu
+	if (code == HC_ACTION && IS_FRESH_KEYDOWN(lParam) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+		for (int a = 0; a < ACT_COUNT; a++) {
+			if (g_hotkeyVk[a] && (int)wParam == g_hotkeyVk[a]) {
+				doAction(a);
+				return 1; // eat the key so it doesn't leak to the game / system menu
+			}
+		}
 	}
 	return CallNextHookEx(nullptr, code, wParam, lParam);
 }
@@ -517,6 +662,12 @@ static void setupHooks() {
 	oDirect3DCreate9 = reinterpret_cast<Direct3DCreate9_t>(*slot);
 	*slot = reinterpret_cast<DWORD>(&myDirect3DCreate9);
 	VirtualProtect(slot, sizeof(DWORD), old, &old);
+
+	// Borderless mode presents a windowed device, so stop the game deriving its fullscreen flag
+	// (0x8998B0) from present.Windowed - we own that flag instead (writeFsFlag), which keeps its
+	// Alt+Enter toggle flipping the right way. `mov [0x8998B0], al` at 0x004405BC is 5 bytes.
+	if (g_borderless)
+		patchNop(0x004405BC, 5);
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
@@ -533,9 +684,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d)",
+	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d transparent=%d",
 	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY);
+	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_transparent);
 	return TRUE;
 }
 
