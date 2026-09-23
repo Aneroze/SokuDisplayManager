@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build ExclusiveFullscreen.dll (32-bit) on Linux (or any host) by cross-compiling with mingw-w64.
+# Build DisplayManager.dll (32-bit) on Linux (or any host) by cross-compiling with mingw-w64.
 # No Visual Studio or Windows SDK needed - the Windows headers/libs come from mingw-w64.
 #
 # Install the toolchain first, e.g.:
@@ -16,9 +16,9 @@ mkdir -p "$OUT"
 "$CXX" -std=c++17 -O2 -shared \
   -D_CRT_SECURE_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
   -I"$ROOT/src" \
-  "$ROOT/src/ExclusiveFullscreen.cpp" \
-  -o "$OUT/ExclusiveFullscreen.dll" \
+  "$ROOT/src/DisplayManager.cpp" \
+  -o "$OUT/DisplayManager.dll" \
   -static -static-libgcc -static-libstdc++ \
   -lshlwapi -luser32
 
-echo "built: $OUT/ExclusiveFullscreen.dll"
+echo "built: $OUT/DisplayManager.dll"

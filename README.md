@@ -1,8 +1,8 @@
-# ExclusiveFullscreen
+# DisplayManager
 
-A small [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutensoku (th123) 1.10a that gives you **crisp, integer-scaled exclusive fullscreen**.
+A small [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutensoku (th123) 1.10a that manages the game's display: **crisp, integer-scaled exclusive fullscreen** plus **window sizing/positioning**. A modern replacement for WindowResizer.
 
-Instead of the base game's blurry fullscreen, this mod keeps your desktop at its **native resolution** and draws the game **centered with black borders**, in one of three modes. Because it uses **true exclusive fullscreen**, it also gets the low-latency direct-flip present path ("Independent Flip"), which a legacy Direct3D9 game like this one can't get in a borderless window.
+Instead of the base game's blurry fullscreen, this mod keeps your desktop at its **native resolution** and draws the game **centered with black borders**, in one of three modes. Because it uses **true exclusive fullscreen**, it also gets the low-latency direct-flip present path ("Independent Flip"), which a legacy Direct3D9 game like this one can't get in a borderless window. When windowed, it sizes the window (by drag or hotkey) with a locked 4:3 aspect. It can also remember your settings between runs, set a spawn position, and color the border.
 
 - **FitToScreen** (default) — the largest aspect-correct size that fills the screen (fills the height, pillarbox on the sides). Biggest image; may be a non-integer scale (smoothed with linear filtering).
 - **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
@@ -12,14 +12,14 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 
 ## Install
 
-1. Download the latest [release](https://github.com/Aneroze/SokuExclusiveFullscreen/releases/latest) and unarchive the `ExclusiveFullscreen` folder into your Soku `modules` directory.
-2. Enable **ExclusiveFullscreen** in SokuLauncher's mod settings (or add a line for it in `SWRSToys.ini` if you don't use the launcher).
+1. Download the latest [release](https://github.com/Aneroze/SokuDisplayManager/releases/latest) and unarchive the `DisplayManager` folder into your Soku `modules` directory.
+2. Enable **DisplayManager** in SokuLauncher's mod settings (or add a line for it in `SWRSToys.ini` if you don't use the launcher).
 3. **Disable WindowResizer.** Both mods manage the window/fullscreen path — use one or the other.
 4. Launch the game and press **Alt+Enter** to toggle fullscreen.
 
 ## Configuration
 
-All options live in `ExclusiveFullscreen.ini`:
+All options live in `DisplayManager.ini`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ All options live in `ExclusiveFullscreen.ini`:
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
-| `Log` | `0` | Set to `1` to write an `ExclusiveFullscreen.log` next to the ini for troubleshooting. |
+| `Log` | `0` | Set to `1` to write an `DisplayManager.log` next to the ini for troubleshooting. |
 
 Only the value for the active `Mode` matters; the others are ignored. Hotkey changes apply immediately and are not written back to the ini (set the `Mode` there for your startup default).
 
@@ -56,7 +56,7 @@ It only patches the exact th123 1.10a build (verified by hash) and has no extern
 
 ## Building
 
-**Windows (MSVC):** run `build.bat` from an *x86 Native Tools Command Prompt for VS* (or plain `cmd` — it locates Visual Studio via `vswhere`). Output: `build\ExclusiveFullscreen.dll`.
+**Windows (MSVC):** run `build.bat` from an *x86 Native Tools Command Prompt for VS* (or plain `cmd` — it locates Visual Studio via `vswhere`). Output: `build\DisplayManager.dll`.
 
 **Any host (mingw-w64):** run `./build.sh` with `g++-mingw-w64-i686` installed.
 

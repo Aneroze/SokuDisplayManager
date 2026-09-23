@@ -1,4 +1,4 @@
-// ExclusiveFullscreen - crisp, integer-scaled exclusive fullscreen for Touhou Hisoutensoku (th123 1.10a)
+// DisplayManager - crisp, integer-scaled exclusive fullscreen for Touhou Hisoutensoku (th123 1.10a)
 //
 // Problem this solves
 // -------------------
@@ -359,34 +359,34 @@ static D3DCOLOR parseColor(const char *s, D3DCOLOR fallback) {
 static void loadConfig() {
 	GetModuleFileNameA(g_module, g_iniPath, 1024);
 	PathRemoveFileSpecA(g_iniPath);
-	PathAppendA(g_iniPath, "ExclusiveFullscreen.ini");
-	g_enabled = GetPrivateProfileIntA("Fullscreen", "Enabled", 1, g_iniPath) != 0;
+	PathAppendA(g_iniPath, "DisplayManager.ini");
+	g_enabled = GetPrivateProfileIntA("Display", "Enabled", 1, g_iniPath) != 0;
 
 	char mode[64] = {0};
-	GetPrivateProfileStringA("Fullscreen", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
+	GetPrivateProfileStringA("Display", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
 	if (StrCmpIA(mode, "IntegerScaling") == 0)        g_mode = MODE_INTEGER;
 	else if (StrCmpIA(mode, "CustomResolution") == 0) g_mode = MODE_CUSTOM;
 	else                                              g_mode = MODE_FIT;
 
 	char scale[32] = {0};
-	GetPrivateProfileStringA("Fullscreen", "IntegerScaling", "x2", scale, sizeof(scale), g_iniPath);
+	GetPrivateProfileStringA("Display", "IntegerScaling", "x2", scale, sizeof(scale), g_iniPath);
 	g_intScale = parseScale(scale);
 
-	g_customW = GetPrivateProfileIntA("Fullscreen", "CustomWidth", 1280, g_iniPath);
-	g_customH = GetPrivateProfileIntA("Fullscreen", "CustomHeight", 960, g_iniPath);
+	g_customW = GetPrivateProfileIntA("Display", "CustomWidth", 1280, g_iniPath);
+	g_customH = GetPrivateProfileIntA("Display", "CustomHeight", 960, g_iniPath);
 
 	char color[32] = {0};
-	GetPrivateProfileStringA("Fullscreen", "BackgroundColor", "000000", color, sizeof(color), g_iniPath);
+	GetPrivateProfileStringA("Display", "BackgroundColor", "000000", color, sizeof(color), g_iniPath);
 	g_bgColor = parseColor(color, D3DCOLOR_XRGB(0, 0, 0));
 
-	g_resizable = GetPrivateProfileIntA("Fullscreen", "Resizable", 1, g_iniPath) != 0;
-	g_persist   = GetPrivateProfileIntA("Fullscreen", "PersistState", 1, g_iniPath) != 0;
-	g_posX      = GetPrivateProfileIntA("Fullscreen", "PositionX", -1, g_iniPath);
-	g_posY      = GetPrivateProfileIntA("Fullscreen", "PositionY", -1, g_iniPath);
+	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
+	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
+	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
+	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
 
-	g_srcW    = GetPrivateProfileIntA("Fullscreen", "SourceWidth", 640, g_iniPath);
-	g_srcH    = GetPrivateProfileIntA("Fullscreen", "SourceHeight", 480, g_iniPath);
-	g_log     = GetPrivateProfileIntA("Fullscreen", "Log", 0, g_iniPath) != 0;
+	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
+	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
+	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
 }
@@ -400,8 +400,8 @@ static void persistState() {
 	              : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
-	WritePrivateProfileStringA("Fullscreen", "Mode", m, g_iniPath);
-	WritePrivateProfileStringA("Fullscreen", "IntegerScaling", scale, g_iniPath);
+	WritePrivateProfileStringA("Display", "Mode", m, g_iniPath);
+	WritePrivateProfileStringA("Display", "IntegerScaling", scale, g_iniPath);
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
@@ -532,7 +532,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
-	logf("ExclusiveFullscreen initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
+	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
 	     "resizable=%d persist=%d pos=(%d,%d)",
 	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY);

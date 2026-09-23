@@ -1,5 +1,5 @@
 @echo off
-REM Build ExclusiveFullscreen.dll (32-bit) on Windows with the MSVC toolchain.
+REM Build DisplayManager.dll (32-bit) on Windows with the MSVC toolchain.
 REM Needs Visual Studio with "Desktop development with C++" (x86 tools + Windows SDK).
 setlocal
 
@@ -23,7 +23,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 cl /nologo /LD /MT /EHsc /std:c++17 /O2 ^
   /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 ^
   /I "%ROOT%src" ^
-  /Fo"%OUT%\\" /Fe"%OUT%\ExclusiveFullscreen.dll" ^
-  "%ROOT%src\ExclusiveFullscreen.cpp" ^
+  /Fo"%OUT%\\" /Fe"%OUT%\DisplayManager.dll" ^
+  "%ROOT%src\DisplayManager.cpp" ^
   /link shlwapi.lib user32.lib
 exit /b %errorlevel%
