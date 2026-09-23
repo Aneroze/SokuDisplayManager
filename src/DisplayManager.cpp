@@ -226,6 +226,30 @@ static void computeOutput() {
 	     g_filter == D3DTEXF_POINT ? "point" : "linear");
 }
 
+// The native resolution/refresh of the monitor the game window is on. We query this live (rather than
+// trusting the game's cached GetAdapterDisplayMode global at 0x8A0FA0, which can be stale or the wrong
+// monitor) so exclusive fullscreen always uses the true current mode - otherwise the desktop gets
+// switched to a wrong (often small) resolution, which is blurry and shuffles the user's windows.
+static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
+	if (g_hwnd) {
+		MONITORINFOEXA mi; mi.cbSize = sizeof(mi);
+		if (GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+			DEVMODEA dm; ZeroMemory(&dm, sizeof(dm)); dm.dmSize = sizeof(dm);
+			if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+			    dm.dmPelsWidth && dm.dmPelsHeight) {
+				*w = dm.dmPelsWidth; *h = dm.dmPelsHeight; *refresh = dm.dmDisplayFrequency;
+				return;
+			}
+			*w = mi.rcMonitor.right - mi.rcMonitor.left;
+			*h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+			*refresh = 0;
+			return;
+		}
+	}
+	const D3DDISPLAYMODE *d = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
+	*w = d->Width; *h = d->Height; *refresh = d->RefreshRate;
+}
+
 // Decide how to shape the present parameters for this (Create)Device/Reset call. Fullscreen requests
 // (Windowed == FALSE) are forced to the native desktop mode so the monitor is never rescaled; windowed
 // requests are restored to the game's canonical windowed size (undoing the huge size we write into the
@@ -235,11 +259,11 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
 	g_wantFullscreen = !pp->Windowed;                    // the game's real intent (before we override it)
 
-	const D3DDISPLAYMODE *dm = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
-	UINT w = dm->Width, h = dm->Height;
+	UINT w = 0, h = 0, refresh = 0;
+	nativeMode(&w, &h, &refresh);
 
 	// Border/letterbox format & backbuffer target used by both fullscreen paths.
-	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : (D3DFORMAT)dm->Format;
+	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
 
 	if (pp->Windowed) {
 		// The game wants a normal window. Remember its canonical size the first time (before we meddle).
@@ -268,8 +292,8 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 		// Exclusive: true fullscreen at the native mode (no monitor rescale, gets Independent Flip).
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
-		pp->FullScreen_RefreshRateInHz = dm->RefreshRate;
-		logf("exclusive fullscreen -> native %ux%u @%uHz", w, h, dm->RefreshRate);
+		pp->FullScreen_RefreshRateInHz = refresh;
+		logf("exclusive fullscreen -> native %ux%u @%uHz", w, h, refresh);
 	}
 	g_bbW = w; g_bbH = h; g_bbFormat = fmt; g_active = true;
 	computeOutput();
