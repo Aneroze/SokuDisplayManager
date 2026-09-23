@@ -8,7 +8,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
 - **CustomResolution** — an exact size in pixels.
 
-**Hotkeys** (change the mode live, in-game): **Alt+0** = FitToScreen, **Alt+1**…**Alt+4** = IntegerScaling ×1…×4.
+**Hotkeys** (live, in-game) mean "N×" in both contexts: **Alt+1**…**Alt+4** set IntegerScaling ×1…×4 in fullscreen, or resize the window to that scale (640×480 × N) when windowed — so it also works as a WindowResizer-style window sizer. **Alt+0** = FitToScreen (fullscreen).
 
 ## Install
 

@@ -90,6 +90,7 @@ static IDirect3DSurface9 *g_capture = nullptr;  // offscreen RT holding the grab
 // game's shared present-params struct.
 static bool g_haveWin = false;
 static UINT g_winW = 640, g_winH = 480;
+static HWND g_hwnd = nullptr;   // the game's window (from present params), for windowed resizing
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -187,6 +188,7 @@ static void computeOutput() {
 // game's shared present-params struct while fullscreen, which otherwise leaks into the windowed path).
 static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (!g_enabled || !pp) { g_active = false; return; }
+	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
 
 	if (pp->Windowed) {
 		// Remember the game's own windowed size the first time we see it (before we ever meddle).
@@ -363,10 +365,29 @@ static HHOOK g_kbHook = nullptr;
 // or a release).
 #define IS_FRESH_KEYDOWN(lp) (((lp) & (1 << 30)) == 0 && ((lp) & (1 << 31)) == 0)
 
+// Resize the game's window so its client area is exactly (srcW*n) x (srcH*n). We only move the window's
+// borders - the game keeps rendering to its existing backbuffer and D3D9's windowed present stretches it
+// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer.
+static void resizeWindowToScale(int n) {
+	if (!g_hwnd || n < 1) return;
+	RECT r = { 0, 0, g_srcW * n, g_srcH * n };
+	LONG style = GetWindowLongA(g_hwnd, GWL_STYLE);
+	LONG ex    = GetWindowLongA(g_hwnd, GWL_EXSTYLE);
+	AdjustWindowRectEx(&r, style, GetMenu(g_hwnd) != nullptr, ex);
+	SetWindowPos(g_hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+	             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+	logf("windowed resize -> client %dx%d (x%d)", g_srcW * n, g_srcH * n, n);
+}
+
+// "Alt+N" means "N x" in both contexts: it sets the scaling choice (so it carries between modes), then
+// applies it to whichever mode is active right now - the fullscreen output size, or the window size.
 static void applyHotkey(int digit) {
-	if (digit == 0) { g_mode = MODE_FIT; logf("hotkey: Alt+0 -> FitToScreen"); }
-	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> IntegerScaling x%d", digit, digit); }
-	computeOutput();   // native size already known once we've gone fullscreen; no-op before then
+	if (digit == 0) { g_mode = MODE_FIT;     logf("hotkey: Alt+0 -> FitToScreen"); }
+	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> x%d", digit, digit); }
+	if (g_active)
+		computeOutput();            // fullscreen: re-scale the centered output live
+	else if (digit >= 1)
+		resizeWindowToScale(digit); // windowed: resize the window to N x
 }
 
 static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
