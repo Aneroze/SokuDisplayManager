@@ -358,6 +358,48 @@ static void hookDevice(IDirect3DDevice9 *dev) {
 	logf("device vtable hooked (Reset) + swapchain Present");
 }
 
+// Is `fn` inside d3d9.dll? Used to confirm the device global holds a real Direct3D(9/9Ex) device with a
+// standard vtable before we patch it (a wrapper device would point elsewhere - we skip those safely).
+static bool isInsideD3D9(void *fn) {
+	HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
+	if (!d3d9 || !fn) return false;
+	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)d3d9;
+	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)d3d9 + dos->e_lfanew);
+	BYTE *base = (BYTE *)d3d9, *end = base + nt->OptionalHeader.SizeOfImage;
+	return (BYTE *)fn >= base && (BYTE *)fn < end;
+}
+
+// Fallback path when our Direct3DCreate9 hook never fires - e.g. SokuDirectXOptimizations creates a
+// Direct3D9Ex device (via Direct3DCreate9Ex, a different export) or otherwise intercepts creation. We
+// poll the game's device global (0x8A0E30) and hook the device once it exists, regardless of who made it.
+static DWORD WINAPI deviceWatchThread(LPVOID) {
+	for (int i = 0; i < 1200 && !g_deviceHooked; i++) {   // ~60s
+		IDirect3DDevice9 *dev = GAME_DEVICE;
+		void **vt = dev ? *(void ***)dev : nullptr;
+		if (vt && isInsideD3D9(vt[17])) {                 // 17 = Present: a real d3d9 vtable
+			IDirect3DSwapChain9 *sc = nullptr;
+			if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
+				D3DPRESENT_PARAMETERS pp = {0};
+				if (SUCCEEDED(sc->GetPresentParameters(&pp)) && pp.hDeviceWindow)
+					g_hwnd = pp.hDeviceWindow;
+				sc->Release();
+			}
+			if (!g_hwnd) {
+				D3DDEVICE_CREATION_PARAMETERS cp = {0};
+				if (SUCCEEDED(dev->GetCreationParameters(&cp))) g_hwnd = cp.hFocusWindow;
+			}
+			logf("device watch: found device %p (hwnd %p) - hooking without CreateDevice", dev, g_hwnd);
+			hookDevice(dev);
+			installWndProc();
+			installKeyboardHook();
+			onWindowedEntry(true);
+			return 0;
+		}
+		Sleep(50);
+	}
+	return 0;
+}
+
 // ---- IDirect3D9::CreateDevice hook ---------------------------------------------------------------
 static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE type, HWND focus,
                                      DWORD behavior, D3DPRESENT_PARAMETERS *pp,
@@ -696,6 +738,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
 		atexit(persistState);
+		// Fallback for when our Direct3DCreate9 hook never fires (e.g. SokuDirectXOptimizations with
+		// use_d3d9ex=1 creates a Direct3D9Ex device): watch for the device global and hook it directly.
+		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
