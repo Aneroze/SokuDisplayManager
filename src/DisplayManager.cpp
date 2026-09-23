@@ -364,8 +364,9 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
                                      IDirect3DDevice9 **out) {
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
-	installKeyboardHook();   // we're on the game's UI thread here - the right thread to hook
-	applyFullscreenParams(pp);
+	applyFullscreenParams(pp);          // sets g_hwnd from pp->hDeviceWindow
+	if (!g_hwnd && focus) g_hwnd = focus;
+	installKeyboardHook();              // hooks the WINDOW's thread (not necessarily this one)
 	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	if (SUCCEEDED(hr) && out && *out) {
 		hookDevice(*out);
@@ -656,12 +657,16 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
 	return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-// Install the keyboard hook on whatever thread calls this. CreateDevice runs on the game's UI thread, so
-// installing from there targets the right thread (as WindowResizer installs from CreateWindowExA).
+// Install the keyboard hook on the GAME WINDOW's thread. We must target that thread explicitly (rather
+// than the current one): SokuDirectXOptimizations moves rendering/present onto a separate thread, so the
+// thread that calls CreateDevice/Present is not the window's message thread that receives key input.
 static void installKeyboardHook() {
-	if (g_kbHook) return;
-	g_kbHook = SetWindowsHookExA(WH_KEYBOARD, keyboardHook, g_module, GetCurrentThreadId());
-	logf("keyboard hook %s", g_kbHook ? "installed" : "FAILED");
+	if (g_kbHook || !g_hwnd) return;
+	DWORD tid = GetWindowThreadProcessId(g_hwnd, nullptr);
+	if (!tid) return;
+	g_kbHook = SetWindowsHookExA(WH_KEYBOARD, keyboardHook, g_module, tid);
+	logf("keyboard hook on window thread %lu (current %lu) %s",
+	     tid, GetCurrentThreadId(), g_kbHook ? "installed" : "FAILED");
 }
 
 static void setupHooks() {
