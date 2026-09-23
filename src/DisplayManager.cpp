@@ -82,7 +82,6 @@ static bool    g_persist   = true;     // save the current scaling settings to t
 static int     g_posX      = -1;       // spawn position (-1 = don't move the window, the mod's old behavior)
 static int     g_posY      = -1;
 static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
-static bool    g_transparent = false;  // borderless only: make the border area (BackgroundColor) see-through
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -258,8 +257,7 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (g_borderless) {
 		// Borderless: a windowed device with a native-sized backbuffer; we cover the monitor with a
 		// borderless window ourselves (done after the reset, in enterBorderlessFullscreen). No exclusive
-		// mode-set, so no low-latency direct-flip - but it composites over the desktop (needed for a
-		// transparent background) and is friendlier to alt-tab / overlays.
+		// mode-set, so no low-latency direct-flip - but it is friendlier to alt-tab / overlays.
 		pp->Windowed = TRUE;
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
@@ -453,7 +451,6 @@ static void loadConfig() {
 	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
 	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
 	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
-	g_transparent  = GetPrivateProfileIntA("Display", "TransparentBackground", 0, g_iniPath) != 0;
 
 	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
 	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
@@ -538,9 +535,8 @@ static void applyTopmost() {
 // configured spawn position. If we were in borderless fullscreen, restore the normal window frame first.
 static void onWindowedEntry(bool firstTime) {
 	if (g_styleSaved && g_hwnd) {
-		LONG ex = GetWindowLongA(g_hwnd, GWL_EXSTYLE) & ~WS_EX_LAYERED;
 		SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
-		SetWindowLongA(g_hwnd, GWL_EXSTYLE, ex);
+		SetWindowLongA(g_hwnd, GWL_EXSTYLE, g_savedExStyle);
 		SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
 		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 		g_styleSaved = false;
@@ -587,7 +583,7 @@ static void installWndProc() {
 }
 
 // Turn the game's window into a borderless popup covering its monitor (used in borderless-fullscreen
-// mode). Optionally makes the background color see-through (layered color-key) so the desktop shows.
+// mode).
 static void enterBorderlessFullscreen() {
 	if (!g_hwnd) return;
 	if (!g_styleSaved) {
@@ -598,7 +594,6 @@ static void enterBorderlessFullscreen() {
 	LONG style = (g_savedStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX |
 	                               WS_SYSMENU | WS_BORDER | WS_DLGFRAME)) | WS_POPUP;
 	LONG ex = g_savedExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
-	if (g_transparent) ex |= WS_EX_LAYERED;
 	SetWindowLongA(g_hwnd, GWL_STYLE, style);
 	SetWindowLongA(g_hwnd, GWL_EXSTYLE, ex);
 
@@ -607,16 +602,10 @@ static void enterBorderlessFullscreen() {
 	int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
 	SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_TOP,
 	             mi.rcMonitor.left, mi.rcMonitor.top, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-	if (g_transparent) {
-		BYTE r = (g_bgColor >> 16) & 0xFF, g = (g_bgColor >> 8) & 0xFF, b = g_bgColor & 0xFF;
-		BOOL ok = SetLayeredWindowAttributes(g_hwnd, RGB(r, g, b), 0, LWA_COLORKEY);
-		logf("SetLayeredWindowAttributes key=%02x%02x%02x -> %d (exstyle now 0x%08lx)",
-		     r, g, b, ok, GetWindowLongA(g_hwnd, GWL_EXSTYLE));
-	}
 	g_borderlessActive = true;
 	writeFsFlag(true);
-	logf("borderless window %dx%d at (%d,%d) transparent=%d topmost=%d",
-	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_transparent, g_topmost);
+	logf("borderless window %dx%d at (%d,%d) topmost=%d",
+	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_topmost);
 }
 
 // Run a hotkey action. "Scale N" means "N x": it sets the scaling choice (so it carries between modes),
@@ -706,9 +695,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d transparent=%d",
+	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
 	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_transparent);
+	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
 	return TRUE;
 }
 

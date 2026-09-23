@@ -36,8 +36,7 @@ All options live in `DisplayManager.ini`:
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
-| `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Warning:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays or a transparent background. |
-| `TransparentBackground` | `0` | Borderless only. Makes the border area (the `BackgroundColor`) see-through to the desktop via a color-key. Pick a `BackgroundColor` the game never draws (e.g. `FF00FF`) to avoid see-through holes. |
+| `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
 
 The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`.
 
