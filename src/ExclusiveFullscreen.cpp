@@ -5,10 +5,11 @@
 // With WindowResizer off, the base game's fullscreen switches to a resolution that fills the monitor
 // height at 4:3 and pillarboxes the sides, so 480 logical pixels are scaled by a non-integer factor
 // (e.g. 1080/480 = 2.25x) and everything looks blurry. This mod instead keeps the desktop at its
-// native resolution and renders the game centered at an integer scale (1280x960 = 2x by default) with
-// black borders all around. Because it is true exclusive fullscreen it also gets the low-latency
-// direct-flip ("Independent Flip") present path - which a legacy Direct3D9 / DISCARD game like this one
-// cannot get in a borderless window.
+// native resolution and renders the game centered with black borders. Three modes (Mode in the ini,
+// and Alt+0..4 hotkeys): FitToScreen (default - largest aspect-correct size that fills the screen),
+// IntegerScaling (exact x1/x2/x3..., crisp point-sampled), and CustomResolution. Because it is true
+// exclusive fullscreen it also gets the low-latency direct-flip ("Independent Flip") present path -
+// which a legacy Direct3D9 / DISCARD game like this one cannot get in a borderless window.
 //
 // How it works
 // ------------
@@ -60,16 +61,20 @@ static const int VT_SC_PRESENT        = 3;    // IDirect3DSwapChain9::Present   
 // NOTE: the game presents via the SWAPCHAIN (0x8A0E34)->Present, not the device, so we hook that.
 
 // ---- config --------------------------------------------------------------------------------------
+enum Mode { MODE_FIT = 0, MODE_INTEGER = 1, MODE_CUSTOM = 2 };
+
 static HMODULE g_module;
 static char    g_iniPath[1024 + MAX_PATH];
 static bool    g_enabled   = true;
-static int     g_maxScale  = 2;      // cap on the auto integer scale (2 = at most 2x, even if 3x fits)
-static int     g_ovrW      = 0;      // exact output override from the ini (0 = use MaxScale auto-fit)
-static int     g_ovrH      = 0;
-static int     g_scaleW    = 1280;   // resolved output width  (set per-fullscreen from override or auto)
-static int     g_scaleH    = 960;    // resolved output height
-static int     g_srcW      = 640;    // the game's own render size (grabbed from the backbuffer top-left)
+static int     g_mode      = MODE_FIT; // FitToScreen (default) / IntegerScaling / CustomResolution
+static int     g_intScale  = 2;        // used when g_mode == MODE_INTEGER (x1, x2, ...)
+static int     g_customW   = 1280;     // used when g_mode == MODE_CUSTOM
+static int     g_customH   = 960;
+static int     g_scaleW    = 1280;     // resolved output width  (computed from mode + native res)
+static int     g_scaleH    = 960;      // resolved output height
+static int     g_srcW      = 640;      // the game's own render size (grabbed from the backbuffer top-left)
 static int     g_srcH      = 480;
+static DWORD   g_filter    = D3DTEXF_POINT;  // upscale filter (point for integer, linear otherwise)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -130,6 +135,49 @@ static void *hookSlot(void **vtable, int index, void *hook) {
 	return prev;
 }
 
+// Resolve the centered output size (g_scaleW/H) and upscale filter from the current mode and the native
+// backbuffer size (g_bbW/g_bbH). Safe to call any time the native size is known (e.g. from a hotkey).
+static void computeOutput() {
+	if (g_bbW == 0 || g_bbH == 0) return;
+	int outW, outH;
+	switch (g_mode) {
+	case MODE_INTEGER: {
+		int n = g_intScale < 1 ? 1 : g_intScale;
+		int maxFit = (int)min(g_bbW / (UINT)g_srcW, g_bbH / (UINT)g_srcH);
+		if (maxFit < 1) maxFit = 1;
+		int use = n > maxFit ? maxFit : n;          // clamp so it never exceeds the screen
+		if (use != n)
+			logf("IntegerScaling x%d doesn't fit %ux%u; using x%d", n, g_bbW, g_bbH, use);
+		outW = g_srcW * use; outH = g_srcH * use;
+		break;
+	}
+	case MODE_CUSTOM:
+		outW = g_customW > 0 ? g_customW : g_srcW;
+		outH = g_customH > 0 ? g_customH : g_srcH;
+		break;
+	case MODE_FIT:
+	default: {
+		// Largest size preserving the source's aspect ratio that fits the screen (fills the height on a
+		// wider-than-4:3 monitor).
+		double s = min((double)g_bbW / g_srcW, (double)g_bbH / g_srcH);
+		outW = (int)(g_srcW * s + 0.5);
+		outH = (int)(g_srcH * s + 0.5);
+		break;
+	}
+	}
+	if (outW > (int)g_bbW) outW = g_bbW;            // final safety: dst must fit the backbuffer
+	if (outH > (int)g_bbH) outH = g_bbH;
+	if (outW < 1) outW = 1;
+	if (outH < 1) outH = 1;
+	g_scaleW = outW; g_scaleH = outH;
+	// Point-sample only when it's an exact integer multiple (crisp); otherwise linear avoids the uneven
+	// doubled/tripled pixels of non-integer point scaling.
+	g_filter = (outW % g_srcW == 0 && outH % g_srcH == 0) ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
+	     ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
+	     g_filter == D3DTEXF_POINT ? "point" : "linear");
+}
+
 // Decide how to shape the present parameters for this (Create)Device/Reset call. Fullscreen requests
 // (Windowed == FALSE) are forced to the native desktop mode so the monitor is never rescaled; windowed
 // requests are restored to the game's canonical windowed size (undoing the huge size we write into the
@@ -151,23 +199,6 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 
 	const D3DDISPLAYMODE *dm = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
 	UINT w = dm->Width, h = dm->Height;
-
-	// Resolve the output size: exact override if given, else the largest integer multiple of the source
-	// that fits the native desktop, capped at MaxScale (computed live, so it needs no configuration).
-	if (g_ovrW > 0 && g_ovrH > 0) {
-		g_scaleW = g_ovrW; g_scaleH = g_ovrH;
-	} else {
-		int fit = (int)min(w / (UINT)g_srcW, h / (UINT)g_srcH);  // largest scale that physically fits
-		int n = fit < g_maxScale ? fit : g_maxScale;             // cap at MaxScale
-		if (n < 1) n = 1;
-		g_scaleW = g_srcW * n; g_scaleH = g_srcH * n;
-	}
-
-	if (w < (UINT)g_scaleW || h < (UINT)g_scaleH) {
-		logf("desktop %ux%u too small for %dx%d output - passthrough", w, h, g_scaleW, g_scaleH);
-		g_active = false;
-		return;
-	}
 	pp->BackBufferWidth  = w;
 	pp->BackBufferHeight = h;
 	pp->FullScreen_RefreshRateInHz = dm->RefreshRate;
@@ -175,9 +206,8 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	g_bbFormat = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat
 	                                                      : (D3DFORMAT)dm->Format;
 	g_active = true;
-	logf("fullscreen -> native %ux%u @%uHz fmt=%d; grab %dx%d -> %dx%d centered at (%d,%d)",
-	     w, h, dm->RefreshRate, (int)g_bbFormat, g_srcW, g_srcH, g_scaleW, g_scaleH,
-	     (int)(w - g_scaleW) / 2, (int)(h - g_scaleH) / 2);
+	logf("fullscreen -> native %ux%u @%uHz fmt=%d", w, h, dm->RefreshRate, (int)g_bbFormat);
+	computeOutput();
 }
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
@@ -207,9 +237,9 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			RECT srcRect = { 0, 0, g_srcW, g_srcH };
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
-			HRESULT a = dev->StretchRect(bb, &srcRect, g_capture, nullptr, D3DTEXF_POINT);
-			HRESULT b = dev->ColorFill(bb, nullptr, D3DCOLOR_XRGB(0, 0, 0));
-			HRESULT c = dev->StretchRect(g_capture, nullptr, bb, &dstRect, D3DTEXF_POINT);
+			HRESULT a = dev->StretchRect(bb, &srcRect, g_capture, nullptr, D3DTEXF_NONE); // 1:1 copy out
+			HRESULT b = dev->ColorFill(bb, nullptr, D3DCOLOR_XRGB(0, 0, 0));             // black borders
+			HRESULT c = dev->StretchRect(g_capture, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			if (!g_presentLogged) {
 				logf("first present post-process: grab=0x%08lx fill=0x%08lx blit=0x%08lx",
 				     (long)a, (long)b, (long)c);
@@ -285,20 +315,65 @@ static IDirect3D9 *WINAPI myDirect3DCreate9(UINT sdkVersion) {
 }
 
 // ---- setup ---------------------------------------------------------------------------------------
+// Parse an integer scale written as "x2", "X3", or plain "2".
+static int parseScale(const char *s) {
+	while (*s == ' ' || *s == '\t') s++;
+	if (*s == 'x' || *s == 'X') s++;
+	int n = atoi(s);
+	return n < 1 ? 1 : n;
+}
+
 static void loadConfig() {
 	GetModuleFileNameA(g_module, g_iniPath, 1024);
 	PathRemoveFileSpecA(g_iniPath);
 	PathAppendA(g_iniPath, "ExclusiveFullscreen.ini");
-	g_enabled  = GetPrivateProfileIntA("Fullscreen", "Enabled", 1, g_iniPath) != 0;
-	g_maxScale = GetPrivateProfileIntA("Fullscreen", "MaxScale", 2, g_iniPath);
-	g_ovrW     = GetPrivateProfileIntA("Fullscreen", "WidthOverride", 0, g_iniPath);
-	g_ovrH     = GetPrivateProfileIntA("Fullscreen", "HeightOverride", 0, g_iniPath);
-	g_srcW     = GetPrivateProfileIntA("Fullscreen", "SourceWidth", 640, g_iniPath);
-	g_srcH     = GetPrivateProfileIntA("Fullscreen", "SourceHeight", 480, g_iniPath);
-	g_log      = GetPrivateProfileIntA("Fullscreen", "Log", 0, g_iniPath) != 0;
-	if (g_maxScale < 1) g_maxScale = 1;
+	g_enabled = GetPrivateProfileIntA("Fullscreen", "Enabled", 1, g_iniPath) != 0;
+
+	char mode[64] = {0};
+	GetPrivateProfileStringA("Fullscreen", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
+	if (StrCmpIA(mode, "IntegerScaling") == 0)        g_mode = MODE_INTEGER;
+	else if (StrCmpIA(mode, "CustomResolution") == 0) g_mode = MODE_CUSTOM;
+	else                                              g_mode = MODE_FIT;
+
+	char scale[32] = {0};
+	GetPrivateProfileStringA("Fullscreen", "IntegerScaling", "x2", scale, sizeof(scale), g_iniPath);
+	g_intScale = parseScale(scale);
+
+	g_customW = GetPrivateProfileIntA("Fullscreen", "CustomWidth", 1280, g_iniPath);
+	g_customH = GetPrivateProfileIntA("Fullscreen", "CustomHeight", 960, g_iniPath);
+	g_srcW    = GetPrivateProfileIntA("Fullscreen", "SourceWidth", 640, g_iniPath);
+	g_srcH    = GetPrivateProfileIntA("Fullscreen", "SourceHeight", 480, g_iniPath);
+	g_log     = GetPrivateProfileIntA("Fullscreen", "Log", 0, g_iniPath) != 0;
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
+}
+
+// ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
+// Polled with edge detection on a background thread (only while this game has foreground focus). The
+// change is applied live - it only affects the post-process output size, so no device reset is needed.
+static void applyHotkey(int digit) {
+	if (digit == 0) { g_mode = MODE_FIT; logf("hotkey: Alt+0 -> FitToScreen"); }
+	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> IntegerScaling x%d", digit, digit); }
+	computeOutput();   // native size already known once we've gone fullscreen; no-op before then
+}
+
+static DWORD WINAPI hotkeyThread(LPVOID) {
+	const int vk[5] = { '0', '1', '2', '3', '4' };
+	bool prev[5] = { false, false, false, false, false };
+	while (true) {
+		bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+		DWORD fgpid = 0;
+		HWND fg = GetForegroundWindow();
+		if (fg) GetWindowThreadProcessId(fg, &fgpid);
+		bool focused = (fgpid == GetCurrentProcessId());
+		for (int i = 0; i < 5; i++) {
+			bool down = alt && focused && (GetAsyncKeyState(vk[i]) & 0x8000) != 0;
+			if (down && !prev[i]) applyHotkey(i);
+			prev[i] = down;
+		}
+		Sleep(25);
+	}
+	return 0;
 }
 
 static void setupHooks() {
@@ -319,14 +394,14 @@ extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hParentModule) {
 	g_module = hMyModule;
 	loadConfig();
-	if (g_enabled)
+	if (g_enabled) {
 		setupHooks();
-	if (g_ovrW > 0 && g_ovrH > 0)
-		logf("ExclusiveFullscreen initialized: enabled=%d src=%dx%d out=%dx%d (override)",
-		     g_enabled, g_srcW, g_srcH, g_ovrW, g_ovrH);
-	else
-		logf("ExclusiveFullscreen initialized: enabled=%d src=%dx%d out=auto (<= %dx)",
-		     g_enabled, g_srcW, g_srcH, g_maxScale);
+		CloseHandle(CreateThread(nullptr, 0, hotkeyThread, nullptr, 0, nullptr));
+	}
+	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
+	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
+	logf("ExclusiveFullscreen initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d",
+	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH);
 	return TRUE;
 }
 

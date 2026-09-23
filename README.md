@@ -2,9 +2,13 @@
 
 A small [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutensoku (th123) 1.10a that gives you **crisp, integer-scaled exclusive fullscreen**.
 
-Instead of the base game's fullscreen — which stretches the 640×480 image to fill the monitor height by a non-integer factor (e.g. 1080 / 480 = 2.25×) and looks blurry — this mod keeps your desktop at its **native resolution** and draws the game **centered at an exact integer scale** (2× = 1280×960 by default) with **black borders** around it. Because it uses **true exclusive fullscreen**, it also gets the low-latency direct-flip present path ("Independent Flip"), which a legacy Direct3D9 game like this one can't get in a borderless window.
+Instead of the base game's blurry fullscreen, this mod keeps your desktop at its **native resolution** and draws the game **centered with black borders**, in one of three modes. Because it uses **true exclusive fullscreen**, it also gets the low-latency direct-flip present path ("Independent Flip"), which a legacy Direct3D9 game like this one can't get in a borderless window.
 
-It's zero-configuration: it detects your resolution at runtime and picks the largest integer scale that fits (up to `MaxScale`).
+- **FitToScreen** (default) — the largest aspect-correct size that fills the screen (fills the height, pillarbox on the sides). Biggest image; may be a non-integer scale (smoothed with linear filtering).
+- **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
+- **CustomResolution** — an exact size in pixels.
+
+**Hotkeys** (change the mode live, in-game): **Alt+0** = FitToScreen, **Alt+1**…**Alt+4** = IntegerScaling ×1…×4.
 
 ## Install
 
@@ -20,10 +24,13 @@ All options live in `ExclusiveFullscreen.ini`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `Enabled` | `1` | Master switch. |
-| `MaxScale` | `2` | Largest integer scale to use (`2` = up to 2× / 1280×960). Never exceeds what fits your screen, and drops to 1× on screens too small for 2×. Set `3` to allow 3× on tall enough monitors, etc. |
-| `WidthOverride` / `HeightOverride` | `0` | Set **both** to force an exact output size in pixels (centered), ignoring `MaxScale`. Keep a 4:3 ratio and an integer multiple of 640×480 for crisp pixels. |
-| `SourceWidth` / `SourceHeight` | `640` / `480` | The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
+| `Mode` | `FitToScreen` | `FitToScreen`, `IntegerScaling`, or `CustomResolution`. The Alt+0…4 hotkeys change this live. |
+| `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
+| `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
+| `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
 | `Log` | `0` | Set to `1` to write an `ExclusiveFullscreen.log` next to the ini for troubleshooting. |
+
+Only the value for the active `Mode` matters; the others are ignored. Hotkey changes apply immediately and are not written back to the ini (set the `Mode` there for your startup default).
 
 ## Notes
 
