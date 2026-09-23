@@ -40,6 +40,7 @@
 #include <d3d9.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
 // Build hash the loader passes to CheckVersion; only this exact build is patched.
@@ -75,6 +76,11 @@ static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // the game's own render size (grabbed from the backbuffer top-left)
 static int     g_srcH      = 480;
 static DWORD   g_filter    = D3DTEXF_POINT;  // upscale filter (point for integer, linear otherwise)
+static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
+static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
+static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
+static int     g_posX      = -1;       // spawn position (-1 = don't move the window, the mod's old behavior)
+static int     g_posY      = -1;
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -111,6 +117,9 @@ static void logf(const char *fmt, ...) {
 
 // forward declarations (definitions live further down)
 static void installKeyboardHook();
+static void installWndProc();
+static void setWindowScaled(int n, bool applyPos);
+static void onWindowedEntry(bool firstTime);
 
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
@@ -243,7 +252,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
 			HRESULT a = dev->StretchRect(bb, &srcRect, g_capture, nullptr, D3DTEXF_NONE); // 1:1 copy out
-			HRESULT b = dev->ColorFill(bb, nullptr, D3DCOLOR_XRGB(0, 0, 0));             // black borders
+			HRESULT b = dev->ColorFill(bb, nullptr, g_bgColor);                         // border color
 			HRESULT c = dev->StretchRect(g_capture, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			if (!g_presentLogged) {
 				logf("first present post-process: grab=0x%08lx fill=0x%08lx blit=0x%08lx",
@@ -260,10 +269,13 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
+	bool wasWindowed = pp && pp->Windowed;
 	applyFullscreenParams(pp);
 	HRESULT hr = oReset(dev, pp);
 	if (SUCCEEDED(hr) && g_active)
 		createCapture(dev);
+	if (SUCCEEDED(hr) && wasWindowed)
+		onWindowedEntry(false);     // returning to windowed: re-apply the remembered window scale
 	g_presentLogged = false;
 	return hr;
 }
@@ -297,6 +309,7 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
                                      IDirect3DDevice9 **out) {
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+	bool windowed = pp && pp->Windowed;
 	installKeyboardHook();   // we're on the game's UI thread here - the right thread to hook
 	applyFullscreenParams(pp);
 	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
@@ -304,6 +317,9 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 		hookDevice(*out);
 		if (g_active)
 			createCapture(*out);
+		installWndProc();               // subclass the window for drag-resize aspect locking
+		if (windowed)
+			onWindowedEntry(true);      // first windowed spawn: apply saved scale + spawn position
 	}
 	return hr;
 }
@@ -329,6 +345,17 @@ static int parseScale(const char *s) {
 	return n < 1 ? 1 : n;
 }
 
+// Parse an "RRGGBB" hex color (optionally prefixed with '#' or "0x") into a D3DCOLOR.
+static D3DCOLOR parseColor(const char *s, D3DCOLOR fallback) {
+	while (*s == ' ' || *s == '\t') s++;
+	if (*s == '#') s++;
+	else if ((s[0] == '0') && (s[1] == 'x' || s[1] == 'X')) s += 2;
+	char *end = nullptr;
+	unsigned long v = strtoul(s, &end, 16);
+	if (end == s) return fallback;
+	return D3DCOLOR_XRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+}
+
 static void loadConfig() {
 	GetModuleFileNameA(g_module, g_iniPath, 1024);
 	PathRemoveFileSpecA(g_iniPath);
@@ -347,11 +374,34 @@ static void loadConfig() {
 
 	g_customW = GetPrivateProfileIntA("Fullscreen", "CustomWidth", 1280, g_iniPath);
 	g_customH = GetPrivateProfileIntA("Fullscreen", "CustomHeight", 960, g_iniPath);
+
+	char color[32] = {0};
+	GetPrivateProfileStringA("Fullscreen", "BackgroundColor", "000000", color, sizeof(color), g_iniPath);
+	g_bgColor = parseColor(color, D3DCOLOR_XRGB(0, 0, 0));
+
+	g_resizable = GetPrivateProfileIntA("Fullscreen", "Resizable", 1, g_iniPath) != 0;
+	g_persist   = GetPrivateProfileIntA("Fullscreen", "PersistState", 1, g_iniPath) != 0;
+	g_posX      = GetPrivateProfileIntA("Fullscreen", "PositionX", -1, g_iniPath);
+	g_posY      = GetPrivateProfileIntA("Fullscreen", "PositionY", -1, g_iniPath);
+
 	g_srcW    = GetPrivateProfileIntA("Fullscreen", "SourceWidth", 640, g_iniPath);
 	g_srcH    = GetPrivateProfileIntA("Fullscreen", "SourceHeight", 480, g_iniPath);
 	g_log     = GetPrivateProfileIntA("Fullscreen", "Log", 0, g_iniPath) != 0;
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
+}
+
+// Persist the current scaling settings (Mode + IntegerScaling) to the ini so the next launch restores
+// them. Window position is deliberately NOT saved. WritePrivateProfileString edits in place, keeping
+// the other keys and comments.
+static void persistState() {
+	if (!g_persist) return;
+	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
+	              : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
+	char scale[16];
+	wsprintfA(scale, "x%d", g_intScale);
+	WritePrivateProfileStringA("Fullscreen", "Mode", m, g_iniPath);
+	WritePrivateProfileStringA("Fullscreen", "IntegerScaling", scale, g_iniPath);
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
@@ -365,18 +415,69 @@ static HHOOK g_kbHook = nullptr;
 // or a release).
 #define IS_FRESH_KEYDOWN(lp) (((lp) & (1 << 30)) == 0 && ((lp) & (1 << 31)) == 0)
 
+// Total non-client border size (width, height) for the game window's current style.
+static void windowBorders(int *bx, int *by) {
+	RECT r = { 0, 0, 0, 0 };
+	AdjustWindowRectEx(&r, GetWindowLongA(g_hwnd, GWL_STYLE), GetMenu(g_hwnd) != nullptr,
+	                   GetWindowLongA(g_hwnd, GWL_EXSTYLE));
+	*bx = r.right - r.left; *by = r.bottom - r.top;
+}
+
 // Resize the game's window so its client area is exactly (srcW*n) x (srcH*n). We only move the window's
 // borders - the game keeps rendering to its existing backbuffer and D3D9's windowed present stretches it
-// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer.
-static void resizeWindowToScale(int n) {
+// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer. Moves to
+// the configured spawn position only when applyPos is set (and a position is configured).
+static void setWindowScaled(int n, bool applyPos) {
 	if (!g_hwnd || n < 1) return;
-	RECT r = { 0, 0, g_srcW * n, g_srcH * n };
-	LONG style = GetWindowLongA(g_hwnd, GWL_STYLE);
-	LONG ex    = GetWindowLongA(g_hwnd, GWL_EXSTYLE);
-	AdjustWindowRectEx(&r, style, GetMenu(g_hwnd) != nullptr, ex);
-	SetWindowPos(g_hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
-	             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-	logf("windowed resize -> client %dx%d (x%d)", g_srcW * n, g_srcH * n, n);
+	int bx, by; windowBorders(&bx, &by);
+	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
+	int x = 0, y = 0;
+	if (applyPos && g_posX >= 0 && g_posY >= 0) { x = g_posX; y = g_posY; }
+	else flags |= SWP_NOMOVE;
+	SetWindowPos(g_hwnd, nullptr, x, y, g_srcW * n + bx, g_srcH * n + by, flags);
+	logf("window -> client %dx%d (x%d)%s", g_srcW * n, g_srcH * n, n,
+	     (flags & SWP_NOMOVE) ? "" : " +spawn-pos");
+}
+
+// Apply the remembered window scale on entering windowed mode; on the first spawn also honor the
+// configured spawn position.
+static void onWindowedEntry(bool firstTime) {
+	setWindowScaled(g_intScale, firstTime);
+}
+
+// Subclassed window procedure: while windowed and resizable, lock a drag-resize to the source aspect
+// ratio (and a minimum of one source-size) so the stretched image never gets squashed.
+static WNDPROC g_origWndProc = nullptr;
+
+static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+	if (msg == WM_SIZING && g_resizable && !g_active) {
+		RECT *wr = (RECT *)lp;
+		int bx, by; windowBorders(&bx, &by);
+		int cw = (wr->right - wr->left) - bx;
+		int ch = (wr->bottom - wr->top) - by;
+		if (cw < g_srcW) cw = g_srcW;
+		if (ch < g_srcH) ch = g_srcH;
+		if (wp == WMSZ_TOP || wp == WMSZ_BOTTOM) cw = ch * g_srcW / g_srcH; // dragging a horizontal edge
+		else                                     ch = cw * g_srcH / g_srcW; // vertical edge or a corner
+		if (wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT) wr->left = wr->right - (cw + bx);
+		else                                                                wr->right = wr->left + (cw + bx);
+		if (wp == WMSZ_TOP || wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT)    wr->top = wr->bottom - (ch + by);
+		else                                                                wr->bottom = wr->top + (ch + by);
+		return TRUE;
+	}
+	return CallWindowProcA(g_origWndProc, h, msg, wp, lp);
+}
+
+static void installWndProc() {
+	if (g_origWndProc || !g_hwnd) return;
+	if (g_resizable) {
+		LONG style = GetWindowLongA(g_hwnd, GWL_STYLE);
+		SetWindowLongA(g_hwnd, GWL_STYLE, style | WS_THICKFRAME);   // add a drag-resize border
+		SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+	}
+	g_origWndProc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndProc);
+	logf("wndproc subclassed (resizable=%d)", g_resizable);
 }
 
 // "Alt+N" means "N x" in both contexts: it sets the scaling choice (so it carries between modes), then
@@ -385,9 +486,9 @@ static void applyHotkey(int digit) {
 	if (digit == 0) { g_mode = MODE_FIT;     logf("hotkey: Alt+0 -> FitToScreen"); }
 	else            { g_mode = MODE_INTEGER; g_intScale = digit; logf("hotkey: Alt+%d -> x%d", digit, digit); }
 	if (g_active)
-		computeOutput();            // fullscreen: re-scale the centered output live
+		computeOutput();               // fullscreen: re-scale the centered output live
 	else if (digit >= 1)
-		resizeWindowToScale(digit); // windowed: resize the window to N x
+		setWindowScaled(digit, false); // windowed: resize the window to N x
 }
 
 static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
@@ -425,12 +526,16 @@ extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hParentModule) {
 	g_module = hMyModule;
 	loadConfig();
-	if (g_enabled)
-		setupHooks();   // the keyboard hook is installed later, from CreateDevice (on the UI thread)
+	if (g_enabled) {
+		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
+		atexit(persistState);
+	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
-	logf("ExclusiveFullscreen initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d",
-	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH);
+	logf("ExclusiveFullscreen initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
+	     "resizable=%d persist=%d pos=(%d,%d)",
+	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
+	     g_resizable, g_persist, g_posX, g_posY);
 	return TRUE;
 }
 

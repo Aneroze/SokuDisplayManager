@@ -27,6 +27,10 @@ All options live in `ExclusiveFullscreen.ini`:
 | `Mode` | `FitToScreen` | `FitToScreen`, `IntegerScaling`, or `CustomResolution`. The Alt+0…4 hotkeys change this live. |
 | `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
+| `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
+| `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
+| `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
+| `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
 | `Log` | `0` | Set to `1` to write an `ExclusiveFullscreen.log` next to the ini for troubleshooting. |
 
