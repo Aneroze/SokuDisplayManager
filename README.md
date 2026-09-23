@@ -46,6 +46,7 @@ Only the value for the active `Mode` matters; the others are ignored. Hotkey cha
 
 ## Notes
 
+- If you also run **SokuDirectXOptimizations**, set its `use_d3d9ex=0`. Its Direct3D 9Ex mode wraps the graphics device in a way DisplayManager can't hook, so scaling and hotkeys won't work; with `use_d3d9ex=0` the two run together fine.
 - It's real exclusive fullscreen, so Alt-Tab minimizes the game (normal, and fast at native resolution).
 - Windowed mode is left completely alone; the mod only acts when you go fullscreen.
 - Some other mods can freeze Alt+Enter if they create Direct3D resources in `D3DPOOL_DEFAULT` without handling a device reset. That's a bug in those mods, not this one.

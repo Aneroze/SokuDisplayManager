@@ -397,6 +397,9 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 		}
 		Sleep(50);
 	}
+	if (!g_deviceHooked)
+		logf("device watch: no hookable d3d9 device found. If SokuDirectXOptimizations is enabled, set "
+		     "use_d3d9ex=0 - its 9Ex path wraps the device and DisplayManager can't attach to it.");
 	return 0;
 }
 
