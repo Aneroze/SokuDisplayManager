@@ -75,7 +75,8 @@ static int     g_scaleW    = 1280;     // resolved output width  (computed from 
 static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // the game's own render size (grabbed from the backbuffer top-left)
 static int     g_srcH      = 480;
-static DWORD   g_filter    = D3DTEXF_POINT;  // upscale filter (point for integer, linear otherwise)
+static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
+static int     g_filterCfg = 0;              // 0 = Auto (point at integer scales, linear otherwise), 1 = Point, 2 = Linear
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -221,9 +222,13 @@ static void computeOutput() {
 	if (outW < 1) outW = 1;
 	if (outH < 1) outH = 1;
 	g_scaleW = outW; g_scaleH = outH;
-	// Point-sample only when it's an exact integer multiple (crisp); otherwise linear avoids the uneven
-	// doubled/tripled pixels of non-integer point scaling.
-	g_filter = (outW % g_srcW == 0 && outH % g_srcH == 0) ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+	// Filter: Auto = point at exact integer multiples (crisp) and linear otherwise (avoids the uneven
+	// doubled/tripled pixels of non-integer point scaling); or force one via the ini. Point keeps hard
+	// pixels even at non-integer scales (sharper, slightly uneven - what WindowResizer's stretch does).
+	if (g_filterCfg == 1)      g_filter = D3DTEXF_POINT;
+	else if (g_filterCfg == 2) g_filter = D3DTEXF_LINEAR;
+	else                       g_filter = (outW % g_srcW == 0 && outH % g_srcH == 0) ? D3DTEXF_POINT
+	                                                                                 : D3DTEXF_LINEAR;
 	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
 	     ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
 	     g_filter == D3DTEXF_POINT ? "point" : "linear");
@@ -525,6 +530,12 @@ static void loadConfig() {
 	char color[32] = {0};
 	GetPrivateProfileStringA("Display", "BackgroundColor", "000000", color, sizeof(color), g_iniPath);
 	g_bgColor = parseColor(color, D3DCOLOR_XRGB(0, 0, 0));
+
+	char filt[32] = {0};
+	GetPrivateProfileStringA("Display", "Filter", "Auto", filt, sizeof(filt), g_iniPath);
+	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = 1;
+	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = 2;
+	else                                    g_filterCfg = 0;
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
 	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
