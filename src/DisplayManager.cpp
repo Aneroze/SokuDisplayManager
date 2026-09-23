@@ -29,7 +29,7 @@
 //      integer scaling with black borders, independent of how the game maps its coordinates.
 // Windowed mode is passed through (restored) so Alt+Enter still toggles windowed <-> crisp fullscreen.
 //
-// This mod expects WindowResizer to be DISABLED (they both manage the window/fullscreen path).
+// Use either this or WindowResizer, but never both at the same time.
 //
 // Self-contained: it only needs the Windows SDK (windows.h / d3d9.h / shlwapi.h). It does not import
 // d3d9.lib - it hooks the game's Direct3DCreate9 through the import table and drives the device the game
@@ -86,9 +86,12 @@ static bool    g_transparent = false;  // borderless only: make the border area 
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
-// Hotkeys (Alt + the configured key). VK codes; 0 disables that hotkey.
+// Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
+// also what a commented-out / missing ini line produces).
 enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_COUNT };
+enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
+static int g_modifier = MODK_ALT;      // the modifier held with each hotkey key
 
 // ---- runtime state -------------------------------------------------------------------------------
 static bool      g_createDeviceHooked = false;
@@ -458,16 +461,22 @@ static void loadConfig() {
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
 
-	// [Hotkeys] - each is Alt + the configured key (single letter/digit; blank disables it).
-	struct { int act; const char *name; const char *def; } hk[] = {
-		{ ACT_FIT, "FitToScreen", "0" }, { ACT_S1, "Scale1", "1" }, { ACT_S2, "Scale2", "2" },
-		{ ACT_S3, "Scale3", "3" }, { ACT_S4, "Scale4", "4" }, { ACT_S5, "Scale5", "5" },
-		{ ACT_S6, "Scale6", "6" }, { ACT_TOP, "AlwaysOnTop", "P" },
-	};
-	for (auto &h : hk) {
+	// [Hotkeys] - the modifier plus a per-action key (single letter/digit). A missing/commented/blank
+	// line disables that hotkey (default is empty, so commenting a line out turns it off).
+	char modn[32] = {0};
+	GetPrivateProfileStringA("Hotkeys", "Modifier", "Alt", modn, sizeof(modn), g_iniPath);
+	if      (StrCmpIA(modn, "Ctrl") == 0 || StrCmpIA(modn, "Control") == 0) g_modifier = MODK_CTRL;
+	else if (StrCmpIA(modn, "Shift") == 0)                                  g_modifier = MODK_SHIFT;
+	else if (StrCmpIA(modn, "Win") == 0)                                    g_modifier = MODK_WIN;
+	else if (StrCmpIA(modn, "None") == 0)                                   g_modifier = MODK_NONE;
+	else                                                                    g_modifier = MODK_ALT;
+
+	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
+	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop" };
+	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
-		GetPrivateProfileStringA("Hotkeys", h.name, h.def, k, sizeof(k), g_iniPath);
-		g_hotkeyVk[h.act] = parseKey(k);
+		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);  // "" = disabled
+		g_hotkeyVk[a] = parseKey(k);
 	}
 }
 
@@ -600,7 +609,9 @@ static void enterBorderlessFullscreen() {
 	             mi.rcMonitor.left, mi.rcMonitor.top, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 	if (g_transparent) {
 		BYTE r = (g_bgColor >> 16) & 0xFF, g = (g_bgColor >> 8) & 0xFF, b = g_bgColor & 0xFF;
-		SetLayeredWindowAttributes(g_hwnd, RGB(r, g, b), 0, LWA_COLORKEY);
+		BOOL ok = SetLayeredWindowAttributes(g_hwnd, RGB(r, g, b), 0, LWA_COLORKEY);
+		logf("SetLayeredWindowAttributes key=%02x%02x%02x -> %d (exstyle now 0x%08lx)",
+		     r, g, b, ok, GetWindowLongA(g_hwnd, GWL_EXSTYLE));
 	}
 	g_borderlessActive = true;
 	writeFsFlag(true);
@@ -633,8 +644,19 @@ static void doAction(int act) {
 	}
 }
 
+static bool modifierDown() {
+	switch (g_modifier) {
+	case MODK_CTRL:  return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+	case MODK_SHIFT: return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	case MODK_WIN:   return ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+	case MODK_NONE:  return true;
+	case MODK_ALT:
+	default:         return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	}
+}
+
 static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
-	if (code == HC_ACTION && IS_FRESH_KEYDOWN(lParam) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+	if (code == HC_ACTION && IS_FRESH_KEYDOWN(lParam) && modifierDown()) {
 		for (int a = 0; a < ACT_COUNT; a++) {
 			if (g_hotkeyVk[a] && (int)wParam == g_hotkeyVk[a]) {
 				doAction(a);

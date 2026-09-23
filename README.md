@@ -8,7 +8,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
 - **CustomResolution** — an exact size in pixels.
 
-**Hotkeys** (live, in-game; all rebindable in the `[Hotkeys]` ini section):
+**Hotkeys** (live, in-game). Default modifier is **Alt**; all keys and the modifier are rebindable in the `[Hotkeys]` ini section, and commenting out a line disables that hotkey:
 - **Alt+1**…**Alt+6** — set IntegerScaling ×1…×6 in fullscreen, or resize the window to that scale (640×480 × N) when windowed.
 - **Alt+0** — FitToScreen.
 - **Alt+P** — toggle always-on-top.
@@ -17,7 +17,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 
 1. Download the latest [release](https://github.com/Aneroze/SokuDisplayManager/releases/latest) and unarchive the `DisplayManager` folder into your Soku `modules` directory.
 2. Enable **DisplayManager** in SokuLauncher's mod settings (or add a line for it in `SWRSToys.ini` if you don't use the launcher).
-3. **Disable WindowResizer.** Both mods manage the window/fullscreen path — use one or the other.
+3. **Use either this or WindowResizer, but never both at the same time.**
 4. Launch the game and press **Alt+Enter** to toggle fullscreen.
 
 ## Configuration
@@ -39,7 +39,7 @@ All options live in `DisplayManager.ini`:
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Warning:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays or a transparent background. |
 | `TransparentBackground` | `0` | Borderless only. Makes the border area (the `BackgroundColor`) see-through to the desktop via a color-key. Pick a `BackgroundColor` the game never draws (e.g. `FF00FF`) to avoid see-through holes. |
 
-The `[Hotkeys]` section rebinds each hotkey (Alt + the given letter/digit; blank disables): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`.
+The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`.
 
 With `Borderless` available, this mod is a superset of WindowResizer — window sizing/positioning, borderless *and* exclusive fullscreen, always-on-top, and crisp integer scaling.
 
