@@ -12,7 +12,8 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **Alt+1**…**Alt+6** — set IntegerScaling ×1…×6 in fullscreen, or resize the window to that scale (640×480 × N) when windowed.
 - **Alt+0** — FitToScreen.
 - **Alt+P** — toggle always-on-top.
-- **Alt+F** — cycle the upscale filter (Auto → Point → Linear) live.
+- **Alt+F** — cycle the upscale filter (Auto → Point → Linear → Sharp) live.
+- **Alt+K** / **Alt+L** — decrease / increase the Sharpness when `Filter=Sharp` (live).
 
 ## Install
 
@@ -32,7 +33,8 @@ All options live in `DisplayManager.ini`:
 | `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
 | `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
-| `Filter` | `Auto` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels (sharper at non-integer sizes like 1080p's 2.25×, matching WindowResizer; slightly uneven). `Linear` = always smooth. |
+| `Filter` | `Auto` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
+| `Sharpness` | `1.5` | Only used when `Filter=Sharp`. `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels. `~1.5` closely matches WindowResizer. Tune live with Alt+K/Alt+L. |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
@@ -42,7 +44,7 @@ All options live in `DisplayManager.ini`:
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
 
-The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`, `CycleFilter`.
+The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`, `CycleFilter`, `SharpnessDown`, `SharpnessUp`.
 
 With `Borderless` available, this mod is a superset of WindowResizer — window sizing/positioning, borderless *and* exclusive fullscreen, always-on-top, and crisp integer scaling.
 

@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
+#include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
 // Build hash the loader passes to CheckVersion; only this exact build is patched.
@@ -88,10 +89,19 @@ static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
+// SmoothRender (experimental, windowed only for now): th123 builds its 2D projection from the WINDOW
+// CLIENT size at device-creation time, and D3D9's windowed present uses a linear (smooth) stretch only
+// when the window is larger than the 640 backbuffer AT CREATION. Sizing the game's main window large at
+// creation therefore reproduces WindowResizer's "started at 1280 looks smooth" render in WINDOWED mode.
+// (This does NOT affect exclusive fullscreen, where DM upscales the grabbed 640 frame itself.)
+static bool    g_smoothRender = false;
+static int     g_smoothW      = 1280;  // window client size forced at creation (drives the smooth present)
+static int     g_smoothH      = 960;
 
 // Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
 // also what a commented-out / missing ini line produces).
-enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER, ACT_COUNT };
+enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER,
+              ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;      // the modifier held with each hotkey key
@@ -102,7 +112,13 @@ static bool      g_deviceHooked       = false;
 static bool      g_active             = false;  // currently forcing exclusive fullscreen?
 static UINT      g_bbW = 0, g_bbH = 0;          // forced backbuffer size (= native desktop)
 static D3DFORMAT g_bbFormat = D3DFMT_X8R8G8B8;  // backbuffer format (for the capture RT)
-static IDirect3DSurface9 *g_capture = nullptr;  // offscreen RT holding the grabbed game frame
+// Grabbed game frame: a render-target TEXTURE (so the Sharp shader can sample it) plus its level-0
+// surface (the StretchRect grab target, and the source for Point/Linear StretchRect upscales).
+static IDirect3DTexture9      *g_captureTex  = nullptr;
+static IDirect3DSurface9      *g_captureSurf = nullptr;
+static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
+static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
+static float                   g_sharpness   = 2.0f;     // 1 = aligned bilinear; higher = crisper toward point
 // The game's canonical windowed backbuffer size, captured from the first (windowed) CreateDevice, so a
 // return to windowed restores it instead of inheriting the huge fullscreen size we wrote into the
 // game's shared present-params struct.
@@ -176,6 +192,11 @@ typedef HRESULT (WINAPI *SCPresent_t)(IDirect3DSwapChain9 *, const RECT *, const
                                       const RGNDATA *, DWORD);
 static SCPresent_t oSCPresent = nullptr;
 
+// SmoothRender: the game's own CreateWindowExA (redirected at its single main-window call site).
+typedef HWND (WINAPI *CreateWindowExA_t)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int,
+                                         HWND, HMENU, HINSTANCE, LPVOID);
+static CreateWindowExA_t oCreateWindowExA = nullptr;
+
 // Overwrite one vtable slot, returning the previous entry. A single aligned pointer store, safe while
 // the render thread may be calling through the table.
 static void *hookSlot(void **vtable, int index, void *hook) {
@@ -227,6 +248,7 @@ static void computeOutput() {
 	// pixels even at non-integer scales (sharper, slightly uneven - what WindowResizer's stretch does).
 	if (g_filterCfg == 1)      g_filter = D3DTEXF_POINT;
 	else if (g_filterCfg == 2) g_filter = D3DTEXF_LINEAR;
+	else if (g_filterCfg == 3) g_filter = D3DTEXF_LINEAR;   // Sharp: shader does the work; StretchRect fallback
 	else                       g_filter = (outW % g_srcW == 0 && outH % g_srcH == 0) ? D3DTEXF_POINT
 	                                                                                 : D3DTEXF_LINEAR;
 	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
@@ -316,37 +338,93 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
 static void releaseCapture() {
-	if (g_capture) { g_capture->Release(); g_capture = nullptr; }
+	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
+	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
+	if (g_captureSurf) { g_captureSurf->Release(); g_captureSurf = nullptr; }
+	if (g_captureTex)  { g_captureTex->Release();  g_captureTex = nullptr; }
 }
 
 static void createCapture(IDirect3DDevice9 *dev) {
 	releaseCapture();
-	HRESULT hr = dev->CreateRenderTarget((UINT)g_srcW, (UINT)g_srcH, g_bbFormat,
-	                                     D3DMULTISAMPLE_NONE, 0, FALSE, &g_capture, nullptr);
-	logf("createCapture %dx%d fmt=%d -> hr=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat, (long)hr);
+	// A render-target texture (usable both as a StretchRect surface and a shader source).
+	HRESULT hr = dev->CreateTexture((UINT)g_srcW, (UINT)g_srcH, 1, D3DUSAGE_RENDERTARGET, g_bbFormat,
+	                                D3DPOOL_DEFAULT, &g_captureTex, nullptr);
+	if (SUCCEEDED(hr) && g_captureTex)
+		g_captureTex->GetSurfaceLevel(0, &g_captureSurf);
+	// Compile-once pixel shader for the Sharp filter (falls back to StretchRect if this fails).
+	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
+	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
+	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat, (long)hr, (long)hrPs);
 }
 
 // ---- device / swapchain method hooks -------------------------------------------------------------
 static bool g_presentLogged = false;
 
+// Sharp-bilinear upscale: draw a full-screen quad over the (centered) destination rect, sampling the
+// captured 640 texture through the sharp-bilinear shader. The quad's vertices sit exactly on the dst-rect
+// corners with UV 0..1 (NO -0.5 vertex offset - that offset is for 1:1 texel->pixel mapping and would
+// mis-align a *scaled* quad by a fraction of a texel; verified against WR's output that offset 0 matches).
+// Sharpness 1 = aligned bilinear; higher narrows the interpolation band toward point (~1.5 matches WR).
+static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *dstRect) {
+	if (!g_ps || !g_captureTex || !g_stateBlock) return;
+	g_stateBlock->Capture();                                  // save all device state
+	dev->SetRenderTarget(0, bb);
+	dev->SetPixelShader(g_ps);
+	dev->SetVertexShader(nullptr);
+	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+	dev->SetTexture(0, g_captureTex);
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+	dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+	dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+	dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+	float c0[4] = { (float)g_srcW, (float)g_srcH, g_sharpness, 0.0f };
+	dev->SetPixelShaderConstantF(0, c0, 1);
+	float L = (float)dstRect->left, T = (float)dstRect->top, R = (float)dstRect->right, B = (float)dstRect->bottom;
+	struct V { float x, y, z, rhw, u, v; } q[4] = {
+		{ L, T, 0.0f, 1.0f, 0.0f, 0.0f },
+		{ R, T, 0.0f, 1.0f, 1.0f, 0.0f },
+		{ L, B, 0.0f, 1.0f, 0.0f, 1.0f },
+		{ R, B, 0.0f, 1.0f, 1.0f, 1.0f },
+	};
+	if (SUCCEEDED(dev->BeginScene())) {
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+		dev->EndScene();
+	}
+	g_stateBlock->Apply();                                    // restore all device state
+}
+
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
 	// resolution backbuffer. Grab that region, wipe the whole backbuffer black, then blit it back
-	// scaled to an integer-multiple size, centered - point-filtered so it stays crisp.
-	if (g_active && g_capture) {
+	// scaled + centered. Point/Linear go through StretchRect; Sharp goes through the shader quad.
+	if (g_active && g_captureSurf) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
 		if (dev && SUCCEEDED(sc->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
 			RECT srcRect = { 0, 0, g_srcW, g_srcH };
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
-			HRESULT a = dev->StretchRect(bb, &srcRect, g_capture, nullptr, D3DTEXF_NONE); // 1:1 copy out
-			HRESULT b = dev->ColorFill(bb, nullptr, g_bgColor);                         // border color
-			HRESULT c = dev->StretchRect(g_capture, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
+			HRESULT a = dev->StretchRect(bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE); // 1:1 grab
+			HRESULT b = dev->ColorFill(bb, nullptr, g_bgColor);                              // borders
+			HRESULT c = S_OK;
+			if (g_filterCfg == 3 && g_ps) {
+				drawSharp(dev, bb, &dstRect);
+			} else {
+				c = dev->StretchRect(g_captureSurf, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
+			}
 			if (!g_presentLogged) {
-				logf("first present post-process: grab=0x%08lx fill=0x%08lx blit=0x%08lx",
-				     (long)a, (long)b, (long)c);
+				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
+				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness);
 				g_presentLogged = true;
 			}
 			bb->Release();
@@ -535,7 +613,14 @@ static void loadConfig() {
 	GetPrivateProfileStringA("Display", "Filter", "Auto", filt, sizeof(filt), g_iniPath);
 	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = 1;
 	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = 2;
+	else if (StrCmpIA(filt, "Sharp") == 0)  g_filterCfg = 3;
 	else                                    g_filterCfg = 0;
+
+	char sharp[32] = {0};
+	GetPrivateProfileStringA("Display", "Sharpness", "2.0", sharp, sizeof(sharp), g_iniPath);
+	g_sharpness = (float)atof(sharp);
+	if (g_sharpness < 1.0f) g_sharpness = 1.0f;
+	if (g_sharpness > 16.0f) g_sharpness = 16.0f;
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
 	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
@@ -548,6 +633,11 @@ static void loadConfig() {
 
 	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
 	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
+	g_smoothRender = GetPrivateProfileIntA("Display", "SmoothRender", 0, g_iniPath) != 0;
+	g_smoothW = GetPrivateProfileIntA("Display", "SmoothRenderWidth", 1280, g_iniPath);
+	g_smoothH = GetPrivateProfileIntA("Display", "SmoothRenderHeight", 960, g_iniPath);
+	if (g_smoothW < g_srcW) g_smoothW = g_srcW;
+	if (g_smoothH < g_srcH) g_smoothH = g_srcH;
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 	if (g_srcW < 1) g_srcW = 640;
 	if (g_srcH < 1) g_srcH = 480;
@@ -563,7 +653,8 @@ static void loadConfig() {
 	else                                                                    g_modifier = MODK_ALT;
 
 	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
-	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter" };
+	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter",
+	                                 "SharpnessDown", "SharpnessUp" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);  // "" = disabled
@@ -571,9 +662,9 @@ static void loadConfig() {
 	}
 }
 
-// Persist the current scaling settings (Mode + IntegerScaling) to the ini so the next launch restores
-// them. Window position is deliberately NOT saved. WritePrivateProfileString edits in place, keeping
-// the other keys and comments.
+// Persist the current scaling settings (Mode + IntegerScaling + Filter + Sharpness) to the ini so the
+// next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
+// NOT saved. WritePrivateProfileString edits in place, keeping the other keys and comments.
 static void persistState() {
 	if (!g_persist) return;
 	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
@@ -582,6 +673,15 @@ static void persistState() {
 	wsprintfA(scale, "x%d", g_intScale);
 	WritePrivateProfileStringA("Display", "Mode", m, g_iniPath);
 	WritePrivateProfileStringA("Display", "IntegerScaling", scale, g_iniPath);
+
+	const char *f = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
+	              : g_filterCfg == 3 ? "Sharp" : "Auto";
+	WritePrivateProfileStringA("Display", "Filter", f, g_iniPath);
+	// wsprintf has no %f; format the sharpness manually (2 decimals).
+	int hundredths = (int)(g_sharpness * 100.0f + 0.5f);
+	char sh[32];
+	wsprintfA(sh, "%d.%02d", hundredths / 100, hundredths % 100);
+	WritePrivateProfileStringA("Display", "Sharpness", sh, g_iniPath);
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
@@ -725,10 +825,19 @@ static void doAction(int act) {
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
 	case ACT_FILTER: {
-		g_filterCfg = (g_filterCfg + 1) % 3;   // Auto -> Point -> Linear -> Auto
+		g_filterCfg = (g_filterCfg + 1) % 4;   // Auto -> Point -> Linear -> Sharp -> Auto
 		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
-		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear" : "Auto";
+		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
+		              : g_filterCfg == 3 ? "Sharp" : "Auto";
 		logf("hotkey: filter -> %s", n);
+		break;
+	}
+	case ACT_SHARP_DOWN:
+	case ACT_SHARP_UP: {
+		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
+		if (g_sharpness < 1.0f) g_sharpness = 1.0f;
+		if (g_sharpness > 16.0f) g_sharpness = 16.0f;
+		logf("hotkey: sharpness -> %.2f (Filter=Sharp to see it; 1=bilinear, higher=crisper)", g_sharpness);
 		break;
 	}
 	}
@@ -769,6 +878,47 @@ static void installKeyboardHook() {
 	     tid, GetCurrentThreadId(), g_kbHook ? "installed" : "FAILED");
 }
 
+// ---- SmoothRender: size the main window large at creation + clamp viewport init to 640 -----------
+// Force the game's MAIN window client to g_smoothW x g_smoothH at creation, so the game bakes a large
+// projection and D3D9's windowed present uses its smooth (linear) stretch for the 640 backbuffer.
+static HWND WINAPI myCreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y,
+                                     int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+	RECT r = { 0, 0, g_smoothW, g_smoothH };
+	AdjustWindowRectEx(&r, style, menu != nullptr, ex);
+	int nw = r.right - r.left, nh = r.bottom - r.top;
+	logf("SmoothRender: sizing main window to client %dx%d (outer %dx%d)", g_smoothW, g_smoothH, nw, nh);
+	return oCreateWindowExA(ex, cls, name, style, x, y, nw, nh, parent, menu, inst, param);
+}
+// The redirected call site does `call dword ptr [&g_myCWEptr]`, so this variable holds our function.
+static HWND (WINAPI *g_myCWEptr)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU,
+                                 HINSTANCE, LPVOID) = myCreateWindowExA;
+
+// Redirect only the ONE call site that makes the main window (0x007FB713 = `call dword ptr [IAT]`).
+static void hookCreateWindowExA() {
+	DWORD operandAddr = 0x007FB713 + 2;                 // the 4-byte [IAT-slot address] operand
+	DWORD old;
+	VirtualProtect((void *)operandAddr, 4, PAGE_EXECUTE_READWRITE, &old);
+	DWORD slotAddr = *(DWORD *)operandAddr;             // address of the IAT slot
+	oCreateWindowExA = *(CreateWindowExA_t *)slotAddr;  // the real CreateWindowExA
+	*(DWORD *)operandAddr = (DWORD)&g_myCWEptr;         // point the call at our fn-ptr variable
+	VirtualProtect((void *)operandAddr, 4, old, &old);
+	logf("SmoothRender: CreateWindowExA call-site redirected (orig=%p)", (void *)oCreateWindowExA);
+}
+
+// Force the game's viewport/backbuffer init to g_srcW x g_srcH instead of the window size (same patch as
+// WindowResizer at 0x00414F8C): mov edx, srcW ; nop nop nop ; mov eax, srcH ; nop nop nop  (16 bytes).
+static void patchViewportInit() {
+	DWORD old;
+	VirtualProtect((void *)0x00414F8C, 16, PAGE_EXECUTE_READWRITE, &old);
+	*(BYTE *)0x00414F8C = 0xBA; *(int *)0x00414F8D = g_srcW;                 // mov edx, srcW
+	*(BYTE *)0x00414F91 = 0x90; *(BYTE *)0x00414F92 = 0x90; *(BYTE *)0x00414F93 = 0x90;
+	*(BYTE *)0x00414F94 = 0xB8; *(int *)0x00414F95 = g_srcH;                 // mov eax, srcH
+	*(BYTE *)0x00414F99 = 0x90; *(BYTE *)0x00414F9A = 0x90; *(BYTE *)0x00414F9B = 0x90;
+	VirtualProtect((void *)0x00414F8C, 16, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), (void *)0x00414F8C, 16);
+	logf("SmoothRender: viewport init forced to %dx%d (0x414F8C)", g_srcW, g_srcH);
+}
+
 static void setupHooks() {
 	// The IAT slot holds the Direct3DCreate9 pointer directly (the game does `jmp [0x8572A0]`); swap in
 	// our wrapper and keep the original to call through.
@@ -784,6 +934,12 @@ static void setupHooks() {
 	// Alt+Enter toggle flipping the right way. `mov [0x8998B0], al` at 0x004405BC is 5 bytes.
 	if (g_borderless)
 		patchNop(0x004405BC, 5);
+
+	// SmoothRender (windowed): size the main window large at creation + clamp the render viewport to 640.
+	if (g_smoothRender) {
+		hookCreateWindowExA();
+		patchViewportInit();
+	}
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
@@ -806,6 +962,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
 	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
+	logf("  SmoothRender=%d (%dx%d)", g_smoothRender, g_smoothW, g_smoothH);
 	return TRUE;
 }
 

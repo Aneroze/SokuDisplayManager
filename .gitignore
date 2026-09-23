@@ -6,3 +6,4 @@ build/
 *.pdb
 *.ilk
 *.log
+dist/
