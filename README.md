@@ -34,6 +34,8 @@ All options live in `DisplayManager.ini`:
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
+| `FullscreenWidth` / `FullscreenHeight` | `0` | *(advanced)* Force the fullscreen **display mode** — the actual screen resolution the monitor switches to (not the game surface, not the scaled output). `0` = auto-detect your monitor's native resolution (recommended). Set both to override if auto-detection picks the wrong mode. |
+| `FullscreenRefresh` | `0` | *(advanced)* Refresh rate for the forced mode; `0` keeps the native refresh. |
 | `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |

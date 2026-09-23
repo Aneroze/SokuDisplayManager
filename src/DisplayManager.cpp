@@ -82,6 +82,9 @@ static bool    g_persist   = true;     // save the current scaling settings to t
 static int     g_posX      = -1;       // spawn position (-1 = don't move the window, the mod's old behavior)
 static int     g_posY      = -1;
 static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
+static int     g_fsW       = 0;        // manual fullscreen display-mode override (0 = auto / native)
+static int     g_fsH       = 0;
+static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -231,6 +234,7 @@ static void computeOutput() {
 // monitor) so exclusive fullscreen always uses the true current mode - otherwise the desktop gets
 // switched to a wrong (often small) resolution, which is blurry and shuffles the user's windows.
 static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
+	*w = *h = *refresh = 0;
 	if (g_hwnd) {
 		MONITORINFOEXA mi; mi.cbSize = sizeof(mi);
 		if (GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
@@ -238,16 +242,22 @@ static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 			if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
 			    dm.dmPelsWidth && dm.dmPelsHeight) {
 				*w = dm.dmPelsWidth; *h = dm.dmPelsHeight; *refresh = dm.dmDisplayFrequency;
-				return;
+			} else {
+				*w = mi.rcMonitor.right - mi.rcMonitor.left;
+				*h = mi.rcMonitor.bottom - mi.rcMonitor.top;
 			}
-			*w = mi.rcMonitor.right - mi.rcMonitor.left;
-			*h = mi.rcMonitor.bottom - mi.rcMonitor.top;
-			*refresh = 0;
-			return;
 		}
 	}
-	const D3DDISPLAYMODE *d = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
-	*w = d->Width; *h = d->Height; *refresh = d->RefreshRate;
+	if (!*w || !*h) {
+		const D3DDISPLAYMODE *d = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
+		*w = d->Width; *h = d->Height; *refresh = d->RefreshRate;
+	}
+	// Manual override: force a specific fullscreen display mode (e.g. when auto-detection is wrong, or to
+	// run the screen at a non-native resolution on purpose).
+	if (g_fsW > 0 && g_fsH > 0) {
+		*w = g_fsW; *h = g_fsH;
+		if (g_fsRefresh > 0) *refresh = g_fsRefresh;
+	}
 }
 
 // Decide how to shape the present parameters for this (Create)Device/Reset call. Fullscreen requests
@@ -521,6 +531,9 @@ static void loadConfig() {
 	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
 	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
 	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
+	g_fsW          = GetPrivateProfileIntA("Display", "FullscreenWidth", 0, g_iniPath);
+	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
+	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 
 	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
 	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
