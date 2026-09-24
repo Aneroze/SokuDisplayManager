@@ -19,6 +19,6 @@ mkdir -p "$OUT"
   "$ROOT/src/DisplayManager.cpp" \
   -o "$OUT/DisplayManager.dll" \
   -static -static-libgcc -static-libstdc++ \
-  -lshlwapi -luser32
+  -lshlwapi -luser32 -lgdi32
 
 echo "built: $OUT/DisplayManager.dll"

@@ -111,6 +111,11 @@ static IDirect3DSurface9      *g_captureSurf = nullptr;
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
 static float                   g_sharpness   = 2.0f;     // 1 = aligned bilinear; higher = crisper toward point
+static const float             SHARP_MIN     = 1.0f;     // clamp: 1.0 = bilinear
+static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is already visually point (shader
+                                                         // interp band = 0.5/sharp), so no point going higher
+static HFONT                   g_osdFont       = nullptr;// lazily-created font for the on-screen readout
+static volatile DWORD          g_sharpOsdUntil = 0;      // GetTickCount() deadline for the sharpness OSD
 // The game's canonical windowed backbuffer size, captured from the first (windowed) CreateDevice, so a
 // return to windowed restores it instead of inheriting the huge fullscreen size we wrote into the
 // game's shared present-params struct.
@@ -400,6 +405,27 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 	dev->SetViewport(&vp);
 }
 
+// Briefly show the current sharpness value on-screen after Alt+K / Alt+L. th123's backbuffer is a
+// lockable X8R8G8B8 render target, so IDirect3DSurface9::GetDC lets us draw GDI text with no d3dx
+// dependency. `out` is the centered game rect; we place the text at its top-left with a drop shadow.
+static void drawSharpnessOsd(IDirect3DSurface9 *bb, const RECT *out) {
+	HDC hdc = nullptr;
+	if (FAILED(bb->GetDC(&hdc)) || !hdc) return;
+	if (!g_osdFont)
+		g_osdFont = CreateFontA(-28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+		                        FF_SWISS | DEFAULT_PITCH, "Segoe UI");
+	HGDIOBJ oldFont = g_osdFont ? SelectObject(hdc, g_osdFont) : nullptr;
+	SetBkMode(hdc, TRANSPARENT);
+	int h = (int)(g_sharpness * 100.0f + 0.5f);
+	char txt[64]; wsprintfA(txt, "Sharpness %d.%02d", h / 100, h % 100);
+	int len = lstrlenA(txt), px = out->left + 20, py = out->top + 16;
+	SetTextColor(hdc, RGB(0, 0, 0));       TextOutA(hdc, px + 2, py + 2, txt, len);  // shadow
+	SetTextColor(hdc, RGB(255, 255, 255)); TextOutA(hdc, px,     py,     txt, len);  // text
+	if (oldFont) SelectObject(hdc, oldFont);
+	bb->ReleaseDC(hdc);
+}
+
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
@@ -420,17 +446,25 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			} else {
 				c = dev->StretchRect(g_captureSurf, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			}
-			// Re-clear the grab-source region [0,0,g_srcW x g_srcH]. Some mods (e.g. PracticeEx) redraw
-			// their 640x480 menu into the game's top-left during our upscale's EndScene, so it lands over
-			// our composited frame as an un-upscaled dupe in the top-left corner. That region is border
-			// area in our centered output, so clearing it after the upscale removes the dupe; in normal
-			// gameplay nothing redraws there, so this is a harmless no-op.
-			{ RECT clr = { 0, 0, g_srcW, g_srcH }; dev->ColorFill(bb, &clr, g_bgColor); }
+			// Re-clear the BORDER (everything outside the centered game rect) after the upscale. Some
+			// mods (e.g. PracticeEx) redraw their 640x480 menu into the backbuffer top-left during our
+			// upscale, landing over our composited frame as an un-upscaled dupe. We must clear only the
+			// border, NOT the game rect (dstRect) - at large scales (x3 / FitToScreen) the game overlaps
+			// the top-left, so clearing a fixed [0,0,640x480] rect would black part of the game (the
+			// bug this replaces). In gameplay the border is already g_bgColor, so this is a no-op there.
+			{
+				LONG W = (LONG)g_bbW, H = (LONG)g_bbH;
+				if (dstRect.top    > 0) { RECT r = { 0, 0, W, dstRect.top };                       dev->ColorFill(bb, &r, g_bgColor); }
+				if (dstRect.bottom < H) { RECT r = { 0, dstRect.bottom, W, H };                    dev->ColorFill(bb, &r, g_bgColor); }
+				if (dstRect.left   > 0) { RECT r = { 0, dstRect.top, dstRect.left, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
+				if (dstRect.right  < W) { RECT r = { dstRect.right, dstRect.top, W, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
+			}
 			if (!g_presentLogged) {
 				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
 				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness);
 				g_presentLogged = true;
 			}
+			if (GetTickCount() < g_sharpOsdUntil) drawSharpnessOsd(bb, &dstRect);   // Alt+K/L readout
 			bb->Release();
 		}
 		// Re-pin every frame on the render thread so nothing (Reset, SetRenderTarget, other mods) undoes it.
@@ -629,8 +663,8 @@ static void loadConfig() {
 	char sharp[32] = {0};
 	GetPrivateProfileStringA("Display", "Sharpness", "2.0", sharp, sizeof(sharp), g_iniPath);
 	g_sharpness = (float)atof(sharp);
-	if (g_sharpness < 1.0f) g_sharpness = 1.0f;
-	if (g_sharpness > 16.0f) g_sharpness = 16.0f;
+	if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
+	if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
 	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
@@ -839,8 +873,9 @@ static void doAction(int act) {
 	case ACT_SHARP_DOWN:
 	case ACT_SHARP_UP: {
 		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
-		if (g_sharpness < 1.0f) g_sharpness = 1.0f;
-		if (g_sharpness > 16.0f) g_sharpness = 16.0f;
+		if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
+		if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
+		g_sharpOsdUntil = GetTickCount() + 1500;                 // show the value on-screen for ~1.5s
 		logf("hotkey: sharpness -> %.2f (Filter=Sharp to see it; 1=bilinear, higher=crisper)", g_sharpness);
 		break;
 	}
