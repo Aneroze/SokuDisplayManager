@@ -110,7 +110,7 @@ static IDirect3DTexture9      *g_captureTex  = nullptr;
 static IDirect3DSurface9      *g_captureSurf = nullptr;
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
-static float                   g_sharpness   = 1.75f;    // 1 = aligned bilinear; higher = crisper toward point
+static float                   g_sharpness   = 1.50f;    // 1 = aligned bilinear; higher = crisper toward point
 static const float             SHARP_MIN     = 1.0f;     // clamp: 1.0 = bilinear
 static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is already visually point (shader
                                                          // interp band = 0.5/sharp), so no point going higher
@@ -353,10 +353,13 @@ static void createCapture(IDirect3DDevice9 *dev) {
 static bool g_presentLogged = false;
 
 // Sharp-bilinear upscale: draw a full-screen quad over the (centered) destination rect, sampling the
-// captured 640 texture through the sharp-bilinear shader. The quad's vertices sit exactly on the dst-rect
-// corners with UV 0..1 (NO -0.5 vertex offset - that offset is for 1:1 texel->pixel mapping and would
-// mis-align a *scaled* quad by a fraction of a texel; verified against WR's output that offset 0 matches).
-// Sharpness 1 = aligned bilinear; higher narrows the interpolation band toward point (~1.5 matches WR).
+// captured 640 texture through the sharp-bilinear shader. The quad is shifted by the D3D9 -0.5 half-pixel
+// offset so an output pixel at screen x samples texel-space (x+0.5)/scale, i.e. output pixel centers land
+// on (k+0.5)/N. WITHOUT the offset, at scale N every output pixel samples exactly k/N, which for integer N
+// only ever hits texel positions where the sharp-bilinear math is a no-op (at 2x only s=0.0 -> fixed 50/50
+// blend and s=0.5 -> exact texel), so Sharpness has NO visible effect. See
+// docs/WindowResizer-rendering-research.md L166-173. Sharpness 1 = aligned bilinear; higher narrows the
+// interpolation band toward point (~1.5 matches WR).
 static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *dstRect) {
 	if (!g_ps || !g_captureTex || !g_stateBlock) return;
 	g_stateBlock->Capture();                                  // save all device state
@@ -380,7 +383,7 @@ static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *
 	dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
 	float c0[4] = { (float)g_srcW, (float)g_srcH, g_sharpness, 0.0f };
 	dev->SetPixelShaderConstantF(0, c0, 1);
-	float L = (float)dstRect->left, T = (float)dstRect->top, R = (float)dstRect->right, B = (float)dstRect->bottom;
+	float L = dstRect->left - 0.5f, T = dstRect->top - 0.5f, R = dstRect->right - 0.5f, B = dstRect->bottom - 0.5f;
 	struct V { float x, y, z, rhw, u, v; } q[4] = {
 		{ L, T, 0.0f, 1.0f, 0.0f, 0.0f },
 		{ R, T, 0.0f, 1.0f, 1.0f, 0.0f },
@@ -729,7 +732,7 @@ static void loadConfig() {
 	else                                    g_filterCfg = 0;
 
 	char sharp[32] = {0};
-	GetPrivateProfileStringA("Display", "Sharpness", "1.75", sharp, sizeof(sharp), g_iniPath);
+	GetPrivateProfileStringA("Display", "Sharpness", "1.50", sharp, sizeof(sharp), g_iniPath);
 	g_sharpness = (float)atof(sharp);
 	if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
 	if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;

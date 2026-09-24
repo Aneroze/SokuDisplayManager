@@ -15,7 +15,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **Alt+F** — cycle the upscale filter (Auto → Point → Linear → Sharp) live.
 - **Alt+K** / **Alt+L** — decrease / increase the Sharpness (live; also switches `Filter` to `Sharp`).
 
-In fullscreen, each of these changes briefly shows the new value on-screen (e.g. `X2`, `FITTOSCREEN`, `SHARP 1.75`).
+In fullscreen, each of these changes briefly shows the new value on-screen (e.g. `X2`, `FITTOSCREEN`, `SHARP 1.50`).
 
 ## Install
 
@@ -36,7 +36,7 @@ All options live in `DisplayManager.ini`:
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
 | `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
 | `Filter` | `Sharp` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
-| `Sharpness` | `1.75` | Only used when `Filter=Sharp`. Range `1.0`–`4.0`: `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels; `~1.5` closely matches WindowResizer; `~4.0` is effectively point. Tune live with Alt+K/Alt+L (shown on-screen). |
+| `Sharpness` | `1.50` | Only used when `Filter=Sharp`. Range `1.0`–`4.0`: `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels; the default `~1.5` closely matches WindowResizer; `~4.0` is effectively point. Tune live with Alt+K/Alt+L (shown on-screen). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
