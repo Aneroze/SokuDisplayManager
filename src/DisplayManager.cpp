@@ -700,26 +700,36 @@ static void loadConfig() {
 	}
 }
 
+// Write "Display"/key = val only if it differs from what's already in the ini, so an unchanged session
+// doesn't re-serialize the file (which would change its timestamp and prompt editors to reload it).
+static void writeIniIfChanged(const char *key, const char *val) {
+	char cur[64] = {0};
+	GetPrivateProfileStringA("Display", key, "\x01", cur, sizeof(cur), g_iniPath);  // sentinel default
+	if (lstrcmpA(cur, val) != 0)
+		WritePrivateProfileStringA("Display", key, val, g_iniPath);
+}
+
 // Persist the current scaling settings (Mode + IntegerScaling + Filter + Sharpness) to the ini so the
 // next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
-// NOT saved. WritePrivateProfileString edits in place, keeping the other keys and comments.
+// NOT saved. Only keys that actually changed are written (see writeIniIfChanged), so if the user changed
+// nothing the file is left untouched.
 static void persistState() {
 	if (!g_persist) return;
 	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
 	              : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
-	WritePrivateProfileStringA("Display", "Mode", m, g_iniPath);
-	WritePrivateProfileStringA("Display", "IntegerScaling", scale, g_iniPath);
+	writeIniIfChanged("Mode", m);
+	writeIniIfChanged("IntegerScaling", scale);
 
 	const char *f = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
 	              : g_filterCfg == 3 ? "Sharp" : "Auto";
-	WritePrivateProfileStringA("Display", "Filter", f, g_iniPath);
+	writeIniIfChanged("Filter", f);
 	// wsprintf has no %f; format the sharpness manually (2 decimals).
 	int hundredths = (int)(g_sharpness * 100.0f + 0.5f);
 	char sh[32];
 	wsprintfA(sh, "%d.%02d", hundredths / 100, hundredths % 100);
-	WritePrivateProfileStringA("Display", "Sharpness", sh, g_iniPath);
+	writeIniIfChanged("Sharpness", sh);
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
