@@ -433,6 +433,12 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			} else {
 				c = dev->StretchRect(g_captureSurf, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			}
+			// Re-clear the grab-source region [0,0,g_srcW x g_srcH]. Some mods (e.g. PracticeEx) redraw
+			// their 640x480 menu into the game's top-left during our upscale's EndScene, so it lands over
+			// our composited frame as an un-upscaled dupe in the top-left corner. That region is border
+			// area in our centered output, so clearing it after the upscale removes the dupe; in normal
+			// gameplay nothing redraws there, so this is a harmless no-op.
+			{ RECT clr = { 0, 0, g_srcW, g_srcH }; dev->ColorFill(bb, &clr, g_bgColor); }
 			if (!g_presentLogged) {
 				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
 				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness);

@@ -4,8 +4,8 @@ Two rendering bugs, both appearing with DisplayManager active in **exclusive ful
 certainly DM's fullscreen post-process (force native backbuffer + grab the top-left 640 + upscale centered)
 interacting with other rendering. Test on the COPY install (`F:\Games\Touhou\SokuLauncher - Copy`).
 
-> ⚠️ The `dist/DisplayManager-v1.0.0.zip` archive prepared for Quosu predates these fixes. Bug 1 (Okuu) is
-> now FIXED in `src/` — rebuild/repackage before shipping. Bug 2 (PracticeEx dupe) is still open.
+> ✅ Both bugs are now FIXED in `src/`. The `dist/DisplayManager-v1.0.0.zip` archive prepared for Quosu
+> predates these fixes — rebuild/repackage from `build/DisplayManager.dll` before shipping.
 
 ## Bug 1 — Okuu (Utsuho Reiuji): giant off-screen sprite intrudes — ✅ FIXED (2026-09-24)
 
@@ -29,37 +29,40 @@ during Okuu's draw; user-confirmed on screen). Patch: `okuu-viewport-fix.patch`;
 **NOT the cause (red herrings):** the `[0x871538]`=3.0 effect-loop scale (same const windowed & fullscreen);
 `clampvp`/`fakevp` (neither pins the default viewport). See the research doc.
 
-## Bug 2 — PracticeEx menu duplicated (small, top-left)
+## Bug 2 — PracticeEx menu duplicated (small, top-left) — ✅ FIXED (2026-09-24)
 
 **Symptom:** In fullscreen, PracticeEx's menu shows correctly (upscaled + centered) **and** a second,
 smaller, un-upscaled copy in the top-left corner. The menu still works. Screenshot:
 `F:\Games\Touhou\screenshots\practiceex-dupe-bug.png` (2560×1440: big centered menu, plus a ~250 px copy at
 top-left).
 
-**Leading hypothesis:** hook-ordering between DM's **swapchain-Present** post-process (grab top-left 640 →
-ColorFill black → draw upscaled centered) and PracticeEx's overlay drawing. The small top-left copy is
-PracticeEx's menu drawn at native 640 scale **after** DM's grab/upscale (so it isn't captured or centered),
-while the centered copy is the menu that was in the 640 frame DM grabbed. i.e. PracticeEx draws its menu at
-a stage DM doesn't cover (its own EndScene/Present hook, possibly via shady-loader/ImGui), landing in the
-top-left over DM's output.
+**Root cause (established by tracing, not the original hypothesis):** the small top-left copy is the game's
+own 640×480 menu render **re-drawn into the top-left after DM's grab+ColorFill+upscale**. Proof: forcing
+DM's ColorFill to magenta made the top-left dupe render *over* the magenta (semi-transparent), so it is
+composited AFTER DM clears the buffer — and it survives into DM's own present output (not a display-layer or
+separate-window artifact). PracticeEx.dll imports **no** graphics APIs (only kernel32/psapi/shlwapi), so it
+draws nothing itself; it invokes th123's own render functions, and the extra 640 render lands over DM's
+composited frame during our upscale. (Ruled out along the way: separate window, device-level Present, GDI,
+and — via `0x8A0F68/6C` poke — a backbuffer-size read.)
 
-**Investigation plan:**
-1. Find PracticeEx's render hook: does it draw in EndScene, device Present, the swapchain Present, or via
-   shady-lua/ImGui? (`C:\Projects\SokuMods\modules\PracticeEx` — read its source.)
-2. Determine DM-vs-PracticeEx present-hook order (which runs first).
-3. Fix options: (a) DM grabs/upscales at a later point that includes overlays; (b) DM detects and also
-   upscales/relocates the post-grab overlay region; (c) special-case: DM re-grab if content changed after
-   its pass. Prefer a general fix so any overlay mod (InGameHostlist, ReplayHudExtras, etc.) composits
-   correctly — those set their own 2/clientW projection and draw overlays too (see UPDATE 4/5).
+**Fix (implemented in `src/DisplayManager.cpp`, `mySCPresent`):** after the grab/ColorFill/upscale, re-clear
+the grab-source region `[0,0,g_srcW × g_srcH]` to `g_bgColor` (one extra `dev->ColorFill`). That region is
+border area in DM's centered output, so clearing it removes the dupe; in normal gameplay nothing redraws
+there, so it is a harmless no-op. Verified in borderless fullscreen with the full mod set (harness `clearsrc`
+test first, then the DM-built fix; user-confirmed the menu now renders with no dupe and the centered menu
+correct). Diagnosed with `tools/SokuHarness` (`pex`/`dupe`/`capafterdm`/`cfcolor`/`clearsrc` commands).
 
-## Common root cause to weigh
-Both bugs stem from DM's exclusive-fullscreen model: **force a native backbuffer, let the game draw 640 in
-the top-left, then grab+upscale.** Overlays/effects that draw at native scale or after DM's grab, or that
-size render targets from the backbuffer, break. Consider whether a different composition point (e.g. grab
-later, or hook the actual final present after all mods) fixes both at once — without losing exclusive/
-Independent-Flip latency (hard requirement).
+**Note / possible follow-up:** the re-clear currently covers only the top-left grab-source rect. If another
+overlay mod (InGameHostlist, ReplayHudExtras, PunishDisplay, …) is ever seen drawing an un-upscaled dupe
+*outside* that rect, generalize the re-clear to all border regions (everything outside the centered output).
+
+## Both bugs — common thread (resolved)
+Both stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale). Bug 1 = the
+default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to 640×480).
+Bug 2 = a post-clear 640 re-draw of the menu in the grab-source region (fixed by re-clearing that region).
 
 ## State to resume from
-- DM current: `Filter=Sharp` default (commit 405622f); clean base + core SmoothRender; probes removed from
-  MAIN install. Copy install has the current DLL. Build: `build.bat` / the fxc+cl one-liner in this session.
-- Full rendering research: `docs/WindowResizer-rendering-research.md` (UPDATE 1–5).
+- DM current: `Filter=Sharp` default; Bug 1 (viewport pin) + Bug 2 (grab-source re-clear) fixed. Copy
+  install has the current DLL. Build: `build.bat`.
+- Full rendering research: `docs/WindowResizer-rendering-research.md` (UPDATE 1–5); Bug 1 trail:
+  `docs/bug1-okuu-research.md`.
