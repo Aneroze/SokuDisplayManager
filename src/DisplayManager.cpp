@@ -23,7 +23,7 @@
 //      backbuffer to the *native* desktop mode so the monitor never rescales. Windowed requests are
 //      restored to the game's own windowed size (we must undo the large size we wrote into the shared
 //      present-params struct, or it leaks into the windowed path).
-//   3. Hook the swapchain's Present: the game has drawn its SourceWidth x SourceHeight frame into the
+//   3. Hook the swapchain's Present: the game has drawn its 640x480 frame into the
 //      backbuffer's top-left. Grab it into an offscreen render target, clear the whole backbuffer
 //      black, then StretchRect it back scaled to WidthxHeight, centered, with POINT filtering -> crisp
 //      integer scaling with black borders, independent of how the game maps its coordinates.
@@ -74,8 +74,8 @@ static int     g_customW   = 1280;     // used when g_mode == MODE_CUSTOM
 static int     g_customH   = 960;
 static int     g_scaleW    = 1280;     // resolved output width  (computed from mode + native res)
 static int     g_scaleH    = 960;      // resolved output height
-static int     g_srcW      = 640;      // the game's own render size (grabbed from the backbuffer top-left)
-static int     g_srcH      = 480;
+static int     g_srcW      = 640;      // th123's fixed render size (grab region / pinned viewport); const
+static int     g_srcH      = 480;      // - th123 always renders 640x480, so this is not configurable
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
 static int     g_filterCfg = 0;              // 0 = Auto (point at integer scales, linear otherwise), 1 = Point, 2 = Linear
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
@@ -89,14 +89,6 @@ static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
-// SmoothRender (experimental, windowed only for now): th123 builds its 2D projection from the WINDOW
-// CLIENT size at device-creation time, and D3D9's windowed present uses a linear (smooth) stretch only
-// when the window is larger than the 640 backbuffer AT CREATION. Sizing the game's main window large at
-// creation therefore reproduces WindowResizer's "started at 1280 looks smooth" render in WINDOWED mode.
-// (This does NOT affect exclusive fullscreen, where DM upscales the grabbed 640 frame itself.)
-static bool    g_smoothRender = false;
-static int     g_smoothW      = 1280;  // window client size forced at creation (drives the smooth present)
-static int     g_smoothH      = 960;
 
 // Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
 // also what a commented-out / missing ini line produces).
@@ -191,11 +183,6 @@ static Reset_t oReset = nullptr;
 typedef HRESULT (WINAPI *SCPresent_t)(IDirect3DSwapChain9 *, const RECT *, const RECT *, HWND,
                                       const RGNDATA *, DWORD);
 static SCPresent_t oSCPresent = nullptr;
-
-// SmoothRender: the game's own CreateWindowExA (redirected at its single main-window call site).
-typedef HWND (WINAPI *CreateWindowExA_t)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int,
-                                         HWND, HMENU, HINSTANCE, LPVOID);
-static CreateWindowExA_t oCreateWindowExA = nullptr;
 
 // Overwrite one vtable slot, returning the previous entry. A single aligned pointer store, safe while
 // the render thread may be calling through the table.
@@ -402,7 +389,7 @@ static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *
 	g_stateBlock->Apply();                                    // restore all device state
 }
 
-// Pin the game's viewport to its SourceWidth x SourceHeight frame. th123 never calls SetViewport: it
+// Pin the game's viewport to its 640x480 (g_srcW x g_srcH) frame. th123 never calls SetViewport: it
 // relies on D3D9 setting the viewport to the whole render target at CreateDevice/Reset, which is 640x480
 // in vanilla. With our native-sized backbuffer that default viewport is e.g. 2560x1440, and every draw
 // that uses TRANSFORMED (non-RHW) vertices - the 3D stage and Okuu (Utsuho) - is mapped through it, i.e.
@@ -654,16 +641,10 @@ static void loadConfig() {
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 
-	g_srcW    = GetPrivateProfileIntA("Display", "SourceWidth", 640, g_iniPath);
-	g_srcH    = GetPrivateProfileIntA("Display", "SourceHeight", 480, g_iniPath);
-	g_smoothRender = GetPrivateProfileIntA("Display", "SmoothRender", 0, g_iniPath) != 0;
-	g_smoothW = GetPrivateProfileIntA("Display", "SmoothRenderWidth", 1280, g_iniPath);
-	g_smoothH = GetPrivateProfileIntA("Display", "SmoothRenderHeight", 960, g_iniPath);
-	if (g_smoothW < g_srcW) g_smoothW = g_srcW;
-	if (g_smoothH < g_srcH) g_smoothH = g_srcH;
+	// g_srcW/g_srcH are fixed at 640x480: th123 always renders its scene at that size, so the grab
+	// region, the pinned viewport, and the post-upscale re-clear must all be exactly 640x480 - there is
+	// no useful reason to make it configurable (a wrong value can only clip the game or grab garbage).
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
-	if (g_srcW < 1) g_srcW = 640;
-	if (g_srcH < 1) g_srcH = 480;
 
 	// [Hotkeys] - the modifier plus a per-action key (single letter/digit). A missing/commented/blank
 	// line disables that hotkey (default is empty, so commenting a line out turns it off).
@@ -901,47 +882,6 @@ static void installKeyboardHook() {
 	     tid, GetCurrentThreadId(), g_kbHook ? "installed" : "FAILED");
 }
 
-// ---- SmoothRender: size the main window large at creation + clamp viewport init to 640 -----------
-// Force the game's MAIN window client to g_smoothW x g_smoothH at creation, so the game bakes a large
-// projection and D3D9's windowed present uses its smooth (linear) stretch for the 640 backbuffer.
-static HWND WINAPI myCreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y,
-                                     int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
-	RECT r = { 0, 0, g_smoothW, g_smoothH };
-	AdjustWindowRectEx(&r, style, menu != nullptr, ex);
-	int nw = r.right - r.left, nh = r.bottom - r.top;
-	logf("SmoothRender: sizing main window to client %dx%d (outer %dx%d)", g_smoothW, g_smoothH, nw, nh);
-	return oCreateWindowExA(ex, cls, name, style, x, y, nw, nh, parent, menu, inst, param);
-}
-// The redirected call site does `call dword ptr [&g_myCWEptr]`, so this variable holds our function.
-static HWND (WINAPI *g_myCWEptr)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU,
-                                 HINSTANCE, LPVOID) = myCreateWindowExA;
-
-// Redirect only the ONE call site that makes the main window (0x007FB713 = `call dword ptr [IAT]`).
-static void hookCreateWindowExA() {
-	DWORD operandAddr = 0x007FB713 + 2;                 // the 4-byte [IAT-slot address] operand
-	DWORD old;
-	VirtualProtect((void *)operandAddr, 4, PAGE_EXECUTE_READWRITE, &old);
-	DWORD slotAddr = *(DWORD *)operandAddr;             // address of the IAT slot
-	oCreateWindowExA = *(CreateWindowExA_t *)slotAddr;  // the real CreateWindowExA
-	*(DWORD *)operandAddr = (DWORD)&g_myCWEptr;         // point the call at our fn-ptr variable
-	VirtualProtect((void *)operandAddr, 4, old, &old);
-	logf("SmoothRender: CreateWindowExA call-site redirected (orig=%p)", (void *)oCreateWindowExA);
-}
-
-// Force the game's viewport/backbuffer init to g_srcW x g_srcH instead of the window size (same patch as
-// WindowResizer at 0x00414F8C): mov edx, srcW ; nop nop nop ; mov eax, srcH ; nop nop nop  (16 bytes).
-static void patchViewportInit() {
-	DWORD old;
-	VirtualProtect((void *)0x00414F8C, 16, PAGE_EXECUTE_READWRITE, &old);
-	*(BYTE *)0x00414F8C = 0xBA; *(int *)0x00414F8D = g_srcW;                 // mov edx, srcW
-	*(BYTE *)0x00414F91 = 0x90; *(BYTE *)0x00414F92 = 0x90; *(BYTE *)0x00414F93 = 0x90;
-	*(BYTE *)0x00414F94 = 0xB8; *(int *)0x00414F95 = g_srcH;                 // mov eax, srcH
-	*(BYTE *)0x00414F99 = 0x90; *(BYTE *)0x00414F9A = 0x90; *(BYTE *)0x00414F9B = 0x90;
-	VirtualProtect((void *)0x00414F8C, 16, old, &old);
-	FlushInstructionCache(GetCurrentProcess(), (void *)0x00414F8C, 16);
-	logf("SmoothRender: viewport init forced to %dx%d (0x414F8C)", g_srcW, g_srcH);
-}
-
 static void setupHooks() {
 	// The IAT slot holds the Direct3DCreate9 pointer directly (the game does `jmp [0x8572A0]`); swap in
 	// our wrapper and keep the original to call through.
@@ -957,12 +897,6 @@ static void setupHooks() {
 	// Alt+Enter toggle flipping the right way. `mov [0x8998B0], al` at 0x004405BC is 5 bytes.
 	if (g_borderless)
 		patchNop(0x004405BC, 5);
-
-	// SmoothRender (windowed): size the main window large at creation + clamp the render viewport to 640.
-	if (g_smoothRender) {
-		hookCreateWindowExA();
-		patchViewportInit();
-	}
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
@@ -985,7 +919,6 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
 	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
-	logf("  SmoothRender=%d (%dx%d)", g_smoothRender, g_smoothW, g_smoothH);
 	return TRUE;
 }
 
