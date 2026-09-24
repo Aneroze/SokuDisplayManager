@@ -25,5 +25,5 @@ cl /nologo /LD /MT /EHsc /std:c++17 /O2 ^
   /I "%ROOT%src" ^
   /Fo"%OUT%\\" /Fe"%OUT%\DisplayManager.dll" ^
   "%ROOT%src\DisplayManager.cpp" ^
-  /link shlwapi.lib user32.lib gdi32.lib
+  /link shlwapi.lib user32.lib
 exit /b %errorlevel%

@@ -110,12 +110,12 @@ static IDirect3DTexture9      *g_captureTex  = nullptr;
 static IDirect3DSurface9      *g_captureSurf = nullptr;
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
-static float                   g_sharpness   = 2.0f;     // 1 = aligned bilinear; higher = crisper toward point
+static float                   g_sharpness   = 1.75f;    // 1 = aligned bilinear; higher = crisper toward point
 static const float             SHARP_MIN     = 1.0f;     // clamp: 1.0 = bilinear
 static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is already visually point (shader
                                                          // interp band = 0.5/sharp), so no point going higher
-static HFONT                   g_osdFont       = nullptr;// lazily-created font for the on-screen readout
-static volatile DWORD          g_sharpOsdUntil = 0;      // GetTickCount() deadline for the sharpness OSD
+static volatile DWORD          g_osdUntil = 0;          // GetTickCount() deadline for the OSD toast
+static char                    g_osdText[32] = {0};     // current OSD message (uppercase; see OSD_CHARS)
 // The game's canonical windowed backbuffer size, captured from the first (windowed) CreateDevice, so a
 // return to windowed restores it instead of inheriting the huge fullscreen size we wrote into the
 // game's shared present-params struct.
@@ -405,25 +405,79 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 	dev->SetViewport(&vp);
 }
 
-// Briefly show the current sharpness value on-screen after Alt+K / Alt+L. th123's backbuffer is a
-// lockable X8R8G8B8 render target, so IDirect3DSurface9::GetDC lets us draw GDI text with no d3dx
-// dependency. `out` is the centered game rect; we place the text at its top-left with a drop shadow.
-static void drawSharpnessOsd(IDirect3DSurface9 *bb, const RECT *out) {
-	HDC hdc = nullptr;
-	if (FAILED(bb->GetDC(&hdc)) || !hdc) return;
-	if (!g_osdFont)
-		g_osdFont = CreateFontA(-28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-		                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-		                        FF_SWISS | DEFAULT_PITCH, "Segoe UI");
-	HGDIOBJ oldFont = g_osdFont ? SelectObject(hdc, g_osdFont) : nullptr;
-	SetBkMode(hdc, TRANSPARENT);
-	int h = (int)(g_sharpness * 100.0f + 0.5f);
-	char txt[64]; wsprintfA(txt, "Sharpness %d.%02d", h / 100, h % 100);
-	int len = lstrlenA(txt), px = out->left + 20, py = out->top + 16;
-	SetTextColor(hdc, RGB(0, 0, 0));       TextOutA(hdc, px + 2, py + 2, txt, len);  // shadow
-	SetTextColor(hdc, RGB(255, 255, 255)); TextOutA(hdc, px,     py,     txt, len);  // text
-	if (oldFont) SelectObject(hdc, oldFont);
-	bb->ReleaseDC(hdc);
+// Tiny 5x7 bitmap font for the on-screen hotkey readout (OSD). GDI text via GetDC does NOT composite on
+// th123's backbuffer, so we draw glyphs as solid rectangles with ColorFill instead - pure D3D, works in
+// exclusive flip, and (unlike a DrawPrimitiveUP quad) needs no BeginScene/EndScene, so it can't
+// re-trigger a mod's per-scene overlay redraw. Rows are 5 bits, MSB = leftmost column. Only the
+// characters used by the OSD messages are defined; OSD_CHARS is the parallel lookup key (uppercase).
+static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUX";
+static const BYTE OSD_FONT[][7] = {
+	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
+	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
+	{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, // 2
+	{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, // 3
+	{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, // 4
+	{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, // 5
+	{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, // 6
+	{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, // 7
+	{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, // 8
+	{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, // 9
+	{0x00,0x00,0x00,0x00,0x00,0x06,0x06}, // .
+	{0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // (space)
+	{0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E}, // S
+	{0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, // H
+	{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, // A
+	{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, // R
+	{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, // P
+	{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, // C
+	{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, // E
+	{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, // F
+	{0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, // I
+	{0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, // L
+	{0x11,0x19,0x15,0x13,0x11,0x11,0x11}, // N
+	{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, // O
+	{0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, // T
+	{0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, // U
+	{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // X
+};
+static int osdGlyph(char c) {
+	for (int i = 0; OSD_CHARS[i]; i++) if (OSD_CHARS[i] == c) return i;
+	return 11;   // space
+}
+
+// Post a message to the on-screen readout for ~1.5s (drawn by drawOsd in the fullscreen present hook).
+// Message text must use only OSD_CHARS characters (uppercase). Called from the hotkey thread.
+static void showOsd(const char *msg) {
+	lstrcpynA(g_osdText, msg, sizeof(g_osdText));
+	g_osdUntil = GetTickCount() + 1500;
+}
+
+// Draw g_osdText as ColorFill glyphs at the top-left of the centered game (`out`).
+static void drawOsd(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *out) {
+	char txt[32]; lstrcpynA(txt, g_osdText, sizeof(txt));
+	const int S = 5, gw = 5 * S, gh = 7 * S, sp = S, pad = 3 * S;   // glyph 25x35, 5px gaps
+	int n = lstrlenA(txt); if (n <= 0) return;
+	int textW = n * (gw + sp) - sp, x0 = out->left + 20, y0 = out->top + 16;
+	RECT bar = { x0 - pad, y0 - pad, x0 + textW + pad, y0 + gh + pad };
+	dev->ColorFill(bb, &bar, D3DCOLOR_XRGB(0, 0, 0));               // opaque backdrop for contrast
+	for (int i = 0; i < n; i++) {
+		int gi = osdGlyph(txt[i]), gx = x0 + i * (gw + sp);
+		for (int r = 0; r < 7; r++) {
+			BYTE row = OSD_FONT[gi][r];
+			for (int c = 0; c < 5; c++)
+				if (row & (1 << (4 - c))) {
+					RECT p = { gx + c * S, y0 + r * S, gx + c * S + S, y0 + r * S + S };
+					dev->ColorFill(bb, &p, D3DCOLOR_XRGB(255, 255, 255));
+				}
+		}
+	}
+}
+
+// Build "SHARP X.XX" from the current sharpness into buf.
+static void sharpOsdText(char *buf, int cap) {
+	int hn = (int)(g_sharpness * 100.0f + 0.5f);
+	wsprintfA(buf, "SHARP %d.%02d", hn / 100, hn % 100);
+	(void)cap;
 }
 
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
@@ -459,12 +513,26 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 				if (dstRect.left   > 0) { RECT r = { 0, dstRect.top, dstRect.left, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
 				if (dstRect.right  < W) { RECT r = { dstRect.right, dstRect.top, W, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
 			}
+			// At large scales (x3 / FitToScreen) the centered game overlaps the 640x480 grab region, so a
+			// mod's un-upscaled dupe there (e.g. PracticeEx's menu) lands ON the game, where the border
+			// clear above can't remove it. Re-blit just that overlap corner from the clean grabbed frame
+			// (g_captureSurf, captured before the dupe). We must use StretchRect, NOT drawSharp: the
+			// shader's BeginScene/EndScene re-triggers the mod to redraw the dupe. At integer scales the
+			// blit is POINT (matches the sharp-bilinear result); otherwise LINEAR - a tiny corner only.
+			if (dstRect.left < g_srcW && dstRect.top < g_srcH) {
+				RECT odst = { dstRect.left, dstRect.top, g_srcW, g_srcH };
+				RECT osrc = { 0, 0, (g_srcW - dstRect.left) * g_srcW / g_scaleW,
+				                    (g_srcH - dstRect.top)  * g_srcH / g_scaleH };
+				D3DTEXTUREFILTERTYPE f = (g_scaleW % g_srcW == 0 && g_scaleH % g_srcH == 0)
+				                         ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+				dev->StretchRect(g_captureSurf, &osrc, bb, &odst, f);
+			}
 			if (!g_presentLogged) {
 				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
 				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness);
 				g_presentLogged = true;
 			}
-			if (GetTickCount() < g_sharpOsdUntil) drawSharpnessOsd(bb, &dstRect);   // Alt+K/L readout
+			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
 			bb->Release();
 		}
 		// Re-pin every frame on the render thread so nothing (Reset, SetRenderTarget, other mods) undoes it.
@@ -661,7 +729,7 @@ static void loadConfig() {
 	else                                    g_filterCfg = 0;
 
 	char sharp[32] = {0};
-	GetPrivateProfileStringA("Display", "Sharpness", "2.0", sharp, sizeof(sharp), g_iniPath);
+	GetPrivateProfileStringA("Display", "Sharpness", "1.75", sharp, sizeof(sharp), g_iniPath);
 	g_sharpness = (float)atof(sharp);
 	if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
 	if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
@@ -857,6 +925,7 @@ static void doAction(int act) {
 	case ACT_FIT:
 		g_mode = MODE_FIT;
 		if (g_active) computeOutput();
+		showOsd("FITTOSCREEN");
 		logf("hotkey: FitToScreen");
 		break;
 	case ACT_S1: case ACT_S2: case ACT_S3: case ACT_S4: case ACT_S5: case ACT_S6: {
@@ -864,6 +933,7 @@ static void doAction(int act) {
 		g_mode = MODE_INTEGER; g_intScale = n;
 		if (g_active) computeOutput();          // fullscreen: re-scale the centered output live
 		else          setWindowScaled(n, false); // windowed: resize the window to N x
+		char msg[8]; wsprintfA(msg, "X%d", n); showOsd(msg);
 		logf("hotkey: x%d", n);
 		break;
 	}
@@ -877,16 +947,20 @@ static void doAction(int act) {
 		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
 		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
 		              : g_filterCfg == 3 ? "Sharp" : "Auto";
+		if (g_filterCfg == 3) { char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg); }  // Sharp: show value
+		else showOsd(g_filterCfg == 1 ? "POINT" : g_filterCfg == 2 ? "LINEAR" : "AUTO");
 		logf("hotkey: filter -> %s", n);
 		break;
 	}
 	case ACT_SHARP_DOWN:
 	case ACT_SHARP_UP: {
+		g_filterCfg = 3;                        // sharpness only affects Sharp, so switch to it
+		if (g_active) computeOutput();
 		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
 		if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
 		if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
-		g_sharpOsdUntil = GetTickCount() + 1500;                 // show the value on-screen for ~1.5s
-		logf("hotkey: sharpness -> %.2f (Filter=Sharp to see it; 1=bilinear, higher=crisper)", g_sharpness);
+		char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg);
+		logf("hotkey: filter=Sharp sharpness -> %.2f", g_sharpness);
 		break;
 	}
 	}

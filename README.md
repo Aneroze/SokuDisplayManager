@@ -13,7 +13,9 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **Alt+0** — FitToScreen.
 - **Alt+P** — toggle always-on-top.
 - **Alt+F** — cycle the upscale filter (Auto → Point → Linear → Sharp) live.
-- **Alt+K** / **Alt+L** — decrease / increase the Sharpness when `Filter=Sharp` (live).
+- **Alt+K** / **Alt+L** — decrease / increase the Sharpness (live; also switches `Filter` to `Sharp`).
+
+In fullscreen, each of these changes briefly shows the new value on-screen (e.g. `X2`, `FITTOSCREEN`, `SHARP 1.75`).
 
 ## Install
 
@@ -33,14 +35,13 @@ All options live in `DisplayManager.ini`:
 | `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
 | `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
-| `Filter` | `Auto` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
-| `Sharpness` | `1.5` | Only used when `Filter=Sharp`. `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels. `~1.5` closely matches WindowResizer. Tune live with Alt+K/Alt+L. |
+| `Filter` | `Sharp` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
+| `Sharpness` | `1.75` | Only used when `Filter=Sharp`. Range `1.0`–`4.0`: `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels; `~1.5` closely matches WindowResizer; `~4.0` is effectively point. Tune live with Alt+K/Alt+L (shown on-screen). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
 | `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `FullscreenWidth` / `FullscreenHeight` | `0` | *(advanced)* Force the fullscreen **display mode** — the actual screen resolution the monitor switches to (not the game surface, not the scaled output). `0` = auto-detect your monitor's native resolution (recommended). Set both to override if auto-detection picks the wrong mode. |
 | `FullscreenRefresh` | `0` | *(advanced)* Refresh rate for the forced mode; `0` keeps the native refresh. |
-| `SourceWidth` / `SourceHeight` | `640` / `480` | *(advanced)* The game's own render size that is grabbed and upscaled. Leave as-is unless the image looks clipped or has a border of leftover pixels. |
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
 
