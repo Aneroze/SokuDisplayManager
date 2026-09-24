@@ -402,6 +402,17 @@ static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *
 	g_stateBlock->Apply();                                    // restore all device state
 }
 
+// Pin the game's viewport to its SourceWidth x SourceHeight frame. th123 never calls SetViewport: it
+// relies on D3D9 setting the viewport to the whole render target at CreateDevice/Reset, which is 640x480
+// in vanilla. With our native-sized backbuffer that default viewport is e.g. 2560x1440, and every draw
+// that uses TRANSFORMED (non-RHW) vertices - the 3D stage and Okuu (Utsuho) - is mapped through it, i.e.
+// scaled by backbuffer/640 from the top-left corner: the giant off-screen Okuu. Pre-transformed (XYZRHW)
+// sprites ignore the viewport, which is why only she looked wrong.
+static void setGameViewport(IDirect3DDevice9 *dev) {
+	D3DVIEWPORT9 vp = { 0, 0, (DWORD)g_srcW, (DWORD)g_srcH, 0.0f, 1.0f };
+	dev->SetViewport(&vp);
+}
+
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
@@ -429,6 +440,8 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			}
 			bb->Release();
 		}
+		// Re-pin every frame on the render thread so nothing (Reset, SetRenderTarget, other mods) undoes it.
+		if (dev) setGameViewport(dev);
 	}
 	return oSCPresent(sc, src, dst, wnd, dirty, flags);
 }
@@ -440,8 +453,10 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	applyFullscreenParams(pp);
 	HRESULT hr = oReset(dev, pp);
 	if (SUCCEEDED(hr)) {
-		if (g_active)
+		if (g_active) {
 			createCapture(dev);
+			setGameViewport(dev);
+		}
 		if (g_wantFullscreen) {
 			if (g_borderless) enterBorderlessFullscreen();
 		} else {
@@ -532,8 +547,10 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	if (SUCCEEDED(hr) && out && *out) {
 		hookDevice(*out);
-		if (g_active)
+		if (g_active) {
 			createCapture(*out);
+			setGameViewport(*out);
+		}
 		installWndProc();               // subclass the window for drag-resize aspect locking
 		if (g_wantFullscreen) {
 			if (g_borderless) enterBorderlessFullscreen();
