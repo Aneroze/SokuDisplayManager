@@ -4,8 +4,8 @@ Two rendering bugs, both appearing with DisplayManager active in **exclusive ful
 certainly DM's fullscreen post-process (force native backbuffer + grab the top-left 640 + upscale centered)
 interacting with other rendering. Test on the COPY install (`F:\Games\Touhou\SokuLauncher - Copy`).
 
-> ✅ Both bugs are now FIXED in `src/`. The `dist/DisplayManager-v1.0.0.zip` archive prepared for Quosu
-> predates these fixes — rebuild/repackage from `build/DisplayManager.dll` before shipping.
+> ✅ All three bugs below are now FIXED in `src/` and shipped in `dist/DisplayManager-v1.0.1.zip`
+> (the older `v1.0.0.zip` predates the fixes — use v1.0.1).
 
 ## Bug 1 — Okuu (Utsuho Reiuji): giant off-screen sprite intrudes — ✅ FIXED (2026-09-24)
 
@@ -56,13 +56,41 @@ correct). Diagnosed with `tools/SokuHarness` (`pex`/`dupe`/`capafterdm`/`cfcolor
 overlay mod (InGameHostlist, ReplayHudExtras, PunishDisplay, …) is ever seen drawing an un-upscaled dupe
 *outside* that rect, generalize the re-clear to all border regions (everything outside the centered output).
 
-## Both bugs — common thread (resolved)
-Both stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale). Bug 1 = the
-default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to 640×480).
+## Bug 3 — Sharpness slider (Alt+K/L) had no visible effect — ✅ FIXED (2026-09-24)
+
+**Symptom:** With `Filter=Sharp`, changing `Sharpness` (via ini or Alt+K/L) did nothing — 1.0 and 4.0 were
+pixel-identical. Sharp still looked distinct from Point/Linear (an every-other-pixel seam blend), but the
+*value* was inert.
+
+**Root cause — missing D3D9 −0.5 half-pixel offset in `drawSharp`.** The sharp-bilinear quad's vertices sat
+exactly on the destination-rect corners (no offset). A prior change had deliberately set the offset to 0,
+believing "offset 0 matches WR" — but that apparent match came from an offline compare script that itself
+sampled at pixel centers (equivalent to −0.5), so it validated the wrong thing. Without the offset, at
+integer scale N every output pixel samples texel-space position exactly `k/N`, which only ever lands where
+the sharp-bilinear math is a no-op: at 2× only `s=0.0` (fixed 50/50 blend) or `s=0.5` (exact texel), for any
+Sharpness. Confirmed by a second model's analysis (`docs/SHARPNESS-NOOP-ANALYSIS.md`, with a Python sim: max
+|1.0−4.0| diff = 0.000 at x2 with offset 0) and `docs/WindowResizer-rendering-research.md` L166-173, which
+already said the quad must use the −0.5 offset.
+
+**Fix (implemented in `src/DisplayManager.cpp`, `drawSharp`):**
+`float L = dstRect->left - 0.5f, T = dstRect->top - 0.5f, R = dstRect->right - 0.5f, B = dstRect->bottom - 0.5f;`
+so output pixel centers sample `(k+0.5)/N`. Sharpness now varies correctly (1.0 = aligned bilinear/smooth →
+4.0 ≈ point). Verified live by the user. Default `Sharpness` retuned under the corrected alignment: **1.50**.
+
+## Common thread (resolved)
+Bugs 1–2 stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale): Bug 1 = the
+default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to 640×480);
 Bug 2 = a post-clear 640 re-draw of the menu in the grab-source region (fixed by re-clearing that region).
+Bug 3 was independent — a half-pixel sampling-alignment error in the Sharp shader path.
 
 ## State to resume from
-- DM current: `Filter=Sharp` default; Bug 1 (viewport pin) + Bug 2 (grab-source re-clear) fixed. Copy
-  install has the current DLL. Build: `build.bat`.
+- DM current: `Filter=Sharp` default, `Sharpness=1.50`; Bugs 1–3 fixed. Both the `dist/DisplayManager-v1.0.1.zip`
+  package and the Copy install have the current DLL (md5 `8C67BB4D…`). Build: `build.bat`. Commits: `fe0f055`
+  (Bug 1), `7a5b0d8` (Bug 2), `5ad94ec` (Bug 3).
+- **Release TODO:** repo is not pushed yet (`git push -u origin master` after creating the GitHub repo — the
+  README's release link 404s until then). `dist/` is gitignored (the zip is a local artifact). Untracked and
+  optional to add: `tools/SokuHarness`, `docs/SHARPNESS-NOOP-ANALYSIS.md`, `okuu-viewport*`.
+- InfiniteDecks Alt+Enter fix (`../SokuMods/modules/InfiniteDecks/main.cpp`, D3DPOOL_MANAGED) is built +
+  deployed to the Copy install but uncommitted and not yet user-verified.
 - Full rendering research: `docs/WindowResizer-rendering-research.md` (UPDATE 1–5); Bug 1 trail:
-  `docs/bug1-okuu-research.md`.
+  `docs/bug1-okuu-research.md`; Bug 3 analysis: `docs/SHARPNESS-NOOP-ANALYSIS.md`.
