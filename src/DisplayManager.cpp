@@ -71,6 +71,7 @@ static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 // ---- vtable indices (verified against d3d9.h) ----------------------------------------------------
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
 static const int VT_DEV_RESET         = 16;   // IDirect3DDevice9::Reset          (+0x40)
+static const int VT_DEV_SETRT         = 37;   // IDirect3DDevice9::SetRenderTarget (+0x94)
 static const int VT_SC_PRESENT        = 3;    // IDirect3DSwapChain9::Present     (+0x0C)
 // NOTE: the game presents via the SWAPCHAIN (0x8A0E34)->Present, not the device, so we hook that.
 
@@ -126,6 +127,10 @@ static IDirect3DSurface9      *g_captureSurf = nullptr;
 static IDirect3DSurface9      *g_stageSurf   = nullptr;
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
+// The game swapchain's backbuffer surface, for identity checks in the SetRenderTarget hook only. NOT
+// AddRef'd (the swapchain owns it); cached after CreateDevice/Reset and each Present, dropped before Reset.
+static IDirect3DSurface9      *g_bbSurf      = nullptr;
+static bool                    g_inPost      = false;    // inside our Present post-process (render thread)
 static float                   g_sharpness   = 1.50f;    // 1 = aligned bilinear; higher = crisper toward point
 static const float             SHARP_MIN     = 1.0f;     // clamp: 1.0 = bilinear
 static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is already visually point (shader
@@ -203,6 +208,9 @@ static Reset_t oReset = nullptr;
 typedef HRESULT (WINAPI *SCPresent_t)(IDirect3DSwapChain9 *, const RECT *, const RECT *, HWND,
                                       const RGNDATA *, DWORD);
 static SCPresent_t oSCPresent = nullptr;
+
+typedef HRESULT (WINAPI *SetRenderTarget_t)(IDirect3DDevice9 *, DWORD, IDirect3DSurface9 *);
+static SetRenderTarget_t oSetRenderTarget = nullptr;
 
 // Overwrite one vtable slot, storing the previous entry in *orig first (so a call that goes through the
 // new slot immediately already finds the original). A single aligned pointer store, safe while the render
@@ -447,6 +455,7 @@ static HRESULT callWithFallback(const char *what, F call, const D3DPRESENT_PARAM
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
 static void releaseCapture() {
+	g_bbSurf = nullptr;
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
 	if (g_stageSurf)   { g_stageSurf->Release();   g_stageSurf = nullptr; }
@@ -456,6 +465,11 @@ static void releaseCapture() {
 
 static void createCapture(IDirect3DDevice9 *dev) {
 	releaseCapture();
+	IDirect3DSurface9 *bb = nullptr;
+	if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+		g_bbSurf = bb;
+		bb->Release();
+	}
 	// A render-target texture (usable both as a StretchRect surface and a shader source).
 	HRESULT hr = dev->CreateTexture((UINT)g_srcW, (UINT)g_srcH, 1, D3DUSAGE_RENDERTARGET, g_bbFormat,
 	                                D3DPOOL_DEFAULT, &g_captureTex, nullptr);
@@ -540,7 +554,8 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 // in vanilla. With our native-sized backbuffer that default viewport is e.g. 2560x1440, and every draw
 // that uses TRANSFORMED (non-RHW) vertices - the 3D stage and Okuu (Utsuho) - is mapped through it, i.e.
 // scaled by backbuffer/640 from the top-left corner: the giant off-screen Okuu. Pre-transformed (XYZRHW)
-// sprites ignore the viewport, which is why only she looked wrong.
+// sprites ignore the viewport, which is why only she looked wrong. Applied after CreateDevice/Reset, every
+// Present, and whenever the backbuffer is bound again mid-frame (mySetRenderTarget).
 static void setGameViewport(IDirect3DDevice9 *dev) {
 	D3DVIEWPORT9 vp = { 0, 0, (DWORD)g_srcW, (DWORD)g_srcH, 0.0f, 1.0f };
 	dev->SetViewport(&vp);
@@ -645,6 +660,8 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
 		if (dev && SUCCEEDED(sc->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+			g_bbSurf = bb;
+			g_inPost = true;                   // our own SetRenderTarget calls must not re-pin the viewport
 			RECT srcRect = { 0, 0, g_srcW, g_srcH };
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
@@ -672,6 +689,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 				g_presentLogged = true;
 			}
 			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
+			g_inPost = false;
 			bb->Release();
 			g_composited = true;
 		}
@@ -680,6 +698,18 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 	}
 	HRESULT hr = oSCPresent(sc, src, dst, wnd, dirty, flags);
 	if (hr != D3DERR_WASSTILLDRAWING) g_composited = false;   // presented (or dropped): next call is a new frame
+	return hr;
+}
+
+// Keep the 640x480 viewport pinned across a mid-frame SetRenderTarget: D3D9 resets the viewport to the
+// whole new render target, so binding the (native-sized) backbuffer again after drawing into a texture would
+// bring back the giant-Okuu scaling (see setGameViewport) for the rest of that frame. Only for the game
+// device's backbuffer at index 0 while we force fullscreen, and not during our own post-process. Other mods
+// may hook this slot too; hookSlot chains to whatever was there.
+static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDirect3DSurface9 *rt) {
+	HRESULT hr = oSetRenderTarget(dev, index, rt);
+	if (index == 0 && g_active && !g_inPost && rt && rt == g_bbSurf && dev == GAME_DEVICE && SUCCEEDED(hr))
+		setGameViewport(dev);
 	return hr;
 }
 
@@ -750,9 +780,10 @@ static bool hookDevice(IDirect3DDevice9 *dev) {
 	if (!dev || InterlockedCompareExchange(&g_deviceHookClaim, 1, 0) != 0) return false;
 	void **vt = *(void ***)dev;
 	hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
+	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
 	hookSwapChain(dev);
 	g_deviceHooked = true;
-	logf("device vtable hooked (Reset) + swapchain Present");
+	logf("device vtable hooked (Reset, SetRenderTarget) + swapchain Present");
 	return true;
 }
 
