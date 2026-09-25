@@ -472,6 +472,12 @@ static void createCapture(IDirect3DDevice9 *dev) {
 
 // ---- device / swapchain method hooks -------------------------------------------------------------
 static bool g_presentLogged = false;
+// The backbuffer holds our composited (upscaled) frame that hasn't been presented yet. th123 presents with
+// D3DPRESENT_DONOTWAIT (dwFlags=1 at 0x401082 / 0x4081D4) and, while Present fails, keeps its "frame
+// pending" flag (0x896B76) and presents the SAME frame again (retry loop at 0x4081B0); present_wait=0 in
+// SokuDirectXOptimizations does the same. Post-processing that retry would grab the top-left 640x480 of our
+// own output and upscale it again (a flash of a zoomed corner). Render thread only.
+static bool g_composited = false;
 
 // Sharp-bilinear upscale: draw a full-screen quad over the (centered) destination rect, sampling the
 // captured 640 texture through the sharp-bilinear shader. The quad is shifted by the D3D9 -0.5 half-pixel
@@ -635,7 +641,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 	// resolution backbuffer. Grab that region, upscale it (centered) into the stage, fill the backbuffer
 	// with the border color and copy the stage back. Point/Linear/Auto go through StretchRect; Sharp goes
 	// through the shader quad.
-	if (g_active && g_captureSurf) {
+	if (g_active && g_captureSurf && !g_composited) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
 		if (dev && SUCCEEDED(sc->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
@@ -667,11 +673,14 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			}
 			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
 			bb->Release();
+			g_composited = true;
 		}
 		// Re-pin every frame on the render thread so nothing (Reset, SetRenderTarget, other mods) undoes it.
 		if (dev) setGameViewport(dev);
 	}
-	return oSCPresent(sc, src, dst, wnd, dirty, flags);
+	HRESULT hr = oSCPresent(sc, src, dst, wnd, dirty, flags);
+	if (hr != D3DERR_WASSTILLDRAWING) g_composited = false;   // presented (or dropped): next call is a new frame
+	return hr;
 }
 
 static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
@@ -679,6 +688,7 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
+	g_composited = false;           // Reset discards the backbuffer contents
 	if (!g_d3d) {                   // device hooked without our CreateDevice (device-watch fallback)
 		D3DDEVICE_CREATION_PARAMETERS cp; IDirect3D9 *d3d = nullptr;
 		if (SUCCEEDED(dev->GetCreationParameters(&cp)) && SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d) {
