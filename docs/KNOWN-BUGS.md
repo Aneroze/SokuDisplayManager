@@ -191,3 +191,21 @@ Test steps: `docs/TEST-CHECKLIST.md` "Increment 2".
 Risks: item 10 assumes whoever retries a failed Present re-presents the same frame (true for th123's loop) -
 if a caller drops the frame and draws a new one, that one frame is shown un-upscaled; item 9's slow path
 (`GetSwapChain` per foreign Present) is cheap but runs every frame for another device's swapchain.
+
+## Increment 3 — Sharp shader via the runtime's own BeginScene/EndScene (branch `sharp-origscene`, 2026-09-25)
+
+**Problem (from the graphics review):** the Sharp pass's own `BeginScene`/`EndScene` went through the device
+vtable, so every other mod's per-scene hook fired once more per frame (double work, double-ticked mod logic). One
+visible symptom was PracticeEx redrawing its 640x480 menu into the backbuffer (Bug 2), which is why DM needed a
+backbuffer-sized stage render target, a full-screen ColorFill and a full-screen copy every frame.
+
+**Rejected alternative (branch `sharp-stretchrect`, kept unmerged):** Sharp via point-prescale x k + linear
+StretchRect. It removes the scene entirely, but k must be a whole number: at 2x only Sharpness 1 (= Linear) and 2
+(= Point) exist, a clear regression from the shader's 1.25-1.75.
+
+**Fix:** `captureSceneFns` reads the device's `BeginScene`/`EndScene` (vtable 41/42) right after CreateDevice and
+trusts them only if they live in the same module as `QueryInterface` (the runtime: system d3d9, DXVK's
+d3d9_custom.dll or Wine). `drawSharp` calls them directly, so no other mod's scene hook runs for our pass, and draws
+straight into the backbuffer; only the border rects are filled (`fillBorders`), and Point/Linear StretchRect straight
+to the backbuffer too. The stage is only created when the pointers can't be trusted (another mod hooked the slots
+first) - then the old redraw-safe stage path is used. Fractional Sharpness (1.00-4.00) is unchanged.

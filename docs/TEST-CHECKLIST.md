@@ -63,6 +63,18 @@ Set `Log=1` for all of these; the log lines quoted below are what to look for.
 
 Regression pass: re-run increment 1 items 3, 4, 7, 8 and 10 on this branch.
 
-## Increment 3 — StretchRect-only Sharp filter (branch `sharp-stretchrect`, stacked on `should-fix`)
+## Increment 3 — Sharp shader with direct scene calls (branch `sharp-origscene`, stacked on `should-fix`)
 
-(to be filled in by the agent implementing it)
+The StretchRect-only Sharp (branch `sharp-stretchrect`) was dropped: whole-number sharpness only (at 2x that means
+exactly Linear or exactly Point). This branch keeps the fractional shader and removes the side effects instead.
+
+Already verified automatically (2026-09-25, 2560x1440, borderless, final-backbuffer dumps from a test-only build):
+log says `scene calls: direct (runtime ...\D3D9.DLL)` and `scene=direct`; output identical to increment 2's shader
+at Sharpness 1.50 and 4.00 (99.9% on static title text, rest = animated clouds); Sharpness still changes the
+image; borders pure black (border-only fill).
+
+1. **PracticeEx menu** (Backspace in Practice) in exclusive fullscreen with Filter=Sharp: NO small un-upscaled copy
+   in the top-left. This is the key check - the stage that used to hide the dupe is gone.
+2. Log line `scene calls:` says `direct`. If it says `via vtable + stage`, another mod hooked BeginScene/EndScene
+   before DM; the old stage path is then used (still correct, just more work per frame).
+3. Sharpness 1.25 / 1.50 / 1.75 at 2x look different from each other and sit between Linear and Point.

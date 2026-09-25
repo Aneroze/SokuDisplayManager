@@ -73,6 +73,9 @@ static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
 static const int VT_DEV_RESET         = 16;   // IDirect3DDevice9::Reset          (+0x40)
 static const int VT_DEV_SETRT         = 37;   // IDirect3DDevice9::SetRenderTarget (+0x94)
+static const int VT_DEV_BEGINSCENE    = 41;   // IDirect3DDevice9::BeginScene      (+0xA4)
+static const int VT_DEV_ENDSCENE      = 42;   // IDirect3DDevice9::EndScene        (+0xA8)
+static const int VT_UNK_QUERYINTERFACE = 0;   // IUnknown::QueryInterface          (+0x00)
 static const int VT_SC_PRESENT        = 3;    // IDirect3DSwapChain9::Present     (+0x0C)
 // NOTE: the game presents via the SWAPCHAIN (0x8A0E34)->Present, not the device, so we hook that.
 
@@ -124,8 +127,17 @@ static D3DFORMAT g_bbFormat = D3DFMT_X8R8G8B8;  // backbuffer format (for the ca
 static IDirect3DTexture9      *g_captureTex  = nullptr;
 static IDirect3DSurface9      *g_captureSurf = nullptr;
 // Offscreen backbuffer-sized render target the upscale is composed into, then copied 1:1 to the backbuffer.
-// Keeps the upscaled frame out of reach of the redraw some mods do during our EndScene (see drawSharp).
+// Only used when we could NOT get the runtime's own BeginScene/EndScene (g_sceneDirect false): then our
+// Begin/EndScene go through other mods' vtable hooks, and the redraw some of them do there (PracticeEx's
+// 640x480 menu) must be kept off the upscaled frame. See drawSharp.
 static IDirect3DSurface9      *g_stageSurf   = nullptr;
+// The D3D runtime's own BeginScene/EndScene, read from the device vtable right after CreateDevice (before
+// other mods patch the shared slots). Calling them directly means our Sharp pass does not re-fire every other
+// mod's per-scene hook once more per frame (double work, double-ticked mod logic, PracticeEx's menu dupe).
+typedef HRESULT (WINAPI *Scene_t)(IDirect3DDevice9 *);
+static Scene_t g_origBeginScene = nullptr;
+static Scene_t g_origEndScene   = nullptr;
+static bool    g_sceneDirect    = false;   // true when the two pointers above are trusted to be the runtime's
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
 // The game swapchain's backbuffer surface, for identity checks in the SetRenderTarget hook only. NOT
@@ -476,8 +488,10 @@ static void createCapture(IDirect3DDevice9 *dev) {
 	                                D3DPOOL_DEFAULT, &g_captureTex, nullptr);
 	if (SUCCEEDED(hr) && g_captureTex)
 		g_captureTex->GetSurfaceLevel(0, &g_captureSurf);
-	HRESULT hrStage = dev->CreateRenderTarget(g_bbW, g_bbH, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
-	                                          &g_stageSurf, nullptr);
+	HRESULT hrStage = S_FALSE;                 // S_FALSE = not needed (direct scene calls, see g_sceneDirect)
+	if (!g_sceneDirect)
+		hrStage = dev->CreateRenderTarget(g_bbW, g_bbH, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
+		                                  &g_stageSurf, nullptr);
 	// Compile-once pixel shader for the Sharp filter (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
@@ -503,10 +517,12 @@ static bool g_composited = false;
 // docs/WindowResizer-rendering-research.md L166-173. Sharpness 1 = aligned bilinear; higher narrows the
 // interpolation band toward point (~1.5 matches WR).
 //
-// The quad is drawn into `target` (the offscreen stage), but the backbuffer is the bound render target
-// at BeginScene and again at EndScene: our Begin/EndScene re-triggers a mod redraw (PracticeEx's 640x480
-// menu) into whatever is bound then, so it lands in the backbuffer - which the caller wipes and overwrites
-// with the stage - instead of on the upscaled frame.
+// Normally (g_sceneDirect) the scene is opened and closed with the runtime's own BeginScene/EndScene, so no
+// other mod's scene hook runs for our pass and the quad goes straight into the backbuffer (`target` == bb).
+// Otherwise the calls go through the vtable (and every mod hooked there): then the quad is drawn into
+// `target` (the offscreen stage) while the backbuffer is bound at BeginScene and again at EndScene, because a
+// mod may redraw its 640x480 menu (PracticeEx) into whatever is bound then - it lands in the backbuffer, which
+// the caller wipes and overwrites with the stage, instead of on the upscaled frame.
 //
 // Returns false if nothing was drawn (a resource is missing, or BeginScene / the draw failed), so the
 // caller can fall back to a StretchRect upscale instead of presenting a stale or uninitialised stage.
@@ -515,8 +531,9 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 	if (!g_ps || !g_captureTex || !g_stateBlock) return false;
 	g_stateBlock->Capture();                                  // save all device state
 	dev->SetRenderTarget(0, bb);
-	if (FAILED(dev->BeginScene())) { g_stateBlock->Apply(); return false; }
-	dev->SetRenderTarget(0, target);
+	HRESULT hrScene = g_sceneDirect ? g_origBeginScene(dev) : dev->BeginScene();
+	if (FAILED(hrScene)) { g_stateBlock->Apply(); return false; }
+	if (target != bb) dev->SetRenderTarget(0, target);
 	dev->SetPixelShader(g_ps);
 	dev->SetVertexShader(nullptr);
 	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
@@ -544,8 +561,8 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 		{ R, B, 0.0f, 1.0f, 1.0f, 1.0f },
 	};
 	HRESULT hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
-	dev->SetRenderTarget(0, bb);
-	dev->EndScene();
+	if (target != bb) dev->SetRenderTarget(0, bb);
+	if (g_sceneDirect) g_origEndScene(dev); else dev->EndScene();
 	g_stateBlock->Apply();                                    // restore all device state
 	return SUCCEEDED(hr);
 }
@@ -637,6 +654,16 @@ static void sharpOsdText(char *buf, int cap) {
 	(void)cap;
 }
 
+// Fill everything outside the centered game rect with the border color (up to four rects). The game rect
+// itself is fully overwritten by the upscale, so a full-screen fill would only waste bandwidth.
+static void fillBorders(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT &d) {
+	LONG W = (LONG)g_bbW, H = (LONG)g_bbH;
+	if (d.top    > 0) { RECT r = { 0, 0, W, d.top };               dev->ColorFill(bb, &r, g_bgColor); }
+	if (d.bottom < H) { RECT r = { 0, d.bottom, W, H };            dev->ColorFill(bb, &r, g_bgColor); }
+	if (d.left   > 0) { RECT r = { 0, d.top, d.left, d.bottom };   dev->ColorFill(bb, &r, g_bgColor); }
+	if (d.right  < W) { RECT r = { d.right, d.top, W, d.bottom };  dev->ColorFill(bb, &r, g_bgColor); }
+}
+
 // The swapchain/device vtables are shared by every D3D9 swapchain/device in the process (overlays, mods that
 // make their own device), so the hooks only act on the game's. Fast path: the game's swapchain global; else
 // (e.g. a wrapper stored its own object there) compare with the game device's implicit swapchain. Neither
@@ -654,9 +681,8 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	if (!isGameSwapChain(sc)) return oSCPresent(sc, src, dst, wnd, dirty, flags);
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
-	// resolution backbuffer. Grab that region, upscale it (centered) into the stage, fill the backbuffer
-	// with the border color and copy the stage back. Point/Linear/Auto go through StretchRect; Sharp goes
-	// through the shader quad.
+	// resolution backbuffer. Grab that region, fill the borders, and upscale it centered straight into the
+	// backbuffer. Point/Linear/Auto go through StretchRect; Sharp goes through the shader quad.
 	if (g_active && g_captureSurf && !g_composited) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
@@ -667,17 +693,16 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
 			HRESULT a = dev->StretchRect(bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE); // 1:1 grab
-			// Compose the upscale into the stage (or straight into the backbuffer if the stage couldn't be
-			// created), then clear the backbuffer and copy the finished frame over 1:1. Clearing AFTER the
-			// upscale also wipes the un-upscaled menu dupe PracticeEx redraws into the backbuffer's top-left
-			// during drawSharp's scene. Every output pixel comes from this one upscale pass - never re-blit part
-			// of the frame with a different filter (that made the corner overlapping the grab region blurry at
-			// non-integer FitToScreen scales, e.g. 2.25x on a 1080p screen).
+			// Every output pixel comes from this one upscale pass - never re-blit part of the frame with a
+			// different filter (that made the corner overlapping the grab region blurry at non-integer
+			// FitToScreen scales, e.g. 2.25x on a 1080p screen). Without direct scene calls the upscale is
+			// composed into the stage and the backbuffer is only filled + copied AFTER it, which also wipes
+			// the un-upscaled menu dupe PracticeEx redraws into the backbuffer during drawSharp's scene.
 			IDirect3DSurface9 *target = g_stageSurf ? g_stageSurf : bb;
 			HRESULT b = S_OK, c = S_OK;
-			if (!g_stageSurf) b = dev->ColorFill(bb, nullptr, g_bgColor);
+			if (!g_stageSurf) fillBorders(dev, bb, dstRect);
 			// Sharp falls back to StretchRect (g_filter resolves to linear for Sharp) if the shader pass
-			// couldn't draw - otherwise the stale / uninitialised stage would be copied to the screen.
+			// couldn't draw - otherwise a stale / uninitialised frame would be shown.
 			if (g_filterCfg != 3 || !drawSharp(dev, bb, target, &dstRect))
 				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			if (g_stageSurf) {
@@ -685,8 +710,8 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 				c = dev->StretchRect(g_stageSurf, &dstRect, bb, &dstRect, D3DTEXF_NONE);   // 1:1 copy
 			}
 			if (!g_presentLogged) {
-				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
-				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness);
+				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f scene=%s",
+				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness, g_sceneDirect ? "direct" : "vtable+stage");
 				g_presentLogged = true;
 			}
 			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
@@ -773,6 +798,30 @@ static void hookSwapChain(IDirect3DDevice9 *dev) {
 	}
 }
 
+// Remember the runtime's own BeginScene/EndScene for drawSharp. They are trusted only if they live in the same
+// module as the device's QueryInterface (which mods practically never hook): that is the D3D runtime itself
+// (system d3d9, DXVK's d3d9_custom.dll, Wine), not another mod's hook. If a mod patched the slots before us,
+// fall back to calling through the vtable with the stage render target (the old, redraw-safe path).
+static HMODULE moduleOf(void *p) {
+	HMODULE m = nullptr;
+	if (p) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                          (LPCSTR)p, &m);
+	return m;
+}
+static void captureSceneFns(void **vt) {
+	HMODULE rt = moduleOf(vt[VT_UNK_QUERYINTERFACE]);
+	HMODULE mb = moduleOf(vt[VT_DEV_BEGINSCENE]), me = moduleOf(vt[VT_DEV_ENDSCENE]);
+	g_sceneDirect = rt && mb == rt && me == rt;
+	if (g_sceneDirect) {
+		g_origBeginScene = (Scene_t)vt[VT_DEV_BEGINSCENE];
+		g_origEndScene   = (Scene_t)vt[VT_DEV_ENDSCENE];
+	}
+	char name[MAX_PATH] = "?";
+	if (rt) GetModuleFileNameA(rt, name, sizeof(name));
+	logf("scene calls: %s (runtime %s)", g_sceneDirect ? "direct" : "via vtable + stage (BeginScene/EndScene already hooked)",
+	     name);
+}
+
 // Single-shot: the CreateDevice hook and the device-watch thread can both get here (th123 passes &0x8A0E30
 // as ppDevice, so the global is already set inside oCreateDevice, before this runs). Returns true only for
 // the caller that actually hooked.
@@ -780,6 +829,7 @@ static volatile LONG g_deviceHookClaim = 0;
 static bool hookDevice(IDirect3DDevice9 *dev) {
 	if (!dev || InterlockedCompareExchange(&g_deviceHookClaim, 1, 0) != 0) return false;
 	void **vt = *(void ***)dev;
+	captureSceneFns(vt);
 	hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
 	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
 	hookSwapChain(dev);
