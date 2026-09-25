@@ -125,6 +125,9 @@ static char                    g_osdText[32] = {0};     // current OSD message (
 static bool g_haveWin = false;
 static UINT g_winW = 640, g_winH = 480;
 static HWND g_hwnd = nullptr;   // the game's window (from present params), for windowed resizing
+// Monitor of the adapter the game's device was created on. Exclusive fullscreen always takes over THIS
+// monitor (the adapter is fixed at CreateDevice), wherever the window has been dragged.
+static HMONITOR g_adapterMon = nullptr;
 static bool g_topmost = false;          // always-on-top toggle (Alt+P)
 // Borderless-mode state: g_wantFullscreen tracks the game's real intent (from pp.Windowed before we
 // override it) so we can tell a forced-windowed borderless-fullscreen apart from a genuine windowed
@@ -251,15 +254,20 @@ static void computeOutput() {
 	     g_filter == D3DTEXF_POINT ? "point" : "linear");
 }
 
-// The native resolution/refresh of the monitor the game window is on. We query this live (rather than
+// The native resolution/refresh of the monitor fullscreen will land on. We query this live (rather than
 // trusting the game's cached GetAdapterDisplayMode global at 0x8A0FA0, which can be stale or the wrong
 // monitor) so exclusive fullscreen always uses the true current mode - otherwise the desktop gets
 // switched to a wrong (often small) resolution, which is blurry and shuffles the user's windows.
+// Exclusive uses the device's ADAPTER monitor: the window's monitor is wrong once the window has been
+// dragged to another screen (e.g. a 1080p second monitor's mode got applied to a 1440p primary).
+// Borderless is a windowed device, so it can cover whichever monitor the window is on.
 static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 	*w = *h = *refresh = 0;
-	if (g_hwnd) {
+	HMONITOR mon = (!g_borderless && g_adapterMon) ? g_adapterMon
+	             : g_hwnd ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY) : nullptr;
+	if (mon) {
 		MONITORINFOEXA mi; mi.cbSize = sizeof(mi);
-		if (GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+		if (GetMonitorInfoA(mon, &mi)) {
 			DEVMODEA dm; ZeroMemory(&dm, sizeof(dm)); dm.dmSize = sizeof(dm);
 			if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
 			    dm.dmPelsWidth && dm.dmPelsHeight) {
@@ -546,6 +554,13 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
+	if (!g_adapterMon) {            // device hooked without our CreateDevice (device-watch fallback)
+		D3DDEVICE_CREATION_PARAMETERS cp; IDirect3D9 *d3d = nullptr;
+		if (SUCCEEDED(dev->GetCreationParameters(&cp)) && SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d) {
+			g_adapterMon = d3d->GetAdapterMonitor(cp.AdapterOrdinal);
+			d3d->Release();
+		}
+	}
 	applyFullscreenParams(pp);
 	HRESULT hr = oReset(dev, pp);
 	if (SUCCEEDED(hr)) {
@@ -637,6 +652,7 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
                                      IDirect3DDevice9 **out) {
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+	g_adapterMon = self->GetAdapterMonitor(adapter);
 	applyFullscreenParams(pp);          // sets g_hwnd from pp->hDeviceWindow
 	if (!g_hwnd && focus) g_hwnd = focus;
 	installKeyboardHook();              // hooks the WINDOW's thread (not necessarily this one)
