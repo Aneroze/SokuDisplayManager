@@ -59,8 +59,12 @@ static const BYTE TARGET_HASH[16] = {
 };
 // IAT slot the game's `call 0x81F6B8` thunk jumps through for Direct3DCreate9.
 static const DWORD ADDR_D3DCREATE9_IAT = 0x008572A0;
-// The game's IDirect3DDevice9* global.
+// The game's IDirect3DDevice9* global. th123 passes its address as CreateDevice's ppReturnedDeviceInterface
+// (0x414FB2 / 0x415038 / 0x415059: HAL+HW VP, HAL+SW VP, REF), which is how we tell its call from others.
 #define GAME_DEVICE (*reinterpret_cast<IDirect3DDevice9 **>(0x008A0E30))
+// The game's implicit swapchain (GetSwapChain(0) right after CreateDevice/Reset, 0x4150BF / 0x4151D3; 0
+// while it resets). It presents every frame through this pointer (0x401078 / 0x4081CD).
+#define GAME_SWAPCHAIN (*reinterpret_cast<IDirect3DSwapChain9 **>(0x008A0E34))
 // D3DDISPLAYMODE the game fetched via GetAdapterDisplayMode at startup (Width+0, Height+4, Refresh+8, Format+0xC).
 static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 
@@ -611,8 +615,22 @@ static void sharpOsdText(char *buf, int cap) {
 	(void)cap;
 }
 
+// The swapchain/device vtables are shared by every D3D9 swapchain/device in the process (overlays, mods that
+// make their own device), so the hooks only act on the game's. Fast path: the game's swapchain global; else
+// (e.g. a wrapper stored its own object there) compare with the game device's implicit swapchain. Neither
+// check AddRefs anything that outlives the call.
+static bool isGameSwapChain(IDirect3DSwapChain9 *sc) {
+	if (sc == GAME_SWAPCHAIN) return true;
+	IDirect3DDevice9 *dev = GAME_DEVICE;
+	IDirect3DSwapChain9 *own = nullptr;
+	if (!dev || FAILED(dev->GetSwapChain(0, &own)) || !own) return false;
+	own->Release();
+	return own == sc;
+}
+
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
+	if (!isGameSwapChain(sc)) return oSCPresent(sc, src, dst, wnd, dirty, flags);
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
 	// resolution backbuffer. Grab that region, upscale it (centered) into the stage, fill the backbuffer
 	// with the border color and copy the stage back. Point/Linear/Auto go through StretchRect; Sharp goes
@@ -657,6 +675,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 }
 
 static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
+	if (dev != GAME_DEVICE) return oReset(dev, pp);   // someone else's device (the vtable is shared)
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
@@ -783,6 +802,12 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE type, HWND focus,
                                      DWORD behavior, D3DPRESENT_PARAMETERS *pp,
                                      IDirect3DDevice9 **out) {
+	// Only the game's own call (it passes &GAME_DEVICE) is ours; a device another mod or overlay creates
+	// must not touch the game window, monitor or present params.
+	if (out != &GAME_DEVICE) {
+		logf("CreateDevice from another caller (ppDevice=%p) - passed through", (void *)out);
+		return oCreateDevice(self, adapter, type, focus, behavior, pp, out);
+	}
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	g_adapterMon = self->GetAdapterMonitor(adapter);
