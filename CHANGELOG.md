@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.4 — 2026-09-25
+
+**Changed**
+- The fullscreen scale setting is renamed from `IntegerScaling` to `FullscreenScale`, so it follows the same
+  naming as `WindowScale` (and `FullscreenWidth/Height/Refresh`). `Mode=IntegerScaling` is unchanged.
+- Existing ini files keep working: the old `IntegerScaling=` key is still read when `FullscreenScale` is
+  missing. With `PersistState=1` (the default) the key is renamed in place on first launch, keeping its value
+  and your comments; with `PersistState=0` the file is never touched. If both keys are present,
+  `FullscreenScale` wins and the old key is removed on exit.
+
 ## 1.0.3 — 2026-09-25
 
 Fixes from a full code review, all tested in-game.

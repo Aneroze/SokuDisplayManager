@@ -5,9 +5,9 @@ only what the game renders (a backbuffer capture can't show window placement).
 
 ## Increment 1 — must-fix items (master: 0fa2204 .. 39dd628)
 
-1. **Windowed start**: window is the IntegerScaling size, at PositionX/Y if set, 4:3 client; drag-resize stays 4:3.
+1. **Windowed start**: window is the WindowScale size, at PositionX/Y if set, 4:3 client; drag-resize stays 4:3.
 2. **Fullscreen start** (quit while fullscreen, relaunch), exclusive AND borderless: comes up fullscreen; Alt+Enter
-   out gives the IntegerScaling size at the spawn position.
+   out gives the WindowScale size at the spawn position.
 3. **Exclusive round-trips**: Alt+Enter out and in 3+ times. Each return to windowed keeps the previous position (not
    re-centered on the primary), the right size, a 4:3 client (1280x960 at x2), and always-on-top if Alt+P was on.
 4. **Borderless round-trips**: Alt+Enter in AND out actually works. Covers the whole monitor (no offset/oversize);
@@ -42,8 +42,8 @@ Set `Log=1` for all of these; the log lines quoted below are what to look for.
      a hang/black screen/exit. Alt+Enter back to windowed must work, and the next Alt+Enter tries native again.
 8. **Window scale vs fullscreen mode**: with `Mode=FitToScreen`, windowed Alt+3 resizes the window to x3; Alt+Enter
    into fullscreen is still FitToScreen (not x3). Quit: the ini has `WindowScale=x3`, `Mode=FitToScreen` and
-   `IntegerScaling` unchanged. Fullscreen Alt+2 still gives IntegerScaling x2 (and sets `Mode=IntegerScaling`).
-   Remove the `WindowScale` line: the window uses the `IntegerScaling` size. On a 1080p monitor Alt+4..6 give the
+   `FullscreenScale` unchanged. Fullscreen Alt+2 still gives FullscreenScale x2 (and sets `Mode=IntegerScaling`).
+   Remove the `WindowScale` line: the window uses the `FullscreenScale` size. On a 1080p monitor Alt+4..6 give the
    largest scale that fits the work area (x2 with the taskbar; log `clamped to the work area`); a window near the
    right/bottom edge is moved back fully on-screen; `PositionX=5000` spawns on-screen.
 9. **Only the game's device**: with an overlay/mod that makes its own D3D9 device (e.g. a Steam/Discord/RTSS

@@ -250,7 +250,7 @@ static void computeOutput() {
 		if (maxFit < 1) maxFit = 1;
 		int use = n > maxFit ? maxFit : n;          // clamp so it never exceeds the screen
 		if (use != n)
-			logf("IntegerScaling x%d doesn't fit %ux%u; using x%d", n, g_bbW, g_bbH, use);
+			logf("FullscreenScale x%d doesn't fit %ux%u; using x%d", n, g_bbW, g_bbH, use);
 		outW = g_srcW * use; outH = g_srcH * use;
 		break;
 	}
@@ -992,11 +992,70 @@ static int parseKey(const char *s) {
 	return 0;
 }
 
+// Old (<= 1.0.3) name of the FullscreenScale key.
+static const char *LEGACY_FS_SCALE_KEY = "IntegerScaling";
+
+static bool iniHasKey(const char *key) {
+	char v[8] = {0};
+	GetPrivateProfileStringA("Display", key, "\x01", v, sizeof(v), g_iniPath);   // sentinel = missing
+	return lstrcmpA(v, "\x01") != 0;
+}
+
+// One-time ini migration (only with PersistState=1, i.e. when the user lets us write the ini): rename the
+// [Display] key IntegerScaling to FullscreenScale IN PLACE, so the value, the surrounding comments and the key
+// order are kept (WritePrivateProfileString would append a new key at the end of the section instead).
+// Skipped for UTF-16 inis and on any I/O error - the fallback read in loadConfig keeps old files working.
+static void migrateIni() {
+	if (!iniHasKey(LEGACY_FS_SCALE_KEY) || iniHasKey("FullscreenScale")) return;
+	HANDLE f = CreateFileA(g_iniPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (f == INVALID_HANDLE_VALUE) return;
+	DWORD size = GetFileSize(f, nullptr), got = 0;
+	char *buf = (size != INVALID_FILE_SIZE && size < (1u << 20)) ? (char *)malloc(size + 1) : nullptr;
+	bool ok = buf && ReadFile(f, buf, size, &got, nullptr) && got == size;
+	CloseHandle(f);
+	if (!ok || (size >= 2 && (BYTE)buf[0] == 0xFF && (BYTE)buf[1] == 0xFE)) { free(buf); return; }
+	buf[size] = 0;
+	// Find the key line inside [Display]: optional blanks, the key (any case), optional blanks, '='.
+	const int keyLen = lstrlenA(LEGACY_FS_SCALE_KEY);
+	bool inDisplay = false;
+	char *hit = nullptr;
+	for (char *line = buf; *line && !hit; ) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '[') inDisplay = StrCmpNIA(p, "[Display]", 9) == 0;
+		else if (inDisplay && StrCmpNIA(p, LEGACY_FS_SCALE_KEY, keyLen) == 0) {
+			char *q = p + keyLen;
+			while (*q == ' ' || *q == '\t') q++;
+			if (*q == '=') hit = p;
+		}
+		char *nl = strchr(line, '\n');
+		line = nl ? nl + 1 : line + lstrlenA(line);
+	}
+	if (hit) {
+		char tmp[1024 + MAX_PATH + 8];
+		wsprintfA(tmp, "%s.tmp", g_iniPath);
+		HANDLE o = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (o != INVALID_HANDLE_VALUE) {
+			DWORD w1 = 0, w2 = 0, w3 = 0, pre = (DWORD)(hit - buf), rest = size - pre - keyLen;
+			bool wrote = WriteFile(o, buf, pre, &w1, nullptr) && WriteFile(o, "FullscreenScale", 15, &w2, nullptr) &&
+			             WriteFile(o, hit + keyLen, rest, &w3, nullptr) && w1 == pre && w2 == 15 && w3 == rest;
+			CloseHandle(o);
+			if (wrote && MoveFileExA(tmp, g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+				logf("ini migrated: IntegerScaling -> FullscreenScale");
+			else
+				DeleteFileA(tmp);
+		}
+	}
+	free(buf);
+}
+
 static void loadConfig() {
 	GetModuleFileNameA(g_module, g_iniPath, 1024);
 	PathRemoveFileSpecA(g_iniPath);
 	PathAppendA(g_iniPath, "DisplayManager.ini");
 	g_enabled = GetPrivateProfileIntA("Display", "Enabled", 1, g_iniPath) != 0;
+	g_log = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;   // early, so migrateIni can log
+	if (GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0) migrateIni();
 
 	char mode[64] = {0};
 	GetPrivateProfileStringA("Display", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
@@ -1004,10 +1063,13 @@ static void loadConfig() {
 	else if (StrCmpIA(mode, "CustomResolution") == 0) g_mode = MODE_CUSTOM;
 	else                                              g_mode = MODE_FIT;
 
+	// FullscreenScale was called IntegerScaling up to 1.0.3: read the old name when the new one is missing
+	// (migrateIni renames it in the file when PersistState is on).
 	char scale[32] = {0};
-	GetPrivateProfileStringA("Display", "IntegerScaling", "x2", scale, sizeof(scale), g_iniPath);
+	GetPrivateProfileStringA("Display", "FullscreenScale", "", scale, sizeof(scale), g_iniPath);
+	if (!scale[0]) GetPrivateProfileStringA("Display", LEGACY_FS_SCALE_KEY, "x2", scale, sizeof(scale), g_iniPath);
 	g_intScale = parseScale(scale);
-	// The window scale defaults to the IntegerScaling value, which older versions used for the window too.
+	// The window scale defaults to the fullscreen scale, which versions before 1.0.3 used for the window too.
 	char wscale[32] = {0};
 	GetPrivateProfileStringA("Display", "WindowScale", scale, wscale, sizeof(wscale), g_iniPath);
 	g_winScale = parseScale(wscale);
@@ -1075,7 +1137,7 @@ static void writeIniIfChanged(const char *key, const char *val) {
 		WritePrivateProfileStringA("Display", key, val, g_iniPath);
 }
 
-// Persist the current scaling settings (Mode + IntegerScaling + WindowScale + Filter + Sharpness) to the ini
+// Persist the current scaling settings (Mode + FullscreenScale + WindowScale + Filter + Sharpness) to the ini
 // so the next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
 // NOT saved. Only keys that actually changed are written (see writeIniIfChanged), so if the user changed
 // nothing the file is left untouched.
@@ -1086,7 +1148,9 @@ static void persistState() {
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
 	writeIniIfChanged("Mode", m);
-	writeIniIfChanged("IntegerScaling", scale);
+	writeIniIfChanged("FullscreenScale", scale);
+	if (iniHasKey(LEGACY_FS_SCALE_KEY))                       // leftover pre-1.0.4 key (migration skipped)
+		WritePrivateProfileStringA("Display", LEGACY_FS_SCALE_KEY, nullptr, g_iniPath);
 	wsprintfA(scale, "x%d", g_winScale);
 	writeIniIfChanged("WindowScale", scale);
 
@@ -1394,7 +1458,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
-	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
+	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
 	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
 	     g_enabled, modeName, g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY, g_borderless);

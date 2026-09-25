@@ -11,7 +11,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 The upscale itself uses the `Filter` setting: by default **Sharp**, a tunable sharp-bilinear filter that reproduces WindowResizer's look; `Point` gives hard pixels (perfectly crisp at integer scales), `Linear` plain smooth, `Auto` point at integer scales and linear otherwise.
 
 **Hotkeys** (live, in-game). Default modifier is **Alt**; all keys and the modifier are rebindable in the `[Hotkeys]` ini section, and commenting out a line disables that hotkey:
-- **Alt+1**…**Alt+6** — in fullscreen, set IntegerScaling ×1…×6; when windowed, resize the window to that scale (640×480 × N, `WindowScale`) without touching the fullscreen mode.
+- **Alt+1**…**Alt+6** — in fullscreen, switch to IntegerScaling at ×1…×6 (`FullscreenScale`); when windowed, resize the window to that scale (640×480 × N, `WindowScale`) without touching the fullscreen mode.
 - **Alt+0** — FitToScreen.
 - **Alt+P** — toggle always-on-top.
 - **Alt+F** — cycle the upscale filter (Auto → Point → Linear → Sharp) live.
@@ -35,14 +35,14 @@ All options live in `DisplayManager.ini`:
 | --- | --- | --- |
 | `Enabled` | `1` | Master switch. |
 | `Mode` | `FitToScreen` | `FitToScreen`, `IntegerScaling`, or `CustomResolution`. The Alt+0…6 hotkeys change this live (Alt+1…6 only while fullscreen). |
-| `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
-| `WindowScale` | `x2` (the `IntegerScaling` value if missing) | Windowed client size, as a whole-number scale of 640×480. Changed by Alt+1…6 while windowed; independent of the fullscreen `Mode`. Reduced to the largest scale that fits the monitor's work area (the window is also kept on-screen). |
+| `FullscreenScale` | `x2` | Fullscreen size when `Mode=IntegerScaling`: whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. Named `IntegerScaling` before v1.0.4 — old inis are still read, and renamed on first launch when `PersistState=1`. |
+| `WindowScale` | `x2` (the `FullscreenScale` value if missing) | Windowed client size, as a whole-number scale of 640×480. Changed by Alt+1…6 while windowed; independent of the fullscreen `Mode`. Reduced to the largest scale that fits the monitor's work area (the window is also kept on-screen). |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
 | `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
 | `Filter` | `Sharp` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
 | `Sharpness` | `1.50` | Only used when `Filter=Sharp`. Range `1.0`–`4.0`: `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels; the default `~1.5` closely matches WindowResizer; `~4.0` is effectively point. Tune live with Alt+K/Alt+L (shown on-screen). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1…6 resizing works either way. |
-| `PersistState` | `1` | Save the current `Mode`, `IntegerScaling`, `WindowScale`, `Filter` and `Sharpness` to the ini on exit (only keys that changed are written), so hotkey changes stick across launches. `0` = never write the ini. |
+| `PersistState` | `1` | Save the current `Mode`, `FullscreenScale`, `WindowScale`, `Filter` and `Sharpness` to the ini on exit (only keys that changed are written), so hotkey changes stick across launches. `0` = never write the ini. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `FullscreenWidth` / `FullscreenHeight` | `0` | *(advanced)* Force the fullscreen **display mode** — the actual screen resolution the monitor switches to (not the game surface, not the scaled output). `0` = auto-detect your monitor's native resolution (recommended). Set both to override if auto-detection picks the wrong mode. A mode your monitor doesn't list falls back to the current desktop mode. |
 | `FullscreenRefresh` | `0` | *(advanced)* Refresh rate for the forced mode; `0` keeps the native refresh. A rate the mode doesn't have snaps to the closest one it does. |
