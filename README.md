@@ -23,7 +23,7 @@ In fullscreen, the scale and filter hotkeys briefly show the new value on-screen
 
 1. Download the latest [release](https://github.com/Aneroze/SokuDisplayManager/releases/latest) and unarchive the `DisplayManager` folder into your Soku `modules` directory.
 2. Enable **DisplayManager** in SokuLauncher's mod settings (or add a line for it in `SWRSToys.ini` if you don't use the launcher).
-3. **Use either this or WindowResizer, but never both at the same time.**
+3. **Use either this or WindowResizer, but never both at the same time.** The same goes for the older IntegerFullscreen and ExclusiveFullscreen mods. If one of them (`WindowResizer.dll`, `IntegerFullscreen.dll`, `ExclusiveFullscreen.dll`) is loaded, DisplayManager detects it when the game creates its device and disables itself (no fullscreen changes, scaling, window management or hotkeys; noted in the log with `Log=1`), so disable the other mod to use this one.
 4. Launch the game and press **Alt+Enter** to toggle fullscreen.
 
 ## Configuration

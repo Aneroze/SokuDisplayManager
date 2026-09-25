@@ -37,7 +37,8 @@
 // Windowed, the device is left exactly as the game made it (DM only sizes/positions the window), so
 // Alt+Enter still toggles windowed <-> crisp fullscreen.
 //
-// Use either this or WindowResizer, but never both at the same time.
+// Use either this or WindowResizer, but never both at the same time. If WindowResizer, IntegerFullscreen
+// or ExclusiveFullscreen is loaded, DM detects it at device creation and passes everything through.
 //
 // Self-contained: it only needs the Windows SDK (windows.h / d3d9.h / shlwapi.h). It does not import
 // d3d9.lib - it hooks the game's Direct3DCreate9 through the import table and drives the device the game
@@ -787,6 +788,25 @@ static bool hookDevice(IDirect3DDevice9 *dev) {
 	return true;
 }
 
+// WindowResizer and the older IntegerFullscreen / ExclusiveFullscreen mods do the same job (fullscreen
+// override, upscale, window management); on top of them DM would process every frame twice and fight over
+// the window. Mod load order means they may load after our Initialize, so this is checked when the game's
+// device is created (or found by the device watch). If one is loaded, DM stands down completely: no device
+// hooks, no fullscreen override, no post-process, no window management or hotkeys, no ini writes.
+static const char *const CONFLICTING_MODS[] = { "WindowResizer.dll", "IntegerFullscreen.dll",
+                                                "ExclusiveFullscreen.dll" };
+static bool conflictingModLoaded() {
+	for (const char *name : CONFLICTING_MODS) {
+		if (GetModuleHandleA(name)) {
+			logf("%s is loaded - DisplayManager is passing everything through (disabled). Use only one of "
+			     "them.", name);
+			g_enabled = false;
+			return true;
+		}
+	}
+	return false;
+}
+
 // Does `fn` point into executable code of a loaded module? Used to confirm the device global holds a
 // finished device with a sane vtable before we patch it. (Deliberately not "inside d3d9.dll": in the usual
 // setup GetModuleHandle("d3d9.dll") is the SokuModLoader proxy in the game folder, while the real device
@@ -809,6 +829,7 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		void **vt = dev ? *(void ***)dev : nullptr;
 		if (vt && isExecutableImage(vt[VT_DEV_RESET]) && isExecutableImage(vt[17])) {   // 17 = Present
+			if (!g_enabled || conflictingModLoaded()) return 0;
 			IDirect3DSwapChain9 *sc = nullptr;
 			BOOL windowed = TRUE;
 			if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
@@ -849,6 +870,8 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 		logf("CreateDevice from another caller (ppDevice=%p) - passed through", (void *)out);
 		return oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	}
+	if (!g_enabled || conflictingModLoaded())
+		return oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	g_adapterMon = self->GetAdapterMonitor(adapter);
@@ -1007,7 +1030,7 @@ static void writeIniIfChanged(const char *key, const char *val) {
 // NOT saved. Only keys that actually changed are written (see writeIniIfChanged), so if the user changed
 // nothing the file is left untouched.
 static void persistState() {
-	if (!g_persist) return;
+	if (!g_persist || !g_enabled) return;   // (g_enabled is cleared when standing down for another mod)
 	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
 	              : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	char scale[16];
