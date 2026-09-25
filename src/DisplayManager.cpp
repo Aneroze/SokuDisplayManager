@@ -131,6 +131,11 @@ static HWND g_hwnd = nullptr;   // the game's window (from present params), for 
 // Monitor of the adapter the game's device was created on. Exclusive fullscreen always takes over THIS
 // monitor (the adapter is fixed at CreateDevice), wherever the window has been dragged.
 static HMONITOR g_adapterMon = nullptr;
+// The game's IDirect3D9 and the adapter its device was created on, for the exclusive-mode query/validation
+// (GetAdapterDisplayMode / EnumAdapterModes). Not AddRef'd: the game keeps it alive (0x8A0E2C), and so
+// does its device.
+static IDirect3D9 *g_d3d = nullptr;
+static UINT g_adapter = D3DADAPTER_DEFAULT;
 static bool g_topmost = false;          // always-on-top toggle (Alt+P)
 // Borderless-mode state: g_wantFullscreen tracks the game's real intent (its pp.Windowed, which we never
 // modify - we only override our own copy) so we can tell a forced-windowed borderless-fullscreen apart
@@ -263,12 +268,19 @@ static void computeOutput() {
 // dragged to another screen (e.g. a 1080p second monitor's mode got applied to a 1440p primary).
 // Borderless is a windowed device, so it can cover whichever monitor the window is on (g_fsMon: the
 // monitor it was on when fullscreen was requested - the same one enterBorderlessFullscreen covers).
+// Exclusive prefers the runtime's own GetAdapterDisplayMode: same refresh rounding as its mode list
+// (EnumDisplaySettings can say 59/143 where the list has 60/144), and it works under Wine/DXVK.
 static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 	*w = *h = *refresh = 0;
+	D3DDISPLAYMODE am;
+	if (!g_borderless && g_d3d && SUCCEEDED(g_d3d->GetAdapterDisplayMode(g_adapter, &am)) &&
+	    am.Width && am.Height) {
+		*w = am.Width; *h = am.Height; *refresh = am.RefreshRate;
+	}
 	HMONITOR mon = (!g_borderless && g_adapterMon) ? g_adapterMon
 	             : (g_borderless && g_fsMon) ? g_fsMon
 	             : g_hwnd ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY) : nullptr;
-	if (mon) {
+	if (mon && !*w) {
 		MONITORINFOEXA mi; mi.cbSize = sizeof(mi);
 		if (GetMonitorInfoA(mon, &mi)) {
 			DEVMODEA dm; ZeroMemory(&dm, sizeof(dm)); dm.dmSize = sizeof(dm);
@@ -290,6 +302,56 @@ static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 	if (g_fsW > 0 && g_fsH > 0) {
 		*w = g_fsW; *h = g_fsH;
 		if (g_fsRefresh > 0) *refresh = g_fsRefresh;
+	}
+}
+
+// Is w x h in the adapter's mode list for `fmt`? If so, *rate = the listed refresh closest to `want`
+// (ties: the higher one).
+static bool listedMode(D3DFORMAT fmt, UINT w, UINT h, UINT want, UINT *rate) {
+	bool found = false; UINT bestDiff = 0xFFFFFFFF;
+	UINT n = g_d3d->GetAdapterModeCount(g_adapter, fmt);
+	for (UINT i = 0; i < n; i++) {
+		D3DDISPLAYMODE m;
+		if (FAILED(g_d3d->EnumAdapterModes(g_adapter, fmt, i, &m)) || m.Width != w || m.Height != h) continue;
+		UINT diff = m.RefreshRate > want ? m.RefreshRate - want : want - m.RefreshRate;
+		if (!found || diff < bestDiff || (diff == bestDiff && m.RefreshRate > *rate)) {
+			*rate = m.RefreshRate; bestDiff = diff;
+		}
+		found = true;
+	}
+	return found;
+}
+
+// Check the forced exclusive mode against the adapter's mode list (EnumAdapterModes) before
+// CreateDevice/Reset sees it. A refresh the list doesn't have for that size snaps to the closest listed
+// one; a size it doesn't have (e.g. a bad FullscreenWidth/Height override) falls back to the adapter's
+// current mode. An empty list (some Wine/DXVK setups) skips the check. Whatever still gets rejected is
+// caught by the retry chain in callWithFallback.
+static void validateExclusiveMode(UINT *w, UINT *h, UINT *refresh, D3DFORMAT fmt) {
+	if (!g_d3d) return;
+	if (fmt == D3DFMT_A8R8G8B8) fmt = D3DFMT_X8R8G8B8;      // the mode list takes display formats only
+	else if (fmt == D3DFMT_A1R5G5B5) fmt = D3DFMT_X1R5G5B5;
+	if (g_d3d->GetAdapterModeCount(g_adapter, fmt) == 0) {
+		logf("mode check: the adapter lists no modes for format %d - not checked", (int)fmt);
+		return;
+	}
+	UINT rate = 0;
+	if (!listedMode(fmt, *w, *h, *refresh, &rate)) {
+		D3DDISPLAYMODE cur;
+		if (FAILED(g_d3d->GetAdapterDisplayMode(g_adapter, &cur)) || (cur.Width == *w && cur.Height == *h) ||
+		    !listedMode(fmt, cur.Width, cur.Height, cur.RefreshRate, &rate)) {
+			logf("mode check: %ux%u is not in the adapter's mode list - trying it anyway", *w, *h);
+			return;
+		}
+		logf("mode check: %ux%u is not in the adapter's mode list - using the current mode %ux%u",
+		     *w, *h, cur.Width, cur.Height);
+		*w = cur.Width; *h = cur.Height; *refresh = cur.RefreshRate;
+	}
+	if (*refresh && rate != *refresh) {
+		logf("mode check: %ux%u has no %uHz in the mode list - using %uHz", *w, *h, *refresh, rate);
+		*refresh = rate;
+	} else {
+		logf("mode check: %ux%u@%uHz ok", *w, *h, *refresh);
 	}
 }
 
@@ -330,6 +392,7 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 		logf("borderless fullscreen -> native %ux%u (windowed device)", w, h);
 	} else {
 		// Exclusive: true fullscreen at the native mode (no monitor rescale, gets Independent Flip).
+		validateExclusiveMode(&w, &h, &refresh, fmt);
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
 		pp->FullScreen_RefreshRateInHz = refresh;
@@ -347,6 +410,34 @@ static void syncPresentParams(D3DPRESENT_PARAMETERS *game, const D3DPRESENT_PARA
 	if (!g_active) { *game = *used; return; }
 	if (game->BackBufferCount == 0) game->BackBufferCount = used->BackBufferCount;
 	if (game->BackBufferFormat == D3DFMT_UNKNOWN) game->BackBufferFormat = used->BackBufferFormat;
+}
+
+// Run a CreateDevice/Reset `call` with our copy `local` of the game's params `orig`, retrying if the runtime
+// rejects the forced mode (custom CRU modes, rotated panels, Wine/DXVK mode lists, a bad manual override):
+// first the same mode with the default refresh rate, then the game's own unmodified params with DM
+// inactive (vanilla-style fullscreen), so the game still runs instead of hanging on a black screen or
+// exiting. Each (Create)Device/Reset starts again from the forced mode. A lost device (a Reset while
+// alt-tabbed) is not a mode problem - the game retries that Reset itself - so it gets no fallback.
+template <typename F>
+static HRESULT callWithFallback(const char *what, F call, const D3DPRESENT_PARAMETERS *orig,
+                                D3DPRESENT_PARAMETERS *local) {
+	HRESULT hr = call(local);
+	if (SUCCEEDED(hr) || !g_active || !orig || hr == D3DERR_DEVICELOST) return hr;
+	logf("%s failed (0x%08lx) with %ux%u@%uHz windowed=%d", what, (long)hr, local->BackBufferWidth,
+	     local->BackBufferHeight, local->FullScreen_RefreshRateInHz, local->Windowed);
+	if (!local->Windowed && local->FullScreen_RefreshRateInHz != 0) {
+		local->FullScreen_RefreshRateInHz = 0;
+		hr = call(local);
+		logf("%s retry with the default refresh rate -> 0x%08lx", what, (long)hr);
+		if (SUCCEEDED(hr) || hr == D3DERR_DEVICELOST) return hr;
+	}
+	*local = *orig;
+	g_active = false;
+	g_borderlessActive = false;
+	hr = call(local);
+	logf("%s retry with the game's own params (DisplayManager inactive until the next Reset) -> 0x%08lx",
+	     what, (long)hr);
+	return hr;
 }
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
@@ -568,11 +659,12 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
-	if (!g_adapterMon) {            // device hooked without our CreateDevice (device-watch fallback)
+	if (!g_d3d) {                   // device hooked without our CreateDevice (device-watch fallback)
 		D3DDEVICE_CREATION_PARAMETERS cp; IDirect3D9 *d3d = nullptr;
 		if (SUCCEEDED(dev->GetCreationParameters(&cp)) && SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d) {
 			g_adapterMon = d3d->GetAdapterMonitor(cp.AdapterOrdinal);
-			d3d->Release();
+			g_d3d = d3d; g_adapter = cp.AdapterOrdinal;
+			d3d->Release();         // the device keeps its IDirect3D9 alive
 		}
 	}
 	// Leaving windowed: remember the window's position and monitor before anything moves it. If the
@@ -587,7 +679,7 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
 	applyFullscreenParams(use);
-	HRESULT hr = oReset(dev, use);
+	HRESULT hr = callWithFallback("Reset", [dev](D3DPRESENT_PARAMETERS *p) { return oReset(dev, p); }, pp, use);
 	if (pp) syncPresentParams(pp, &local);
 	if (SUCCEEDED(hr)) {
 		if (g_active) {
@@ -693,12 +785,15 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	g_adapterMon = self->GetAdapterMonitor(adapter);
+	g_d3d = self; g_adapter = adapter;
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
 	applyFullscreenParams(use);         // sets g_hwnd from pp->hDeviceWindow
 	if (!g_hwnd && focus) g_hwnd = focus;
 	installKeyboardHook();              // hooks the WINDOW's thread (not necessarily this one)
-	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, use, out);
+	HRESULT hr = callWithFallback("CreateDevice", [=](D3DPRESENT_PARAMETERS *p) {
+		return oCreateDevice(self, adapter, type, focus, behavior, p, out);
+	}, pp, use);
 	if (pp) syncPresentParams(pp, &local);
 	if (SUCCEEDED(hr) && out && *out) {
 		hookDevice(*out);
@@ -921,12 +1016,13 @@ static void onWindowedEntry(bool firstTime) {
 }
 
 // Set the window up for the current state: windowed (onWindowedEntry; the first time with the spawn
-// setup) or the borderless popup. Exclusive fullscreen needs nothing - D3D9 owns the screen.
+// setup) or the borderless popup. Exclusive fullscreen needs nothing - D3D9 owns the screen, and neither
+// does the game's own fullscreen when the forced mode failed and we fell back to it (g_active false).
 static void applyWindowState() {
 	bool firstTime = g_spawnPending;
 	g_spawnPending = false;
-	if (!g_wantFullscreen)  onWindowedEntry(firstTime);
-	else if (g_borderless)  enterBorderlessFullscreen();
+	if (!g_wantFullscreen)             onWindowedEntry(firstTime);
+	else if (g_borderless && g_active) enterBorderlessFullscreen();
 }
 
 // Subclassed window procedure: while windowed and resizable, lock a drag-resize to the source aspect
