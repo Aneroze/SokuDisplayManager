@@ -25,9 +25,43 @@ only what the game renders (a backbuffer capture can't show window placement).
 Risks to watch: cursor hidden in borderless; other mods reading the game's present params (0x8A0F68) now see 640x480
 / Windowed=0; SokuDirectXOptimizations with use_d3d9ex=1 (fallback path, untested).
 
-## Increment 2 — should-fix items 7–12 (branch `should-fix`)
+## Increment 2 — should-fix items 7–12 (branch `should-fix`: 7d5a8e0 .. 8fdef7e)
 
-(to be filled in by the agent implementing it)
+Set `Log=1` for all of these; the log lines quoted below are what to look for.
+
+7. **Mode validation / fallback** (exclusive, `Borderless=0`):
+   - Default ini: log shows `mode check: WxH@RHz ok` with the monitor's real refresh (e.g. 144, not 143) and
+     `exclusive fullscreen -> native ...`; the monitor's OSD/refresh readout shows its usual rate.
+   - `FullscreenRefresh=61` (a rate the monitor doesn't have): log `has no 61Hz in the mode list - using NHz`;
+     fullscreen works.
+   - `FullscreenWidth=1234` / `FullscreenHeight=567`: log `not in the adapter's mode list - using the current
+     mode`; fullscreen comes up at native.
+   - Failure chain, if you can provoke it (a CRU custom mode, a rotated panel, Wine/DXVK): the log shows
+     `Reset failed (...)`, then `retry with the default refresh rate`, then if needed `retry with the game's own
+     params` - the game must end up in some working fullscreen (vanilla-style 640x480 in the last case), never
+     a hang/black screen/exit. Alt+Enter back to windowed must work, and the next Alt+Enter tries native again.
+8. **Window scale vs fullscreen mode**: with `Mode=FitToScreen`, windowed Alt+3 resizes the window to x3; Alt+Enter
+   into fullscreen is still FitToScreen (not x3). Quit: the ini has `WindowScale=x3`, `Mode=FitToScreen` and
+   `IntegerScaling` unchanged. Fullscreen Alt+2 still gives IntegerScaling x2 (and sets `Mode=IntegerScaling`).
+   Remove the `WindowScale` line: the window uses the `IntegerScaling` size. On a 1080p monitor Alt+4..6 give the
+   largest scale that fits the work area (x2 with the taskbar; log `clamped to the work area`); a window near the
+   right/bottom edge is moved back fully on-screen; `PositionX=5000` spawns on-screen.
+9. **Only the game's device**: with an overlay/mod that makes its own D3D9 device (e.g. a Steam/Discord/RTSS
+   overlay, OBS game capture), fullscreen still upscales, the overlay isn't upscaled/cropped, and the log has no
+   extra `Reset:`/`CreateDevice:` lines for it (only `CreateDevice from another caller ... passed through`).
+10. **Double-Present guard**: SokuDirectXOptimizations with `present_wait=0` (and without it: th123 itself presents
+    with DONOTWAIT), vsync on, a heavy scene: watch for single-frame flashes of a zoomed top-left corner in
+    fullscreen - there must be none.
+11. **Viewport across SetRenderTarget**: Okuu in fullscreen with the full mod set (all overlays: ReplayHudExtras,
+    InGameHostlist, PunishDisplay, LabTool, giuroll UI) - normal size in every scene, including while those overlays
+    are visible; no giant sprite flicker. Sharp/Point/Linear all still render correctly (DM's own post-process
+    binds the backbuffer and must not be affected).
+12. **Conflicting mods**: enable WindowResizer together with DM: the log says `WindowResizer.dll is loaded -
+    DisplayManager is passing everything through`; the game behaves exactly as with WindowResizer alone (no DM
+    hotkeys/OSD, no DM window changes), and DM's ini is not rewritten on exit. Repeat with IntegerFullscreen and
+    ExclusiveFullscreen. Disable them again: DM works normally.
+
+Regression pass: re-run increment 1 items 3, 4, 7, 8 and 10 on this branch.
 
 ## Increment 3 — StretchRect-only Sharp filter (branch `sharp-stretchrect`, stacked on `should-fix`)
 

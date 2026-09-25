@@ -7,7 +7,7 @@ the COPY install (`F:\Games\Touhou\SokuLauncher - Copy`).
 
 > ✅ Bugs 1–4 are FIXED in `src/`; Bugs 1–3 shipped in `dist/DisplayManager-v1.0.1.zip` (the older
 > `v1.0.0.zip` predates them). Bug 4 and the Bug 5+ fixes are newer than v1.0.1; the Bug 5+ fixes are
-> built but **not yet verified in-game**.
+> built but **not yet verified in-game**. Increment 2 (items 7–12, branch `should-fix`) is at the end.
 
 ## Bug 1 — Okuu (Utsuho Reiuji): giant off-screen sprite intrudes — ✅ FIXED (2026-09-24)
 
@@ -159,3 +159,35 @@ Verified against th123's disassembly (`0x415220` = the toggle, `0x415100` = its 
 Side effect to check: in borderless the game now knows it is "fullscreen", so its toggle wrapper
 (`0x408350`) applies its fullscreen cursor handling (`ShowCursor(FALSE)`, when its cursor flag is set)
 like in exclusive mode, and it saves/restores the "start fullscreen" state normally.
+
+## Increment 2 — should-fix items 7–12 (branch `should-fix`, 2026-09-25) — ✅ implemented, needs in-game test
+
+Test steps: `docs/TEST-CHECKLIST.md` "Increment 2".
+
+- **7 — forced mode not validated** (`7d5a8e0`). A mode the runtime rejects (CRU custom modes, rotated panels,
+  Wine/DXVK mode lists, a bad `FullscreenWidth/Height`) made CreateDevice/Reset fail -> hang/black screen/exit.
+  **Fix:** exclusive takes the mode from `IDirect3D9::GetAdapterDisplayMode` (the runtime's own refresh rounding)
+  and checks it against `EnumAdapterModes` (unlisted refresh -> closest listed; unlisted size -> current mode);
+  if the call still fails: retry with refresh 0, then with the game's own params and DM inactive (vanilla
+  fullscreen) until the next Reset. A lost device (`D3DERR_DEVICELOST`) gets no fallback - the game retries it.
+- **8 — windowed Alt+N changed the fullscreen mode** (`4398d8b`). It set `Mode=IntegerScaling` + scale, which
+  was persisted. **Fix:** separate `WindowScale` (ini, persisted, defaults to the `IntegerScaling` value);
+  window sizes clamped to the monitor work area and kept on-screen.
+- **9 — hooks acted on every D3D9 device** (`bd1228d`). The vtables are process-wide. **Fix:** Present only for
+  the game's swapchain (`0x8A0E34`, else the game device's implicit swapchain), Reset only for `GAME_DEVICE`,
+  CreateDevice only for th123's call (`ppDevice == &0x8A0E30`, verified at `0x414FB2`/`0x415038`/`0x415059`).
+- **10 — double post-process on a re-presented frame** (`9afd28a`). th123 itself presents with
+  `D3DPRESENT_DONOTWAIT` (`dwFlags=1` at `0x401082`/`0x4081D4`) and re-presents the same frame while Present
+  fails (pending flag `0x896B76`, retry loop `0x4081B0`) - not only with SokuDirectXOptimizations
+  `present_wait=0`. On `D3DERR_WASSTILLDRAWING` DM upscaled its own output's corner again. **Fix:**
+  composited-not-presented flag.
+- **11 — viewport lost after a mid-frame SetRenderTarget** (`8720af4`). th123 never calls SetRenderTarget, but
+  a mod binding the backbuffer again reset the viewport to native (Bug 1 for the rest of the frame). **Fix:**
+  SetRenderTarget hook (vtable 37) re-pins 640x480 when the game's backbuffer is bound at index 0, except during
+  DM's own post-process.
+- **12 — DM stacked on WindowResizer / IntegerFullscreen / ExclusiveFullscreen** (`8fdef7e`). **Fix:** checked
+  via `GetModuleHandleA` at device creation (they may load after DM); DM then passes everything through.
+
+Risks: item 10 assumes whoever retries a failed Present re-presents the same frame (true for th123's loop) -
+if a caller drops the frame and draws a new one, that one frame is shown un-upscaled; item 9's slow path
+(`GetSwapChain` per foreign Present) is cheap but runs every frame for another device's swapchain.
