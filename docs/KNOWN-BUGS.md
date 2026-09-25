@@ -125,7 +125,8 @@ sampling-alignment error in the Sharp shader path.
 
 ## Bug 5+ — window state, Alt+Enter, and hook races (code review, 2026-09-25) — ✅ FIXED, needs in-game test
 
-Verified against th123's disassembly (`0x415220` = the toggle, `0x415100` = its Reset wrapper).
+Verified against th123's disassembly (`0x415220` = the toggle, `0x415100` = its Reset wrapper). Commits:
+`8fce093` (Bug 5), `9fa4482` + `c2cafd7` (Bug 6), `0fa2204` (Bug 7), `a033073` (Bug 8), `f205eb1` (Bug 9).
 
 - **Bug 5 — Alt+Enter couldn't leave borderless; DM polluted the game's present params.** The toggle only
   flips `Windowed` in the game's global struct (`0x8A0F68`, `Windowed` at `+0x20` = `0x8A0F88`) and calls
