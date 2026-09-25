@@ -99,8 +99,8 @@ static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;      // the modifier held with each hotkey key
 
 // ---- runtime state -------------------------------------------------------------------------------
-static bool      g_createDeviceHooked = false;
-static bool      g_deviceHooked       = false;
+static volatile bool g_createDeviceHooked = false;   // (volatile: polled by the device-watch thread)
+static volatile bool g_deviceHooked       = false;
 static bool      g_active             = false;  // currently forcing exclusive fullscreen?
 static UINT      g_bbW = 0, g_bbH = 0;          // forced backbuffer size (= native desktop)
 static D3DFORMAT g_bbFormat = D3DFMT_X8R8G8B8;  // backbuffer format (for the capture RT)
@@ -195,15 +195,17 @@ typedef HRESULT (WINAPI *SCPresent_t)(IDirect3DSwapChain9 *, const RECT *, const
                                       const RGNDATA *, DWORD);
 static SCPresent_t oSCPresent = nullptr;
 
-// Overwrite one vtable slot, returning the previous entry. A single aligned pointer store, safe while
-// the render thread may be calling through the table.
-static void *hookSlot(void **vtable, int index, void *hook) {
+// Overwrite one vtable slot, storing the previous entry in *orig first (so a call that goes through the
+// new slot immediately already finds the original). A single aligned pointer store, safe while the render
+// thread may be calling through the table. No-op if the slot already holds our hook: recording our own
+// hook as the "original" would make it call itself forever.
+static void hookSlot(void **vtable, int index, void *hook, void **orig) {
+	if (vtable[index] == hook) return;
 	DWORD old;
 	VirtualProtect(&vtable[index], sizeof(void *), PAGE_READWRITE, &old);
-	void *prev = vtable[index];
+	*orig = vtable[index];
 	vtable[index] = hook;
 	VirtualProtect(&vtable[index], sizeof(void *), old, &old);
-	return prev;
 }
 
 // Resolve the centered output size (g_scaleW/H) and upscale filter from the current mode and the native
@@ -587,7 +589,7 @@ static void hookSwapChain(IDirect3DDevice9 *dev) {
 	IDirect3DSwapChain9 *sc = nullptr;
 	if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
 		void **vt = *(void ***)sc;
-		oSCPresent = (SCPresent_t)hookSlot(vt, VT_SC_PRESENT, (void *)mySCPresent);
+		hookSlot(vt, VT_SC_PRESENT, (void *)mySCPresent, (void **)&oSCPresent);
 		sc->Release();
 		logf("swapchain Present hooked");
 	} else {
@@ -595,34 +597,42 @@ static void hookSwapChain(IDirect3DDevice9 *dev) {
 	}
 }
 
-static void hookDevice(IDirect3DDevice9 *dev) {
-	if (g_deviceHooked || !dev) return;
+// Single-shot: the CreateDevice hook and the device-watch thread can both get here (th123 passes &0x8A0E30
+// as ppDevice, so the global is already set inside oCreateDevice, before this runs). Returns true only for
+// the caller that actually hooked.
+static volatile LONG g_deviceHookClaim = 0;
+static bool hookDevice(IDirect3DDevice9 *dev) {
+	if (!dev || InterlockedCompareExchange(&g_deviceHookClaim, 1, 0) != 0) return false;
 	void **vt = *(void ***)dev;
-	oReset = (Reset_t)hookSlot(vt, VT_DEV_RESET, (void *)myReset);
+	hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
 	hookSwapChain(dev);
 	g_deviceHooked = true;
 	logf("device vtable hooked (Reset) + swapchain Present");
+	return true;
 }
 
-// Is `fn` inside d3d9.dll? Used to confirm the device global holds a real Direct3D(9/9Ex) device with a
-// standard vtable before we patch it (a wrapper device would point elsewhere - we skip those safely).
-static bool isInsideD3D9(void *fn) {
-	HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
-	if (!d3d9 || !fn) return false;
-	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)d3d9;
-	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)d3d9 + dos->e_lfanew);
-	BYTE *base = (BYTE *)d3d9, *end = base + nt->OptionalHeader.SizeOfImage;
-	return (BYTE *)fn >= base && (BYTE *)fn < end;
+// Does `fn` point into executable code of a loaded module? Used to confirm the device global holds a
+// finished device with a sane vtable before we patch it. (Deliberately not "inside d3d9.dll": in the usual
+// setup GetModuleHandle("d3d9.dll") is the SokuModLoader proxy in the game folder, while the real device
+// comes from System32's d3d9, a d3d9_custom.dll, or DXVK.)
+static bool isExecutableImage(void *fn) {
+	MEMORY_BASIC_INFORMATION mbi;
+	if (!fn || !VirtualQuery(fn, &mbi, sizeof(mbi))) return false;
+	return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+	       (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
 }
 
 // Fallback path when our Direct3DCreate9 hook never fires - e.g. SokuDirectXOptimizations creates a
 // Direct3D9Ex device (via Direct3DCreate9Ex, a different export) or otherwise intercepts creation. We
 // poll the game's device global (0x8A0E30) and hook the device once it exists, regardless of who made it.
+// Best-effort only: it stands down as soon as the normal CreateDevice hook is in place, and a late attach
+// can still miss Resets if another mod has already redirected the game's Reset call site (0x4151AC) to a
+// saved copy of the original Reset.
 static DWORD WINAPI deviceWatchThread(LPVOID) {
-	for (int i = 0; i < 1200 && !g_deviceHooked; i++) {   // ~60s
+	for (int i = 0; i < 1200 && !g_deviceHooked && !g_createDeviceHooked; i++) {   // ~60s
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		void **vt = dev ? *(void ***)dev : nullptr;
-		if (vt && isInsideD3D9(vt[17])) {                 // 17 = Present: a real d3d9 vtable
+		if (vt && isExecutableImage(vt[VT_DEV_RESET]) && isExecutableImage(vt[17])) {   // 17 = Present
 			IDirect3DSwapChain9 *sc = nullptr;
 			if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
 				D3DPRESENT_PARAMETERS pp = {0};
@@ -634,8 +644,8 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 				D3DDEVICE_CREATION_PARAMETERS cp = {0};
 				if (SUCCEEDED(dev->GetCreationParameters(&cp))) g_hwnd = cp.hFocusWindow;
 			}
-			logf("device watch: found device %p (hwnd %p) - hooking without CreateDevice", dev, g_hwnd);
-			hookDevice(dev);
+			if (!hookDevice(dev)) return 0;        // the CreateDevice path got there first
+			logf("device watch: found device %p (hwnd %p) - hooked without CreateDevice", dev, g_hwnd);
 			installWndProc();
 			installKeyboardHook();
 			onWindowedEntry(true);
@@ -643,7 +653,7 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 		}
 		Sleep(50);
 	}
-	if (!g_deviceHooked)
+	if (!g_deviceHooked && !g_createDeviceHooked)
 		logf("device watch: no hookable d3d9 device found. If SokuDirectXOptimizations is enabled, set "
 		     "use_d3d9ex=0 - its 9Ex path wraps the device and DisplayManager can't attach to it.");
 	return 0;
@@ -681,7 +691,7 @@ static IDirect3D9 *WINAPI myDirect3DCreate9(UINT sdkVersion) {
 	IDirect3D9 *d3d = oDirect3DCreate9(sdkVersion);
 	if (d3d && !g_createDeviceHooked) {
 		void **vt = *(void ***)d3d;
-		oCreateDevice = (CreateDevice_t)hookSlot(vt, VT_D3D9_CREATEDEVICE, (void *)myCreateDevice);
+		hookSlot(vt, VT_D3D9_CREATEDEVICE, (void *)myCreateDevice, (void **)&oCreateDevice);
 		g_createDeviceHooked = true;
 		logf("IDirect3D9 created, CreateDevice hooked");
 	}
@@ -900,15 +910,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	return CallWindowProcA(g_origWndProc, h, msg, wp, lp);
 }
 
+static volatile LONG g_wndProcClaim = 0;
 static void installWndProc() {
-	if (g_origWndProc || !g_hwnd) return;
+	if (!g_hwnd || InterlockedCompareExchange(&g_wndProcClaim, 1, 0) != 0) return;   // single-shot
 	if (g_resizable) {
 		LONG style = GetWindowLongA(g_hwnd, GWL_STYLE);
 		SetWindowLongA(g_hwnd, GWL_STYLE, style | WS_THICKFRAME);   // add a drag-resize border
 		SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
 		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 	}
-	g_origWndProc = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndProc);
+	// Record the original before swapping, so a message dispatched in between (the install can run off the
+	// window thread, from the device watch) never finds it null.
+	g_origWndProc = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+	WNDPROC prev = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndProc);
+	if (prev) g_origWndProc = prev;
 	logf("wndproc subclassed (resizable=%d)", g_resizable);
 }
 
