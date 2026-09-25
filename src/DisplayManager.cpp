@@ -149,6 +149,7 @@ static bool     g_haveWinPos = false;
 static POINT    g_winPos     = { 0, 0 };
 static HMONITOR g_fsMon      = nullptr;
 static UINT     g_applyMsg   = 0;       // private registered message: apply the window state (wndProc)
+static bool     g_spawnPending = false; // first-spawn window setup posted but not applied yet
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -174,6 +175,7 @@ static void setWindowScaled(int n, const POINT *pos);
 static void onWindowedEntry(bool firstTime);
 static void enterBorderlessFullscreen();
 static void postWindowApply(bool firstTime);
+static void applyWindowState();
 static void applyTopmost();
 
 // ---- original function pointers ------------------------------------------------------------------
@@ -573,8 +575,11 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 			d3d->Release();
 		}
 	}
-	// Leaving windowed: remember the window's position and monitor before anything moves it.
+	// Leaving windowed: remember the window's position and monitor before anything moves it. If the
+	// first-spawn setup is still queued (a fullscreen start: th123 SendMessages its startup Alt+Enter at
+	// 0x442EC7, possibly before our posted message is pumped), run it now so that is what we restore.
 	if (pp && !pp->Windowed && !g_windowFs && g_hwnd) {
+		if (g_spawnPending) applyWindowState();
 		RECT r;
 		if (GetWindowRect(g_hwnd, &r)) { g_winPos.x = r.left; g_winPos.y = r.top; g_haveWinPos = true; }
 		g_fsMon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -915,9 +920,11 @@ static void onWindowedEntry(bool firstTime) {
 	applyTopmost();
 }
 
-// Set the window up for the current state: windowed (onWindowedEntry) or the borderless popup. Exclusive
-// fullscreen needs nothing - D3D9 owns the screen.
-static void applyWindowState(bool firstTime) {
+// Set the window up for the current state: windowed (onWindowedEntry; the first time with the spawn
+// setup) or the borderless popup. Exclusive fullscreen needs nothing - D3D9 owns the screen.
+static void applyWindowState() {
+	bool firstTime = g_spawnPending;
+	g_spawnPending = false;
 	if (!g_wantFullscreen)  onWindowedEntry(firstTime);
 	else if (g_borderless)  enterBorderlessFullscreen();
 }
@@ -929,7 +936,7 @@ static WNDPROC g_origWndProc = nullptr;
 // Also runs the deferred window-state apply posted by postWindowApply.
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	if (g_applyMsg && msg == g_applyMsg) {
-		applyWindowState(wp != 0);
+		applyWindowState();
 		return 0;
 	}
 	if (msg == WM_SIZING && g_resizable && !g_active) {
@@ -975,10 +982,11 @@ static void installWndProc() {
 // message to the game window and do the work in wndProc, after the game's own window code has run.
 // Falls back to applying immediately if the window isn't subclassed.
 static void postWindowApply(bool firstTime) {
+	if (firstTime) g_spawnPending = true;
 	if (!g_applyMsg) g_applyMsg = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
-	if (g_hwnd && g_origWndProc && g_applyMsg && PostMessageA(g_hwnd, g_applyMsg, firstTime ? 1 : 0, 0))
+	if (g_hwnd && g_origWndProc && g_applyMsg && PostMessageA(g_hwnd, g_applyMsg, 0, 0))
 		return;
-	applyWindowState(firstTime);
+	applyWindowState();
 }
 
 // Turn the game's window into a borderless popup covering its monitor (used in borderless-fullscreen
