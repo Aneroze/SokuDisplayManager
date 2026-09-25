@@ -380,12 +380,15 @@ static bool g_presentLogged = false;
 // at BeginScene and again at EndScene: our Begin/EndScene re-triggers a mod redraw (PracticeEx's 640x480
 // menu) into whatever is bound then, so it lands in the backbuffer - which the caller wipes and overwrites
 // with the stage - instead of on the upscaled frame.
-static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
+//
+// Returns false if nothing was drawn (a resource is missing, or BeginScene / the draw failed), so the
+// caller can fall back to a StretchRect upscale instead of presenting a stale or uninitialised stage.
+static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
                       const RECT *dstRect) {
-	if (!g_ps || !g_captureTex || !g_stateBlock) return;
+	if (!g_ps || !g_captureTex || !g_stateBlock) return false;
 	g_stateBlock->Capture();                                  // save all device state
 	dev->SetRenderTarget(0, bb);
-	if (FAILED(dev->BeginScene())) { g_stateBlock->Apply(); return; }
+	if (FAILED(dev->BeginScene())) { g_stateBlock->Apply(); return false; }
 	dev->SetRenderTarget(0, target);
 	dev->SetPixelShader(g_ps);
 	dev->SetVertexShader(nullptr);
@@ -413,10 +416,11 @@ static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 		{ L, B, 0.0f, 1.0f, 0.0f, 1.0f },
 		{ R, B, 0.0f, 1.0f, 1.0f, 1.0f },
 	};
-	dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+	HRESULT hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
 	dev->SetRenderTarget(0, bb);
 	dev->EndScene();
 	g_stateBlock->Apply();                                    // restore all device state
+	return SUCCEEDED(hr);
 }
 
 // Pin the game's viewport to its 640x480 (g_srcW x g_srcH) frame. th123 never calls SetViewport: it
@@ -527,11 +531,10 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			IDirect3DSurface9 *target = g_stageSurf ? g_stageSurf : bb;
 			HRESULT b = S_OK, c = S_OK;
 			if (!g_stageSurf) b = dev->ColorFill(bb, nullptr, g_bgColor);
-			if (g_filterCfg == 3 && g_ps) {
-				drawSharp(dev, bb, target, &dstRect);
-			} else {
+			// Sharp falls back to StretchRect (g_filter resolves to linear for Sharp) if the shader pass
+			// couldn't draw - otherwise the stale / uninitialised stage would be copied to the screen.
+			if (g_filterCfg != 3 || !drawSharp(dev, bb, target, &dstRect))
 				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
-			}
 			if (g_stageSurf) {
 				b = dev->ColorFill(bb, nullptr, g_bgColor);                                  // borders
 				c = dev->StretchRect(g_stageSurf, &dstRect, bb, &dstRect, D3DTEXF_NONE);   // 1:1 copy
