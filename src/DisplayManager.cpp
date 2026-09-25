@@ -14,15 +14,18 @@
 // How it works
 // ------------
 // The game builds one global D3DPRESENT_PARAMETERS (0x8A0F68) and creates a plain Direct3D9 device
-// (Direct3DCreate9, not Ex; SwapEffect DISCARD). Its "fullscreen" state (0x8998B0) is literally
-// (present.Windowed == 0). Crucially, the game always draws its 640x480 surface at 1:1 into the
-// top-left of the backbuffer and relies on the fullscreen *display mode* to upscale the whole
-// framebuffer - it does not scale its scene to the backbuffer. So we:
+// (Direct3DCreate9, not Ex; SwapEffect DISCARD). Its fullscreen state is literally that struct's
+// Windowed == 0: Alt+Enter (0x4082DE -> 0x415220) just flips Windowed and calls Reset with the struct.
+// (0x8998B0 is only the saved "start fullscreen" config flag: stored from Windowed at exit, 0x4405AF, and
+// read at startup, 0x442EC7, to post an Alt+Enter.) Crucially, the game always draws its 640x480 surface
+// at 1:1 into the top-left of the backbuffer and relies on the fullscreen *display mode* to upscale the
+// whole framebuffer - it does not scale its scene to the backbuffer. So we:
 //   1. Intercept Direct3DCreate9 (IAT thunk at 0x8572A0) -> hook IDirect3D9::CreateDevice.
 //   2. In CreateDevice/Reset, when the game asks for fullscreen (Windowed == FALSE), force the
-//      backbuffer to the *native* desktop mode so the monitor never rescales. Windowed requests are
-//      restored to the game's own windowed size (we must undo the large size we wrote into the shared
-//      present-params struct, or it leaks into the windowed path).
+//      backbuffer to the *native* desktop mode so the monitor never rescales (borderless: a windowed
+//      device at native size instead). These changes go into a COPY of the game's struct, which is
+//      never modified, so the game (and other mods) always see its real windowed/fullscreen state.
+//      Windowed requests pass through untouched.
 //   3. Hook the swapchain's Present: the game has drawn its 640x480 frame into the
 //      backbuffer's top-left. Grab it into an offscreen render target, clear the whole backbuffer
 //      black, then StretchRect it back scaled to WidthxHeight, centered, with POINT filtering -> crisp
@@ -119,19 +122,14 @@ static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is alrea
                                                          // interp band = 0.5/sharp), so no point going higher
 static volatile DWORD          g_osdUntil = 0;          // GetTickCount() deadline for the OSD toast
 static char                    g_osdText[32] = {0};     // current OSD message (uppercase; see OSD_CHARS)
-// The game's canonical windowed backbuffer size, captured from the first (windowed) CreateDevice, so a
-// return to windowed restores it instead of inheriting the huge fullscreen size we wrote into the
-// game's shared present-params struct.
-static bool g_haveWin = false;
-static UINT g_winW = 640, g_winH = 480;
 static HWND g_hwnd = nullptr;   // the game's window (from present params), for windowed resizing
 // Monitor of the adapter the game's device was created on. Exclusive fullscreen always takes over THIS
 // monitor (the adapter is fixed at CreateDevice), wherever the window has been dragged.
 static HMONITOR g_adapterMon = nullptr;
 static bool g_topmost = false;          // always-on-top toggle (Alt+P)
-// Borderless-mode state: g_wantFullscreen tracks the game's real intent (from pp.Windowed before we
-// override it) so we can tell a forced-windowed borderless-fullscreen apart from a genuine windowed
-// request. Saved styles restore the normal window when leaving borderless fullscreen.
+// Borderless-mode state: g_wantFullscreen tracks the game's real intent (its pp.Windowed, which we never
+// modify - we only override our own copy) so we can tell a forced-windowed borderless-fullscreen apart
+// from a genuine windowed request. Saved styles restore the normal window when leaving borderless.
 static bool g_wantFullscreen = false;
 static bool g_borderlessActive = false;
 static bool g_styleSaved = false;
@@ -161,23 +159,6 @@ static void setWindowScaled(int n, bool applyPos);
 static void onWindowedEntry(bool firstTime);
 static void enterBorderlessFullscreen();
 static void applyTopmost();
-
-// Overwrite `len` bytes at `addr` with NOPs (used only in borderless mode to stop the game deriving its
-// fullscreen flag from present.Windowed, so we can own that flag ourselves).
-static void patchNop(DWORD addr, int len) {
-	DWORD old;
-	VirtualProtect((void *)addr, len, PAGE_EXECUTE_READWRITE, &old);
-	for (int i = 0; i < len; i++) ((BYTE *)addr)[i] = 0x90;
-	VirtualProtect((void *)addr, len, old, &old);
-	FlushInstructionCache(GetCurrentProcess(), (void *)addr, len);
-}
-
-// In borderless mode we present a windowed device, but the game must still believe it is fullscreen so
-// its Alt+Enter toggle flips the right way. We write the flag (0x8998B0) ourselves; the game's own write
-// to it is NOP'd (see setupHooks).
-static void writeFsFlag(bool fs) {
-	if (g_borderless) *(BYTE *)0x008998B0 = fs ? 1 : 0;
-}
 
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
@@ -294,8 +275,11 @@ static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 
 // Decide how to shape the present parameters for this (Create)Device/Reset call. Fullscreen requests
 // (Windowed == FALSE) are forced to the native desktop mode so the monitor is never rescaled; windowed
-// requests are restored to the game's canonical windowed size (undoing the huge size we write into the
-// game's shared present-params struct while fullscreen, which otherwise leaks into the windowed path).
+// requests pass through untouched. `pp` is always OUR COPY of the game's struct (see syncPresentParams):
+// the game's own global (0x8A0F68) must keep its real values - its Alt+Enter toggle just flips that
+// struct's Windowed, its post-toggle window code and device-lost recovery read it back, and other mods
+// read it too. Writing Windowed=TRUE (borderless) or the native size into it made Alt+Enter unable to
+// leave borderless.
 static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (!g_enabled || !pp) { g_active = false; return; }
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
@@ -308,13 +292,7 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
 
 	if (pp->Windowed) {
-		// The game wants a normal window. Remember its canonical size the first time (before we meddle).
-		if (!g_haveWin && pp->BackBufferWidth && pp->BackBufferHeight &&
-		    pp->BackBufferWidth <= 4096 && pp->BackBufferHeight <= 4096) {
-			g_winW = pp->BackBufferWidth; g_winH = pp->BackBufferHeight; g_haveWin = true;
-		}
-		if (g_haveWin) { pp->BackBufferWidth = g_winW; pp->BackBufferHeight = g_winH; }
-		pp->FullScreen_RefreshRateInHz = 0;
+		// The game wants a normal window: its own size (640x480), untouched.
 		g_active = false;
 		return;
 	}
@@ -339,6 +317,16 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	}
 	g_bbW = w; g_bbH = h; g_bbFormat = fmt; g_active = true;
 	computeOutput();
+}
+
+// After a (Create)Device/Reset made with our copy `used` of the game's struct `game`, hand back only what
+// the runtime itself fills in. An untouched (windowed) copy goes back whole, exactly as if the game had
+// passed its own struct; for a fullscreen copy we never write back our size / Windowed overrides - only
+// the defaults the runtime resolves (th123 passes explicit values for both, so this is normally a no-op).
+static void syncPresentParams(D3DPRESENT_PARAMETERS *game, const D3DPRESENT_PARAMETERS *used) {
+	if (!g_active) { *game = *used; return; }
+	if (game->BackBufferCount == 0) game->BackBufferCount = used->BackBufferCount;
+	if (game->BackBufferFormat == D3DFMT_UNKNOWN) game->BackBufferFormat = used->BackBufferFormat;
 }
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
@@ -566,8 +554,11 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 			d3d->Release();
 		}
 	}
-	applyFullscreenParams(pp);
-	HRESULT hr = oReset(dev, pp);
+	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
+	if (pp) { local = *pp; use = &local; }
+	applyFullscreenParams(use);
+	HRESULT hr = oReset(dev, use);
+	if (pp) syncPresentParams(pp, &local);
 	if (SUCCEEDED(hr)) {
 		if (g_active) {
 			createCapture(dev);
@@ -666,10 +657,13 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	g_adapterMon = self->GetAdapterMonitor(adapter);
-	applyFullscreenParams(pp);          // sets g_hwnd from pp->hDeviceWindow
+	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
+	if (pp) { local = *pp; use = &local; }
+	applyFullscreenParams(use);         // sets g_hwnd from pp->hDeviceWindow
 	if (!g_hwnd && focus) g_hwnd = focus;
 	installKeyboardHook();              // hooks the WINDOW's thread (not necessarily this one)
-	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, pp, out);
+	HRESULT hr = oCreateDevice(self, adapter, type, focus, behavior, use, out);
+	if (pp) syncPresentParams(pp, &local);
 	if (SUCCEEDED(hr) && out && *out) {
 		hookDevice(*out);
 		if (g_active) {
@@ -882,7 +876,6 @@ static void onWindowedEntry(bool firstTime) {
 		g_styleSaved = false;
 	}
 	g_borderlessActive = false;
-	writeFsFlag(false);
 	setWindowScaled(g_intScale, firstTime);
 	applyTopmost();
 }
@@ -948,7 +941,6 @@ static void enterBorderlessFullscreen() {
 	SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_TOP,
 	             mi.rcMonitor.left, mi.rcMonitor.top, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 	g_borderlessActive = true;
-	writeFsFlag(true);
 	logf("borderless window %dx%d at (%d,%d) topmost=%d",
 	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_topmost);
 }
@@ -1045,12 +1037,6 @@ static void setupHooks() {
 	oDirect3DCreate9 = reinterpret_cast<Direct3DCreate9_t>(*slot);
 	*slot = reinterpret_cast<DWORD>(&myDirect3DCreate9);
 	VirtualProtect(slot, sizeof(DWORD), old, &old);
-
-	// Borderless mode presents a windowed device, so stop the game deriving its fullscreen flag
-	// (0x8998B0) from present.Windowed - we own that flag instead (writeFsFlag), which keeps its
-	// Alt+Enter toggle flipping the right way. `mov [0x8998B0], al` at 0x004405BC is 5 bytes.
-	if (g_borderless)
-		patchNop(0x004405BC, 5);
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
