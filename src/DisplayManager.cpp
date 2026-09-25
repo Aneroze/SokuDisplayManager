@@ -134,6 +134,16 @@ static bool g_wantFullscreen = false;
 static bool g_borderlessActive = false;
 static bool g_styleSaved = false;
 static LONG g_savedStyle = 0, g_savedExStyle = 0;
+// Window state across a windowed <-> fullscreen switch. g_windowFs = the state the window was last set up
+// for (a Reset that doesn't change it, e.g. device-lost recovery, leaves the window alone). When leaving
+// windowed we remember where the window was (the game's own post-toggle SetWindowPos re-centers it on the
+// primary monitor) and which monitor it was on (borderless covers that one - by the time we apply it the
+// game has already moved the window to the primary's origin).
+static bool     g_windowFs   = false;
+static bool     g_haveWinPos = false;
+static POINT    g_winPos     = { 0, 0 };
+static HMONITOR g_fsMon      = nullptr;
+static UINT     g_applyMsg   = 0;       // private registered message: apply the window state (wndProc)
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -155,9 +165,10 @@ static void logf(const char *fmt, ...) {
 // forward declarations (definitions live further down)
 static void installKeyboardHook();
 static void installWndProc();
-static void setWindowScaled(int n, bool applyPos);
+static void setWindowScaled(int n, const POINT *pos);
 static void onWindowedEntry(bool firstTime);
 static void enterBorderlessFullscreen();
+static void postWindowApply(bool firstTime);
 static void applyTopmost();
 
 // ---- original function pointers ------------------------------------------------------------------
@@ -243,10 +254,12 @@ static void computeOutput() {
 // switched to a wrong (often small) resolution, which is blurry and shuffles the user's windows.
 // Exclusive uses the device's ADAPTER monitor: the window's monitor is wrong once the window has been
 // dragged to another screen (e.g. a 1080p second monitor's mode got applied to a 1440p primary).
-// Borderless is a windowed device, so it can cover whichever monitor the window is on.
+// Borderless is a windowed device, so it can cover whichever monitor the window is on (g_fsMon: the
+// monitor it was on when fullscreen was requested - the same one enterBorderlessFullscreen covers).
 static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 	*w = *h = *refresh = 0;
 	HMONITOR mon = (!g_borderless && g_adapterMon) ? g_adapterMon
+	             : (g_borderless && g_fsMon) ? g_fsMon
 	             : g_hwnd ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY) : nullptr;
 	if (mon) {
 		MONITORINFOEXA mi; mi.cbSize = sizeof(mi);
@@ -554,6 +567,12 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 			d3d->Release();
 		}
 	}
+	// Leaving windowed: remember the window's position and monitor before anything moves it.
+	if (pp && !pp->Windowed && !g_windowFs && g_hwnd) {
+		RECT r;
+		if (GetWindowRect(g_hwnd, &r)) { g_winPos.x = r.left; g_winPos.y = r.top; g_haveWinPos = true; }
+		g_fsMon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+	}
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
 	applyFullscreenParams(use);
@@ -564,10 +583,12 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 			createCapture(dev);
 			setGameViewport(dev);
 		}
-		if (g_wantFullscreen) {
-			if (g_borderless) enterBorderlessFullscreen();
-		} else {
-			onWindowedEntry(false); // returning to windowed: restore frame + remembered window scale
+		// A real windowed <-> fullscreen switch: set the window up for the new state (borderless popup, or
+		// the restored frame + remembered scale/position + topmost). Deferred via postWindowApply, because
+		// the game's own SetWindowPos runs after this Reset returns and would undo it.
+		if (g_wantFullscreen != g_windowFs) {
+			g_windowFs = g_wantFullscreen;
+			postWindowApply(false);
 		}
 	}
 	g_presentLogged = false;
@@ -625,10 +646,13 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 		void **vt = dev ? *(void ***)dev : nullptr;
 		if (vt && isExecutableImage(vt[VT_DEV_RESET]) && isExecutableImage(vt[17])) {   // 17 = Present
 			IDirect3DSwapChain9 *sc = nullptr;
+			BOOL windowed = TRUE;
 			if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
 				D3DPRESENT_PARAMETERS pp = {0};
-				if (SUCCEEDED(sc->GetPresentParameters(&pp)) && pp.hDeviceWindow)
-					g_hwnd = pp.hDeviceWindow;
+				if (SUCCEEDED(sc->GetPresentParameters(&pp))) {
+					if (pp.hDeviceWindow) g_hwnd = pp.hDeviceWindow;
+					windowed = pp.Windowed;
+				}
 				sc->Release();
 			}
 			if (!g_hwnd) {
@@ -639,7 +663,8 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 			logf("device watch: found device %p (hwnd %p) - hooked without CreateDevice", dev, g_hwnd);
 			installWndProc();
 			installKeyboardHook();
-			onWindowedEntry(true);
+			g_wantFullscreen = g_windowFs = !windowed;   // attached mid-fullscreen: wait for the next Reset
+			if (windowed) postWindowApply(true);
 			return 0;
 		}
 		Sleep(50);
@@ -671,11 +696,10 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 			setGameViewport(*out);
 		}
 		installWndProc();               // subclass the window for drag-resize aspect locking
-		if (g_wantFullscreen) {
-			if (g_borderless) enterBorderlessFullscreen();
-		} else {
-			onWindowedEntry(true);      // first windowed spawn: apply saved scale + spawn position
-		}
+		// First spawn (th123 always creates windowed): saved scale + spawn position. Deferred like the
+		// Reset path, so it lands after the game's own window setup instead of racing it.
+		g_windowFs = g_wantFullscreen;
+		postWindowApply(true);
 	}
 	return hr;
 }
@@ -845,18 +869,18 @@ static void windowBorders(int *bx, int *by) {
 
 // Resize the game's window so its client area is exactly (srcW*n) x (srcH*n). We only move the window's
 // borders - the game keeps rendering to its existing backbuffer and D3D9's windowed present stretches it
-// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer. Moves to
-// the configured spawn position only when applyPos is set (and a position is configured).
-static void setWindowScaled(int n, bool applyPos) {
+// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer. Also moves
+// the window's top-left to `pos` when given (null = keep the current position).
+static void setWindowScaled(int n, const POINT *pos) {
 	if (!g_hwnd || n < 1) return;
 	int bx, by; windowBorders(&bx, &by);
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
 	int x = 0, y = 0;
-	if (applyPos && g_posX >= 0 && g_posY >= 0) { x = g_posX; y = g_posY; }
+	if (pos) { x = pos->x; y = pos->y; }
 	else flags |= SWP_NOMOVE;
 	SetWindowPos(g_hwnd, nullptr, x, y, g_srcW * n + bx, g_srcH * n + by, flags);
 	logf("window -> client %dx%d (x%d)%s", g_srcW * n, g_srcH * n, n,
-	     (flags & SWP_NOMOVE) ? "" : " +spawn-pos");
+	     pos ? " +pos" : "");
 }
 
 static void applyTopmost() {
@@ -865,8 +889,10 @@ static void applyTopmost() {
 		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-// Apply the remembered window scale on entering (real) windowed mode; on the first spawn also honor the
-// configured spawn position. If we were in borderless fullscreen, restore the normal window frame first.
+// Apply the remembered window scale on entering (real) windowed mode. On the first spawn, move to the
+// configured spawn position (if any); when coming back from fullscreen, to where the window was before
+// (the game's post-toggle SetWindowPos re-centers it on the primary monitor). If we were in borderless
+// fullscreen, restore the normal window frame first.
 static void onWindowedEntry(bool firstTime) {
 	if (g_styleSaved && g_hwnd) {
 		SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
@@ -876,15 +902,30 @@ static void onWindowedEntry(bool firstTime) {
 		g_styleSaved = false;
 	}
 	g_borderlessActive = false;
-	setWindowScaled(g_intScale, firstTime);
+	POINT spawn = { g_posX, g_posY };
+	const POINT *pos = firstTime ? ((g_posX >= 0 && g_posY >= 0) ? &spawn : nullptr)
+	                             : (g_haveWinPos ? &g_winPos : nullptr);
+	setWindowScaled(g_intScale, pos);
 	applyTopmost();
+}
+
+// Set the window up for the current state: windowed (onWindowedEntry) or the borderless popup. Exclusive
+// fullscreen needs nothing - D3D9 owns the screen.
+static void applyWindowState(bool firstTime) {
+	if (!g_wantFullscreen)  onWindowedEntry(firstTime);
+	else if (g_borderless)  enterBorderlessFullscreen();
 }
 
 // Subclassed window procedure: while windowed and resizable, lock a drag-resize to the source aspect
 // ratio (and a minimum of one source-size) so the stretched image never gets squashed.
 static WNDPROC g_origWndProc = nullptr;
 
+// Also runs the deferred window-state apply posted by postWindowApply.
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+	if (g_applyMsg && msg == g_applyMsg) {
+		applyWindowState(wp != 0);
+		return 0;
+	}
 	if (msg == WM_SIZING && g_resizable && !g_active) {
 		RECT *wr = (RECT *)lp;
 		int bx, by; windowBorders(&bx, &by);
@@ -920,6 +961,20 @@ static void installWndProc() {
 	logf("wndproc subclassed (resizable=%d)", g_resizable);
 }
 
+// Apply the window state (applyWindowState) once the game has finished handling the current message.
+// On Alt+Enter th123 calls Reset from its window procedure (0x4082DE -> 0x415220) and, AFTER Reset
+// returns, does its own SetWindowPos: windowed = HWND_NOTOPMOST, re-centered on the primary monitor, sized
+// with fixed-frame metrics (wrong for our WS_THICKFRAME, giving a non-4:3 client); fullscreen = move the
+// client to the primary's origin. Anything done inside myReset is undone by that, so we post a private
+// message to the game window and do the work in wndProc, after the game's own window code has run.
+// Falls back to applying immediately if the window isn't subclassed.
+static void postWindowApply(bool firstTime) {
+	if (!g_applyMsg) g_applyMsg = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
+	if (g_hwnd && g_origWndProc && g_applyMsg && PostMessageA(g_hwnd, g_applyMsg, firstTime ? 1 : 0, 0))
+		return;
+	applyWindowState(firstTime);
+}
+
 // Turn the game's window into a borderless popup covering its monitor (used in borderless-fullscreen
 // mode).
 static void enterBorderlessFullscreen() {
@@ -935,8 +990,11 @@ static void enterBorderlessFullscreen() {
 	SetWindowLongA(g_hwnd, GWL_STYLE, style);
 	SetWindowLongA(g_hwnd, GWL_EXSTYLE, ex);
 
+	// Cover the monitor the window was on when fullscreen was requested (g_fsMon): by now the game's
+	// post-toggle SetWindowPos has moved the window to the primary monitor's origin.
 	MONITORINFO mi = { sizeof(mi) };
-	GetMonitorInfo(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+	if (!g_fsMon || !GetMonitorInfo(g_fsMon, &mi))
+		GetMonitorInfo(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
 	int mw = mi.rcMonitor.right - mi.rcMonitor.left, mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
 	SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_TOP,
 	             mi.rcMonitor.left, mi.rcMonitor.top, mw, mh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
@@ -958,8 +1016,8 @@ static void doAction(int act) {
 	case ACT_S1: case ACT_S2: case ACT_S3: case ACT_S4: case ACT_S5: case ACT_S6: {
 		int n = act - ACT_S1 + 1;
 		g_mode = MODE_INTEGER; g_intScale = n;
-		if (g_active) computeOutput();          // fullscreen: re-scale the centered output live
-		else          setWindowScaled(n, false); // windowed: resize the window to N x
+		if (g_active) computeOutput();            // fullscreen: re-scale the centered output live
+		else          setWindowScaled(n, nullptr); // windowed: resize the window to N x
 		char msg[8]; wsprintfA(msg, "X%d", n); showOsd(msg);
 		logf("hotkey: x%d", n);
 		break;
