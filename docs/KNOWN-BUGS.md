@@ -77,6 +77,27 @@ already said the quad must use the −0.5 offset.
 so output pixel centers sample `(k+0.5)/N`. Sharpness now varies correctly (1.0 = aligned bilinear/smooth →
 4.0 ≈ point). Verified live by the user. Default `Sharpness` retuned under the corrected alignment: **1.50**.
 
+## Bug 4 — Sharp filter blurry in a top-left block at non-integer scales — ✅ FIXED (2026-09-25)
+
+**Reported by Quosu** (1920×1080 monitor, FitToScreen = 2.25×): with `Filter=Sharp`, a rectangle at the
+top-left of the game image looked blurry. Never seen at 2560×1440 because FitToScreen there is an exact 3×.
+
+**Root cause — the large-scale PracticeEx dupe workaround (1d01ea7).** After the upscale, `mySCPresent`
+re-blitted the part of the image overlapping the 640×480 grab region (screen `[dst.left..640]×[dst.top..480]`)
+from the clean capture with `StretchRect` — POINT at integer scales but **LINEAR otherwise**, never the Sharp
+shader. At 2.25× that is a 400×480 plain-bilinear block (≈178×213 game px); its integer-truncated source
+rect also shifted it ~1 px. At 3× POINT is close enough to Sharp that nobody noticed.
+
+**Fix:** compose the upscale (any filter) into an offscreen backbuffer-sized render target (`g_stageSurf`),
+then ColorFill the backbuffer and copy the stage over 1:1 — every output pixel comes from the one upscale
+pass. `drawSharp` binds the *backbuffer* at BeginScene/EndScene and the stage only for its draw, so the
+PracticeEx redraw that our scene triggers lands in the backbuffer (wiped by the ColorFill) instead of on the
+frame. The corner re-blit and the border re-clear are gone. Verified with a 1920×1080 forced backbuffer
+(borderless + `FullscreenWidth/Height`), via a test-only build that dumps the final backbuffer right before
+the real Present (the harness `shotbb` fires *before* DM's hook, so it can't see the final top-left):
+old build = "Vs Network" (in the corner) visibly softer than "Practice" below y=480; new build = identical
+crispness, and the PracticeEx menu (Backspace) shows no top-left dupe.
+
 ## Common thread (resolved)
 Bugs 1–2 stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale): Bug 1 = the
 default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to 640×480);

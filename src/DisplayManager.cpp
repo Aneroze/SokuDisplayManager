@@ -108,6 +108,9 @@ static D3DFORMAT g_bbFormat = D3DFMT_X8R8G8B8;  // backbuffer format (for the ca
 // surface (the StretchRect grab target, and the source for Point/Linear StretchRect upscales).
 static IDirect3DTexture9      *g_captureTex  = nullptr;
 static IDirect3DSurface9      *g_captureSurf = nullptr;
+// Offscreen backbuffer-sized render target the upscale is composed into, then copied 1:1 to the backbuffer.
+// Keeps the upscaled frame out of reach of the redraw some mods do during our EndScene (see drawSharp).
+static IDirect3DSurface9      *g_stageSurf   = nullptr;
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
 static float                   g_sharpness   = 1.50f;    // 1 = aligned bilinear; higher = crisper toward point
@@ -332,6 +335,7 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 static void releaseCapture() {
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
+	if (g_stageSurf)   { g_stageSurf->Release();   g_stageSurf = nullptr; }
 	if (g_captureSurf) { g_captureSurf->Release(); g_captureSurf = nullptr; }
 	if (g_captureTex)  { g_captureTex->Release();  g_captureTex = nullptr; }
 }
@@ -343,10 +347,13 @@ static void createCapture(IDirect3DDevice9 *dev) {
 	                                D3DPOOL_DEFAULT, &g_captureTex, nullptr);
 	if (SUCCEEDED(hr) && g_captureTex)
 		g_captureTex->GetSurfaceLevel(0, &g_captureSurf);
+	HRESULT hrStage = dev->CreateRenderTarget(g_bbW, g_bbH, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
+	                                          &g_stageSurf, nullptr);
 	// Compile-once pixel shader for the Sharp filter (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
-	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat, (long)hr, (long)hrPs);
+	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx stage=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat,
+	     (long)hr, (long)hrStage, (long)hrPs);
 }
 
 // ---- device / swapchain method hooks -------------------------------------------------------------
@@ -360,10 +367,18 @@ static bool g_presentLogged = false;
 // blend and s=0.5 -> exact texel), so Sharpness has NO visible effect. See
 // docs/WindowResizer-rendering-research.md L166-173. Sharpness 1 = aligned bilinear; higher narrows the
 // interpolation band toward point (~1.5 matches WR).
-static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *dstRect) {
+//
+// The quad is drawn into `target` (the offscreen stage), but the backbuffer is the bound render target
+// at BeginScene and again at EndScene: our Begin/EndScene re-triggers a mod redraw (PracticeEx's 640x480
+// menu) into whatever is bound then, so it lands in the backbuffer - which the caller wipes and overwrites
+// with the stage - instead of on the upscaled frame.
+static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
+                      const RECT *dstRect) {
 	if (!g_ps || !g_captureTex || !g_stateBlock) return;
 	g_stateBlock->Capture();                                  // save all device state
 	dev->SetRenderTarget(0, bb);
+	if (FAILED(dev->BeginScene())) { g_stateBlock->Apply(); return; }
+	dev->SetRenderTarget(0, target);
 	dev->SetPixelShader(g_ps);
 	dev->SetVertexShader(nullptr);
 	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
@@ -390,10 +405,9 @@ static void drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *
 		{ L, B, 0.0f, 1.0f, 0.0f, 1.0f },
 		{ R, B, 0.0f, 1.0f, 1.0f, 1.0f },
 	};
-	if (SUCCEEDED(dev->BeginScene())) {
-		dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
-		dev->EndScene();
-	}
+	dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+	dev->SetRenderTarget(0, bb);
+	dev->EndScene();
 	g_stateBlock->Apply();                                    // restore all device state
 }
 
@@ -496,39 +510,23 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
 			HRESULT a = dev->StretchRect(bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE); // 1:1 grab
-			HRESULT b = dev->ColorFill(bb, nullptr, g_bgColor);                              // borders
-			HRESULT c = S_OK;
+			// Compose the upscale into the stage (or straight into the backbuffer if the stage couldn't be
+			// created), then clear the backbuffer and copy the finished frame over 1:1. Clearing AFTER the
+			// upscale also wipes the un-upscaled menu dupe PracticeEx redraws into the backbuffer's top-left
+			// during drawSharp's scene. Every output pixel comes from this one upscale pass - never re-blit part
+			// of the frame with a different filter (that made the corner overlapping the grab region blurry at
+			// non-integer FitToScreen scales, e.g. 2.25x on a 1080p screen).
+			IDirect3DSurface9 *target = g_stageSurf ? g_stageSurf : bb;
+			HRESULT b = S_OK, c = S_OK;
+			if (!g_stageSurf) b = dev->ColorFill(bb, nullptr, g_bgColor);
 			if (g_filterCfg == 3 && g_ps) {
-				drawSharp(dev, bb, &dstRect);
+				drawSharp(dev, bb, target, &dstRect);
 			} else {
-				c = dev->StretchRect(g_captureSurf, nullptr, bb, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
+				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			}
-			// Re-clear the BORDER (everything outside the centered game rect) after the upscale. Some
-			// mods (e.g. PracticeEx) redraw their 640x480 menu into the backbuffer top-left during our
-			// upscale, landing over our composited frame as an un-upscaled dupe. We must clear only the
-			// border, NOT the game rect (dstRect) - at large scales (x3 / FitToScreen) the game overlaps
-			// the top-left, so clearing a fixed [0,0,640x480] rect would black part of the game (the
-			// bug this replaces). In gameplay the border is already g_bgColor, so this is a no-op there.
-			{
-				LONG W = (LONG)g_bbW, H = (LONG)g_bbH;
-				if (dstRect.top    > 0) { RECT r = { 0, 0, W, dstRect.top };                       dev->ColorFill(bb, &r, g_bgColor); }
-				if (dstRect.bottom < H) { RECT r = { 0, dstRect.bottom, W, H };                    dev->ColorFill(bb, &r, g_bgColor); }
-				if (dstRect.left   > 0) { RECT r = { 0, dstRect.top, dstRect.left, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
-				if (dstRect.right  < W) { RECT r = { dstRect.right, dstRect.top, W, dstRect.bottom }; dev->ColorFill(bb, &r, g_bgColor); }
-			}
-			// At large scales (x3 / FitToScreen) the centered game overlaps the 640x480 grab region, so a
-			// mod's un-upscaled dupe there (e.g. PracticeEx's menu) lands ON the game, where the border
-			// clear above can't remove it. Re-blit just that overlap corner from the clean grabbed frame
-			// (g_captureSurf, captured before the dupe). We must use StretchRect, NOT drawSharp: the
-			// shader's BeginScene/EndScene re-triggers the mod to redraw the dupe. At integer scales the
-			// blit is POINT (matches the sharp-bilinear result); otherwise LINEAR - a tiny corner only.
-			if (dstRect.left < g_srcW && dstRect.top < g_srcH) {
-				RECT odst = { dstRect.left, dstRect.top, g_srcW, g_srcH };
-				RECT osrc = { 0, 0, (g_srcW - dstRect.left) * g_srcW / g_scaleW,
-				                    (g_srcH - dstRect.top)  * g_srcH / g_scaleH };
-				D3DTEXTUREFILTERTYPE f = (g_scaleW % g_srcW == 0 && g_scaleH % g_srcH == 0)
-				                         ? D3DTEXF_POINT : D3DTEXF_LINEAR;
-				dev->StretchRect(g_captureSurf, &osrc, bb, &odst, f);
+			if (g_stageSurf) {
+				b = dev->ColorFill(bb, nullptr, g_bgColor);                                  // borders
+				c = dev->StretchRect(g_stageSurf, &dstRect, bb, &dstRect, D3DTEXF_NONE);   // 1:1 copy
 			}
 			if (!g_presentLogged) {
 				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f",
