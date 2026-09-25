@@ -4,9 +4,11 @@ A small [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutens
 
 Instead of the base game's blurry fullscreen, this mod keeps your desktop at its **native resolution** and draws the game **centered with black borders**, in one of three modes. Because it uses **true exclusive fullscreen**, it also gets the low-latency direct-flip present path ("Independent Flip"), which a legacy Direct3D9 game like this one can't get in a borderless window. When windowed, it sizes the window (by drag or hotkey) with a locked 4:3 aspect. It can also remember your settings between runs, set a spawn position, and color the border.
 
-- **FitToScreen** (default) — the largest aspect-correct size that fills the screen (fills the height, pillarbox on the sides). Biggest image; may be a non-integer scale (smoothed with linear filtering).
-- **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960), point-sampled for perfectly crisp pixels. Auto-reduced if it wouldn't fit.
+- **FitToScreen** (default) — the largest aspect-correct size that fills the screen (fills the height, pillarbox on the sides). Biggest image; may be a non-integer scale (e.g. 2.25× on 1080p).
+- **IntegerScaling** — an exact whole-number multiple of 640×480 (e.g. x2 = 1280×960). Auto-reduced if it wouldn't fit.
 - **CustomResolution** — an exact size in pixels.
+
+The upscale itself uses the `Filter` setting: by default **Sharp**, a tunable sharp-bilinear filter that reproduces WindowResizer's look; `Point` gives hard pixels (perfectly crisp at integer scales), `Linear` plain smooth, `Auto` point at integer scales and linear otherwise.
 
 **Hotkeys** (live, in-game). Default modifier is **Alt**; all keys and the modifier are rebindable in the `[Hotkeys]` ini section, and commenting out a line disables that hotkey:
 - **Alt+1**…**Alt+6** — set IntegerScaling ×1…×6 in fullscreen, or resize the window to that scale (640×480 × N) when windowed.
@@ -15,7 +17,7 @@ Instead of the base game's blurry fullscreen, this mod keeps your desktop at its
 - **Alt+F** — cycle the upscale filter (Auto → Point → Linear → Sharp) live.
 - **Alt+K** / **Alt+L** — decrease / increase the Sharpness (live; also switches `Filter` to `Sharp`).
 
-In fullscreen, each of these changes briefly shows the new value on-screen (e.g. `X2`, `FITTOSCREEN`, `SHARP 1.50`).
+In fullscreen, the scale and filter hotkeys briefly show the new value on-screen (e.g. `X2`, `FITTOSCREEN`, `SHARP 1.50`); Alt+P has no on-screen readout, and nothing is shown while windowed.
 
 ## Install
 
@@ -31,14 +33,14 @@ All options live in `DisplayManager.ini`:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `Enabled` | `1` | Master switch. |
-| `Mode` | `FitToScreen` | `FitToScreen`, `IntegerScaling`, or `CustomResolution`. The Alt+0…4 hotkeys change this live. |
+| `Mode` | `FitToScreen` | `FitToScreen`, `IntegerScaling`, or `CustomResolution`. The Alt+0…6 hotkeys change this live. |
 | `IntegerScaling` | `x2` | Used when `Mode=IntegerScaling`. Whole-number scale of 640×480 (`x2` = 1280×960). Auto-reduced if it wouldn't fit the screen. |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Used when `Mode=CustomResolution`. Exact output size in pixels (centered). |
 | `BackgroundColor` | `000000` | Border/letterbox color in fullscreen, as `RRGGBB` hex. |
 | `Filter` | `Sharp` | How the 640×480 image is scaled up. `Auto` = point at integer scales, linear otherwise. `Point` = always hard pixels. `Linear` = always smooth. `Sharp` = tunable sharp-bilinear (see `Sharpness`) — **this is what reproduces WindowResizer's look** (WR's smoothness is just D3D9's windowed-present bilinear, which `Sharp` matches with correct half-texel alignment that plain `Linear` misses). |
 | `Sharpness` | `1.50` | Only used when `Filter=Sharp`. Range `1.0`–`4.0`: `1.0` = plain aligned bilinear (WR's smooth upscale); higher = crisper toward hard pixels; the default `~1.5` closely matches WindowResizer; `~4.0` is effectively point. Tune live with Alt+K/Alt+L (shown on-screen). |
-| `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1–4 resizing works either way. |
-| `PersistState` | `1` | Remember the current mode/scale on exit and restore it next launch. |
+| `Resizable` | `1` | Allow resizing the window by dragging its edges (aspect locked to 4:3). Alt+1…6 resizing works either way. |
+| `PersistState` | `1` | Save the current `Mode`, `IntegerScaling`, `Filter` and `Sharpness` to the ini on exit (only keys that changed are written), so hotkey changes stick across launches. `0` = never write the ini. |
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `FullscreenWidth` / `FullscreenHeight` | `0` | *(advanced)* Force the fullscreen **display mode** — the actual screen resolution the monitor switches to (not the game surface, not the scaled output). `0` = auto-detect your monitor's native resolution (recommended). Set both to override if auto-detection picks the wrong mode. |
 | `FullscreenRefresh` | `0` | *(advanced)* Refresh rate for the forced mode; `0` keeps the native refresh. |
@@ -49,13 +51,14 @@ The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and 
 
 With `Borderless` available, this mod is a superset of WindowResizer — window sizing/positioning, borderless *and* exclusive fullscreen, always-on-top, and crisp integer scaling.
 
-Only the value for the active `Mode` matters; the others are ignored. Hotkey changes apply immediately and are not written back to the ini (set the `Mode` there for your startup default).
+Only the value for the active `Mode` matters; the others are ignored. Hotkey changes apply immediately; with `PersistState=1` (default) they are also written back to the ini on exit, with `PersistState=0` the ini values are your fixed startup defaults.
 
 ## Notes
 
 - If you also run **SokuDirectXOptimizations**, set its `use_d3d9ex=0`. Its Direct3D 9Ex mode wraps the graphics device in a way DisplayManager can't hook, so scaling and hotkeys won't work; with `use_d3d9ex=0` the two run together fine.
 - It's real exclusive fullscreen, so Alt-Tab minimizes the game (normal, and fast at native resolution).
-- Windowed mode is left completely alone; the mod only acts when you go fullscreen.
+- In windowed mode the game's rendering is left alone; the mod only manages the window: at launch it sizes it to the `IntegerScaling` scale (and moves it to `PositionX`/`PositionY` if set), keeps drag-resizing at 4:3, and handles always-on-top. Coming back from fullscreen (Alt+Enter) restores the window's previous position, the `IntegerScaling` size and always-on-top.
+- Borderless fullscreen covers the monitor the window was on when you pressed Alt+Enter; exclusive fullscreen uses the monitor of the adapter the game started on.
 - Some other mods can freeze Alt+Enter if they create Direct3D resources in `D3DPOOL_DEFAULT` without handling a device reset. That's a bug in those mods, not this one.
 
 ## How it works
@@ -65,8 +68,9 @@ The game builds one global `D3DPRESENT_PARAMETERS` and creates a plain Direct3D9
 The mod:
 
 1. Intercepts `Direct3DCreate9` (via the import table) → hooks `IDirect3D9::CreateDevice`.
-2. On `CreateDevice`/`Reset`, when the game asks for fullscreen, forces the backbuffer to the **native** desktop mode so the monitor never rescales (true exclusive fullscreen at native resolution). Windowed requests are restored to the game's own size.
-3. Hooks the swapchain's `Present`: grabs the game's rendered frame into an offscreen render target, clears the whole backbuffer black, then `StretchRect`s it back **scaled and centered** with **point filtering** — crisp integer scaling with black borders, independent of how the game maps its coordinates.
+2. On `CreateDevice`/`Reset`, when the game asks for fullscreen, forces the backbuffer to the **native** desktop mode so the monitor never rescales (true exclusive fullscreen at native resolution; with `Borderless=1`, a windowed device at native size instead). These changes are made to a *copy* of the game's present parameters — the game's own struct is never modified, so its Alt+Enter toggle (and other mods) always see the real windowed/fullscreen state. Windowed requests pass through untouched.
+3. Hooks the swapchain's `Present`: grabs the game's 640×480 frame, upscales it **centered** into an offscreen backbuffer-sized surface — with the sharp-bilinear pixel shader for `Filter=Sharp`, or `StretchRect` with point/linear filtering (also the fallback if the shader can't draw) — then fills the backbuffer with the border color and copies the result over. It also pins the viewport to 640×480, which the game's 3D stage and some character draws rely on.
+4. After an Alt+Enter toggle, sets up the window (borderless popup, or the restored windowed size/position/always-on-top) *after* the game's own post-toggle window repositioning, via a message to its window.
 
 It only patches the exact th123 1.10a build (verified by hash) and has no external dependencies beyond the Windows system DLLs.
 

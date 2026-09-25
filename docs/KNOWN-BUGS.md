@@ -1,11 +1,13 @@
 # DisplayManager — known bugs to fix before release (recorded 2026-09-24)
 
-Two rendering bugs, both appearing with DisplayManager active in **exclusive fullscreen**. Both are almost
-certainly DM's fullscreen post-process (force native backbuffer + grab the top-left 640 + upscale centered)
-interacting with other rendering. Test on the COPY install (`F:\Games\Touhou\SokuLauncher - Copy`).
+Bugs 1–4 are rendering bugs that appeared with DisplayManager active in fullscreen — DM's fullscreen
+post-process (force native backbuffer + grab the top-left 640 + upscale centered) interacting with other
+rendering. "Bug 5+" at the end are the window/Alt+Enter/hooking issues found by two code reviews. Test on
+the COPY install (`F:\Games\Touhou\SokuLauncher - Copy`).
 
-> ✅ All three bugs below are now FIXED in `src/` and shipped in `dist/DisplayManager-v1.0.1.zip`
-> (the older `v1.0.0.zip` predates the fixes — use v1.0.1).
+> ✅ Bugs 1–4 are FIXED in `src/`; Bugs 1–3 shipped in `dist/DisplayManager-v1.0.1.zip` (the older
+> `v1.0.0.zip` predates them). Bug 4 and the Bug 5+ fixes are newer than v1.0.1; the Bug 5+ fixes are
+> built but **not yet verified in-game**.
 
 ## Bug 1 — Okuu (Utsuho Reiuji): giant off-screen sprite intrudes — ✅ FIXED (2026-09-24)
 
@@ -52,7 +54,9 @@ there, so it is a harmless no-op. Verified in borderless fullscreen with the ful
 test first, then the DM-built fix; user-confirmed the menu now renders with no dupe and the centered menu
 correct). Diagnosed with `tools/SokuHarness` (`pex`/`dupe`/`capafterdm`/`cfcolor`/`clearsrc` commands).
 
-**Note / possible follow-up:** the re-clear currently covers only the top-left grab-source rect. If another
+**Superseded by Bug 4:** the re-clear is gone; the upscale is now composed in an offscreen stage and the
+PracticeEx redraw lands in the (wiped) backbuffer instead. Old follow-up note, kept for history: the
+re-clear covered only the top-left grab-source rect. If another
 overlay mod (InGameHostlist, ReplayHudExtras, PunishDisplay, …) is ever seen drawing an un-upscaled dupe
 *outside* that rect, generalize the re-clear to all border regions (everything outside the centered output).
 
@@ -99,15 +103,18 @@ old build = "Vs Network" (in the corner) visibly softer than "Practice" below y=
 crispness, and the PracticeEx menu (Backspace) shows no top-left dupe.
 
 ## Common thread (resolved)
-Bugs 1–2 stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale): Bug 1 = the
-default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to 640×480);
-Bug 2 = a post-clear 640 re-draw of the menu in the grab-source region (fixed by re-clearing that region).
-Bug 3 was independent — a half-pixel sampling-alignment error in the Sharp shader path.
+Bugs 1, 2 and 4 stemmed from DM's model (native backbuffer + game draws 640 top-left + grab/upscale): Bug 1 =
+the default D3D9 **viewport** became native, scaling transformed draws (fixed by pinning the viewport to
+640×480); Bug 2 = a 640 re-draw of the PracticeEx menu during our scene, and Bug 4 = the corner re-blit that
+worked around it; both are now handled by composing the upscale in an offscreen stage (drawSharp binds the
+backbuffer at Begin/EndScene so the redraw lands there and gets wiped). Bug 3 was independent — a half-pixel
+sampling-alignment error in the Sharp shader path.
 
 ## State to resume from
-- DM current: `Filter=Sharp` default, `Sharpness=1.50`; Bugs 1–3 fixed. Both the `dist/DisplayManager-v1.0.1.zip`
-  package and the Copy install have the current DLL (md5 `8C67BB4D…`). Build: `build.bat`. Commits: `fe0f055`
-  (Bug 1), `7a5b0d8` (Bug 2), `5ad94ec` (Bug 3).
+- DM current: `Filter=Sharp` default (also the code default when the ini has no `Filter` line),
+  `Sharpness=1.50`; Bugs 1–4 and 5–9 fixed in `src/`. `dist/DisplayManager-v1.0.1.zip` (md5 `8C67BB4D…`)
+  predates Bug 4 and Bug 5+. Build: `build.bat`. Commits: `fe0f055` (Bug 1), `7a5b0d8` (Bug 2), `5ad94ec`
+  (Bug 3), `3c7c3d5` (Bug 4); Bug 5+ commits listed in that section.
 - **Release TODO:** repo is not pushed yet (`git push -u origin master` after creating the GitHub repo — the
   README's release link 404s until then). `dist/` is gitignored (the zip is a local artifact). Untracked and
   optional to add: `tools/SokuHarness`, `docs/SHARPNESS-NOOP-ANALYSIS.md`, `okuu-viewport*`.
@@ -115,3 +122,39 @@ Bug 3 was independent — a half-pixel sampling-alignment error in the Sharp sha
   deployed to the Copy install but uncommitted and not yet user-verified.
 - Full rendering research: `docs/WindowResizer-rendering-research.md` (UPDATE 1–5); Bug 1 trail:
   `docs/bug1-okuu-research.md`; Bug 3 analysis: `docs/SHARPNESS-NOOP-ANALYSIS.md`.
+
+## Bug 5+ — window state, Alt+Enter, and hook races (code review, 2026-09-25) — ✅ FIXED, needs in-game test
+
+Verified against th123's disassembly (`0x415220` = the toggle, `0x415100` = its Reset wrapper).
+
+- **Bug 5 — Alt+Enter couldn't leave borderless; DM polluted the game's present params.** The toggle only
+  flips `Windowed` in the game's global struct (`0x8A0F68`, `Windowed` at `+0x20` = `0x8A0F88`) and calls
+  Reset with it; device-lost recovery (`0x407D82 -> 0x415100`) and the post-toggle window code read it
+  back. DM wrote `Windowed=TRUE` (borderless) and the native size into it, so the next Alt+Enter "toggled"
+  to fullscreen again. **Fix:** CreateDevice/Reset apply DM's changes to a local copy; the game's struct is
+  never modified (windowed copies are synced back whole, fullscreen copies only for runtime-filled
+  defaults — none for th123, which passes explicit values). `0x8998B0` turned out to be only the saved
+  "start fullscreen" config flag (stored from `Windowed` at exit, `0x4405AF`, part of the config block
+  written by `0x4295D0`; read at `0x442EC7` to SendMessage a startup Alt+Enter), so the `0x4405BC` NOP,
+  `writeFsFlag` and the windowed-size restore were removed.
+- **Bug 6 — the game's own SetWindowPos undid DM's window setup.** After Reset returns, `0x415220` calls
+  `SetWindowPos`: to windowed = `HWND_NOTOPMOST`, centered on the primary, size = backbuffer + fixed-frame
+  metrics (non-4:3 client with DM's `WS_THICKFRAME`), `SWP_FRAMECHANGED`; to fullscreen = move the client
+  to the primary's origin. **Fix:** on a real windowed<->fullscreen switch (and at first CreateDevice),
+  myReset posts a private registered message; the subclassed wndProc applies the window state (scale +
+  restored position + topmost, or the borderless popup) after the game's code. The pre-fullscreen window
+  position and monitor are recorded (borderless covers that monitor).
+- **Bug 7 — Sharp had no fallback.** drawSharp now returns success; on failure mySCPresent uses StretchRect.
+- **Bug 8 — device-watch fallback broken.** `GetModuleHandle("d3d9.dll")` is the SokuModLoader proxy, so it
+  never attached; and if it did, it could race the CreateDevice path (th123 passes `&0x8A0E30` as
+  `ppDevice`) and hook twice, recording our own hook as the original (infinite recursion). **Fix:**
+  VirtualQuery "executable image" check, watch thread stands down once CreateDevice is hooked,
+  single-shot `hookDevice`/`installWndProc`, `hookSlot` no-op on an already-hooked slot. Still
+  best-effort: a late attach misses Resets if another mod redirected the Reset call site (`0x4151AC`).
+- **Bug 9 — docs/defaults.** README/ini/comments corrected (Alt+0..6, PersistState writes
+  Mode/IntegerScaling/Filter/Sharpness, windowed window management, Sharp default); code default Filter
+  is now Sharp (was Auto).
+
+Side effect to check: in borderless the game now knows it is "fullscreen", so its toggle wrapper
+(`0x408350`) applies its fullscreen cursor handling (`ShowCursor(FALSE)`, when its cursor flag is set)
+like in exclusive mode, and it saves/restores the "start fullscreen" state normally.

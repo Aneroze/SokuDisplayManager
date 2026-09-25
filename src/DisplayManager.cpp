@@ -6,10 +6,12 @@
 // height at 4:3 and pillarboxes the sides, so 480 logical pixels are scaled by a non-integer factor
 // (e.g. 1080/480 = 2.25x) and everything looks blurry. This mod instead keeps the desktop at its
 // native resolution and renders the game centered with black borders. Three modes (Mode in the ini,
-// and Alt+0..4 hotkeys): FitToScreen (default - largest aspect-correct size that fills the screen),
-// IntegerScaling (exact x1/x2/x3..., crisp point-sampled), and CustomResolution. Because it is true
-// exclusive fullscreen it also gets the low-latency direct-flip ("Independent Flip") present path -
-// which a legacy Direct3D9 / DISCARD game like this one cannot get in a borderless window.
+// and Alt+0..6 hotkeys): FitToScreen (default - largest aspect-correct size that fills the screen),
+// IntegerScaling (exact x1/x2/x3...), and CustomResolution; the upscale filter is Sharp (tunable
+// sharp-bilinear, default), Point, Linear or Auto. Because it is true exclusive fullscreen it also gets
+// the low-latency direct-flip ("Independent Flip") present path - which a legacy Direct3D9 / DISCARD
+// game like this one cannot get in a borderless window (an optional borderless mode exists anyway).
+// Windowed, it sizes the game window (4:3 drag-resize, Alt+1..6 scale, spawn position, always-on-top).
 //
 // How it works
 // ------------
@@ -17,7 +19,7 @@
 // (Direct3DCreate9, not Ex; SwapEffect DISCARD). Its fullscreen state is literally that struct's
 // Windowed == 0: Alt+Enter (0x4082DE -> 0x415220) just flips Windowed and calls Reset with the struct.
 // (0x8998B0 is only the saved "start fullscreen" config flag: stored from Windowed at exit, 0x4405AF, and
-// read at startup, 0x442EC7, to post an Alt+Enter.) Crucially, the game always draws its 640x480 surface
+// read at startup, 0x442EC7, to send an Alt+Enter.) Crucially, the game always draws its 640x480 surface
 // at 1:1 into the top-left of the backbuffer and relies on the fullscreen *display mode* to upscale the
 // whole framebuffer - it does not scale its scene to the backbuffer. So we:
 //   1. Intercept Direct3DCreate9 (IAT thunk at 0x8572A0) -> hook IDirect3D9::CreateDevice.
@@ -27,10 +29,13 @@
 //      never modified, so the game (and other mods) always see its real windowed/fullscreen state.
 //      Windowed requests pass through untouched.
 //   3. Hook the swapchain's Present: the game has drawn its 640x480 frame into the
-//      backbuffer's top-left. Grab it into an offscreen render target, clear the whole backbuffer
-//      black, then StretchRect it back scaled to WidthxHeight, centered, with POINT filtering -> crisp
-//      integer scaling with black borders, independent of how the game maps its coordinates.
-// Windowed mode is passed through (restored) so Alt+Enter still toggles windowed <-> crisp fullscreen.
+//      backbuffer's top-left. Grab it into a render-target texture, upscale it into a backbuffer-sized
+//      stage (Sharp = sharp-bilinear pixel shader quad; Point/Linear = StretchRect; Sharp falls back to
+//      StretchRect if the shader can't draw), then fill the backbuffer with the border color and copy
+//      the stage over 1:1 -> scaled + centered with borders, independent of how the game maps its
+//      coordinates. The viewport is pinned to 640x480 (the game relies on the default one).
+// Windowed, the device is left exactly as the game made it (DM only sizes/positions the window), so
+// Alt+Enter still toggles windowed <-> crisp fullscreen.
 //
 // Use either this or WindowResizer, but never both at the same time.
 //
@@ -80,7 +85,7 @@ static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // th123's fixed render size (grab region / pinned viewport); const
 static int     g_srcH      = 480;      // - th123 always renders 640x480, so this is not configurable
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
-static int     g_filterCfg = 0;              // 0 = Auto (point at integer scales, linear otherwise), 1 = Point, 2 = Linear
+static int     g_filterCfg = 3;              // 0 = Auto (point at integer scales, linear otherwise), 1 = Point, 2 = Linear, 3 = Sharp
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -515,8 +520,9 @@ static void sharpOsdText(char *buf, int cap) {
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
-	// resolution backbuffer. Grab that region, wipe the whole backbuffer black, then blit it back
-	// scaled + centered. Point/Linear go through StretchRect; Sharp goes through the shader quad.
+	// resolution backbuffer. Grab that region, upscale it (centered) into the stage, fill the backbuffer
+	// with the border color and copy the stage back. Point/Linear/Auto go through StretchRect; Sharp goes
+	// through the shader quad.
 	if (g_active && g_captureSurf) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
@@ -770,11 +776,11 @@ static void loadConfig() {
 	g_bgColor = parseColor(color, D3DCOLOR_XRGB(0, 0, 0));
 
 	char filt[32] = {0};
-	GetPrivateProfileStringA("Display", "Filter", "Auto", filt, sizeof(filt), g_iniPath);
+	GetPrivateProfileStringA("Display", "Filter", "Sharp", filt, sizeof(filt), g_iniPath);
 	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = 1;
 	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = 2;
-	else if (StrCmpIA(filt, "Sharp") == 0)  g_filterCfg = 3;
-	else                                    g_filterCfg = 0;
+	else if (StrCmpIA(filt, "Auto") == 0)   g_filterCfg = 0;
+	else                                    g_filterCfg = 3;   // Sharp (the default)
 
 	char sharp[32] = {0};
 	GetPrivateProfileStringA("Display", "Sharpness", "1.50", sharp, sizeof(sharp), g_iniPath);
@@ -792,8 +798,8 @@ static void loadConfig() {
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 
 	// g_srcW/g_srcH are fixed at 640x480: th123 always renders its scene at that size, so the grab
-	// region, the pinned viewport, and the post-upscale re-clear must all be exactly 640x480 - there is
-	// no useful reason to make it configurable (a wrong value can only clip the game or grab garbage).
+	// region and the pinned viewport must both be exactly 640x480 - there is no useful reason to make
+	// it configurable (a wrong value can only clip the game or grab garbage).
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 
 	// [Hotkeys] - the modifier plus a per-action key (single letter/digit). A missing/commented/blank
@@ -848,7 +854,7 @@ static void persistState() {
 	writeIniIfChanged("Sharpness", sh);
 }
 
-// ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..4 = IntegerScaling x1..x4 ---------
+// ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..6 = x1..x6, Alt+P/F/K/L ------------
 // A WH_KEYBOARD hook on the game's UI thread (the same technique WindowResizer uses for its Alt+number
 // hotkeys). This fires for the game's own key messages, so it works in exclusive fullscreen - unlike a
 // GetAsyncKeyState poll, which the exclusive-fullscreen input path doesn't cooperate with. The change is
