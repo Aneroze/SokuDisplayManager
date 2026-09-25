@@ -78,6 +78,7 @@ static char    g_iniPath[1024 + MAX_PATH];
 static bool    g_enabled   = true;
 static int     g_mode      = MODE_FIT; // FitToScreen (default) / IntegerScaling / CustomResolution
 static int     g_intScale  = 2;        // used when g_mode == MODE_INTEGER (x1, x2, ...)
+static int     g_winScale  = 2;        // windowed client size = 640x480 x this (separate from the fullscreen mode)
 static int     g_customW   = 1280;     // used when g_mode == MODE_CUSTOM
 static int     g_customH   = 960;
 static int     g_scaleW    = 1280;     // resolved output width  (computed from mode + native res)
@@ -867,6 +868,10 @@ static void loadConfig() {
 	char scale[32] = {0};
 	GetPrivateProfileStringA("Display", "IntegerScaling", "x2", scale, sizeof(scale), g_iniPath);
 	g_intScale = parseScale(scale);
+	// The window scale defaults to the IntegerScaling value, which older versions used for the window too.
+	char wscale[32] = {0};
+	GetPrivateProfileStringA("Display", "WindowScale", scale, wscale, sizeof(wscale), g_iniPath);
+	g_winScale = parseScale(wscale);
 
 	g_customW = GetPrivateProfileIntA("Display", "CustomWidth", 1280, g_iniPath);
 	g_customH = GetPrivateProfileIntA("Display", "CustomHeight", 960, g_iniPath);
@@ -931,8 +936,8 @@ static void writeIniIfChanged(const char *key, const char *val) {
 		WritePrivateProfileStringA("Display", key, val, g_iniPath);
 }
 
-// Persist the current scaling settings (Mode + IntegerScaling + Filter + Sharpness) to the ini so the
-// next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
+// Persist the current scaling settings (Mode + IntegerScaling + WindowScale + Filter + Sharpness) to the ini
+// so the next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
 // NOT saved. Only keys that actually changed are written (see writeIniIfChanged), so if the user changed
 // nothing the file is left untouched.
 static void persistState() {
@@ -943,6 +948,8 @@ static void persistState() {
 	wsprintfA(scale, "x%d", g_intScale);
 	writeIniIfChanged("Mode", m);
 	writeIniIfChanged("IntegerScaling", scale);
+	wsprintfA(scale, "x%d", g_winScale);
+	writeIniIfChanged("WindowScale", scale);
 
 	const char *f = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
 	              : g_filterCfg == 3 ? "Sharp" : "Auto";
@@ -977,16 +984,36 @@ static void windowBorders(int *bx, int *by) {
 // borders - the game keeps rendering to its existing backbuffer and D3D9's windowed present stretches it
 // to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer. Also moves
 // the window's top-left to `pos` when given (null = keep the current position).
+// Clamped to the work area of the monitor it lands on: the largest integer scale that fits (at least x1),
+// moved back on-screen if it would stick out. The side/bottom slack allows for Windows 10's invisible
+// resize borders, which are part of the window rect but not of what's visible.
 static void setWindowScaled(int n, const POINT *pos) {
 	if (!g_hwnd || n < 1) return;
 	int bx, by; windowBorders(&bx, &by);
+	RECT wr;
+	if (!GetWindowRect(g_hwnd, &wr)) return;
+	int x = pos ? pos->x : wr.left, y = pos ? pos->y : wr.top, use = n;
+	POINT at = { x, y };
+	HMONITOR mon = pos ? MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST)
+	                   : MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (mon && GetMonitorInfoA(mon, &mi)) {
+		const RECT &wa = mi.rcWork;
+		int slack = bx / 2;                                   // one side border
+		int maxN = min((wa.right - wa.left + 2 * slack - bx) / g_srcW, (wa.bottom - wa.top + slack - by) / g_srcH);
+		if (maxN < 1) maxN = 1;
+		if (use > maxN) use = maxN;
+		int w = g_srcW * use + bx, h = g_srcH * use + by;
+		if (x + w > wa.right + slack)   x = wa.right + slack - w;
+		if (y + h > wa.bottom + slack)  y = wa.bottom + slack - h;
+		if (x < wa.left - slack)        x = wa.left - slack;
+		if (y < wa.top)                 y = wa.top;
+	}
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
-	int x = 0, y = 0;
-	if (pos) { x = pos->x; y = pos->y; }
-	else flags |= SWP_NOMOVE;
-	SetWindowPos(g_hwnd, nullptr, x, y, g_srcW * n + bx, g_srcH * n + by, flags);
-	logf("window -> client %dx%d (x%d)%s", g_srcW * n, g_srcH * n, n,
-	     pos ? " +pos" : "");
+	if (x == wr.left && y == wr.top) flags |= SWP_NOMOVE;
+	SetWindowPos(g_hwnd, nullptr, x, y, g_srcW * use + bx, g_srcH * use + by, flags);
+	logf("window -> client %dx%d (x%d%s)%s", g_srcW * use, g_srcH * use, use,
+	     use != n ? ", clamped to the work area" : "", (flags & SWP_NOMOVE) ? "" : " +pos");
 }
 
 static void applyTopmost() {
@@ -1011,7 +1038,7 @@ static void onWindowedEntry(bool firstTime) {
 	POINT spawn = { g_posX, g_posY };
 	const POINT *pos = firstTime ? ((g_posX >= 0 && g_posY >= 0) ? &spawn : nullptr)
 	                             : (g_haveWinPos ? &g_winPos : nullptr);
-	setWindowScaled(g_intScale, pos);
+	setWindowScaled(g_winScale, pos);
 	applyTopmost();
 }
 
@@ -1113,8 +1140,9 @@ static void enterBorderlessFullscreen() {
 	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_topmost);
 }
 
-// Run a hotkey action. "Scale N" means "N x": it sets the scaling choice (so it carries between modes),
-// then applies it to whichever mode is active - the fullscreen output, or the window size.
+// Run a hotkey action. "Scale N" means "N x" for whichever state the game is in: in fullscreen it sets
+// Mode=IntegerScaling xN (as before); windowed it only resizes the window (g_winScale), so sizing the
+// window never changes the fullscreen mode (a FitToScreen/CustomResolution user stays that way).
 static void doAction(int act) {
 	switch (act) {
 	case ACT_FIT:
@@ -1125,9 +1153,13 @@ static void doAction(int act) {
 		break;
 	case ACT_S1: case ACT_S2: case ACT_S3: case ACT_S4: case ACT_S5: case ACT_S6: {
 		int n = act - ACT_S1 + 1;
-		g_mode = MODE_INTEGER; g_intScale = n;
-		if (g_active) computeOutput();            // fullscreen: re-scale the centered output live
-		else          setWindowScaled(n, nullptr); // windowed: resize the window to N x
+		if (g_wantFullscreen) {                    // fullscreen: re-scale the centered output live
+			g_mode = MODE_INTEGER; g_intScale = n;
+			if (g_active) computeOutput();
+		} else {                                   // windowed: resize the window to N x
+			g_winScale = n;
+			setWindowScaled(n, nullptr);
+		}
 		char msg[8]; wsprintfA(msg, "X%d", n); showOsd(msg);
 		logf("hotkey: x%d", n);
 		break;
@@ -1223,9 +1255,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
 	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
-	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d custom=%dx%d src=%dx%d "
+	logf("DisplayManager initialized: enabled=%d mode=%s intScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
 	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
-	     g_enabled, modeName, g_intScale, g_customW, g_customH, g_srcW, g_srcH,
+	     g_enabled, modeName, g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
 	return TRUE;
 }
