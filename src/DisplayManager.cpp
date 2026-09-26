@@ -2,16 +2,14 @@
 //
 // Problem this solves
 // -------------------
-// With WindowResizer off, the base game's fullscreen switches to a resolution that fills the monitor
-// height at 4:3 and pillarboxes the sides, so 480 logical pixels are scaled by a non-integer factor
-// (e.g. 1080/480 = 2.25x) and everything looks blurry. This mod instead keeps the desktop at its
-// native resolution and renders the game centered with black borders. Three modes (Mode in the ini,
-// and Alt+0..6 hotkeys): FitToScreen (default - largest aspect-correct size that fills the screen),
-// IntegerScaling (exact x1/x2/x3...), and CustomResolution; the upscale filter is Sharp (tunable
-// sharp-bilinear, default), Point, Linear or Auto. Because it is true exclusive fullscreen it also gets
-// the low-latency direct-flip ("Independent Flip") present path - which a legacy Direct3D9 / DISCARD
-// game like this one cannot get in a borderless window (an optional borderless mode exists anyway).
-// Windowed, it sizes the game window (4:3 drag-resize, Alt+1..6 scale, spawn position, always-on-top).
+// With WindowResizer off, the base game's fullscreen switches to a mode that fills the monitor height at
+// 4:3, so 480 logical pixels get a non-integer scale (e.g. 1080/480 = 2.25x) and look blurry. This mod
+// keeps the desktop at its native resolution and renders the game centered with borders: FitToScreen
+// (default), IntegerScaling or CustomResolution (Mode in the ini, Alt+0..6), with a Sharp (tunable
+// sharp-bilinear, default), Point, Linear or Auto filter. True exclusive fullscreen keeps the low-latency
+// "Independent Flip" present path, which a legacy D3D9 / DISCARD game can't get in a borderless window
+// (an optional borderless mode exists anyway). Windowed, it sizes the game window (4:3 drag-resize,
+// Alt+1..6 scale, spawn position, always-on-top).
 //
 // How it works
 // ------------
@@ -28,21 +26,17 @@
 //      device at native size instead). These changes go into a COPY of the game's struct, which is
 //      never modified, so the game (and other mods) always see its real windowed/fullscreen state.
 //      Windowed requests pass through untouched.
-//   3. Hook the swapchain's Present: the game has drawn its 640x480 frame into the
-//      backbuffer's top-left. Grab it into a render-target texture, upscale it into a backbuffer-sized
-//      stage (Sharp = sharp-bilinear pixel shader quad; Point/Linear = StretchRect; Sharp falls back to
-//      StretchRect if the shader can't draw), then fill the backbuffer with the border color and copy
-//      the stage over 1:1 -> scaled + centered with borders, independent of how the game maps its
-//      coordinates. The viewport is pinned to 640x480 (the game relies on the default one).
+//   3. Hook the swapchain's Present: grab the 640x480 frame from the backbuffer's top-left into a
+//      render-target texture, fill the borders and upscale it centered into the backbuffer (Sharp =
+//      sharp-bilinear pixel shader quad, falling back to StretchRect; Point/Linear = StretchRect). The
+//      viewport is pinned to 640x480 (the game relies on the default one).
 // Windowed, the device is left exactly as the game made it (DM only sizes/positions the window), so
 // Alt+Enter still toggles windowed <-> crisp fullscreen.
 //
-// Use either this or WindowResizer, but never both at the same time. If WindowResizer, IntegerFullscreen
-// or ExclusiveFullscreen is loaded, DM detects it at device creation and passes everything through.
+// If WindowResizer, IntegerFullscreen or ExclusiveFullscreen is loaded, DM detects it at device creation
+// and passes everything through.
 //
-// Self-contained: it only needs the Windows SDK (windows.h / d3d9.h / shlwapi.h). It does not import
-// d3d9.lib - it hooks the game's Direct3DCreate9 through the import table and drives the device the game
-// itself creates, so there are no external runtime dependencies.
+// Self-contained: Windows SDK headers only, no d3d9.lib import (Direct3DCreate9 is hooked via the IAT).
 
 #include <windows.h>
 #include <Shlwapi.h>
@@ -99,7 +93,7 @@ static int     g_filterCfg = 3;              // 0 = Auto (point at integer scale
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
-static int     g_posX      = -1;       // spawn position (-1 = don't move the window, the mod's old behavior)
+static int     g_posX      = -1;       // spawn position (-1 = don't move the window)
 static int     g_posY      = -1;
 static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
 static int     g_fsW       = 0;        // manual fullscreen display-mode override (0 = auto / native)
@@ -286,16 +280,13 @@ static void computeOutput() {
 	     g_filter == D3DTEXF_POINT ? "point" : "linear");
 }
 
-// The native resolution/refresh of the monitor fullscreen will land on. We query this live (rather than
-// trusting the game's cached GetAdapterDisplayMode global at 0x8A0FA0, which can be stale or the wrong
-// monitor) so exclusive fullscreen always uses the true current mode - otherwise the desktop gets
-// switched to a wrong (often small) resolution, which is blurry and shuffles the user's windows.
-// Exclusive uses the device's ADAPTER monitor: the window's monitor is wrong once the window has been
-// dragged to another screen (e.g. a 1080p second monitor's mode got applied to a 1440p primary).
-// Borderless is a windowed device, so it can cover whichever monitor the window is on (g_fsMon: the
-// monitor it was on when fullscreen was requested - the same one enterBorderlessFullscreen covers).
-// Exclusive prefers the runtime's own GetAdapterDisplayMode: same refresh rounding as its mode list
+// The native resolution/refresh of the monitor fullscreen will land on, queried live: the game's cached
+// GetAdapterDisplayMode global (0x8A0FA0) can be stale or the wrong monitor, which set a wrong (small)
+// mode - blurry, and it shuffled the user's windows.
+// Exclusive uses the device's ADAPTER monitor (the window's is wrong once it has been dragged to another
+// screen) and prefers the runtime's GetAdapterDisplayMode: same refresh rounding as its mode list
 // (EnumDisplaySettings can say 59/143 where the list has 60/144), and it works under Wine/DXVK.
+// Borderless is a windowed device, so it covers g_fsMon (the window's monitor when fullscreen was requested).
 static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 	*w = *h = *refresh = 0;
 	D3DDISPLAYMODE am;
@@ -323,8 +314,7 @@ static void nativeMode(UINT *w, UINT *h, UINT *refresh) {
 		const D3DDISPLAYMODE *d = reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE);
 		*w = d->Width; *h = d->Height; *refresh = d->RefreshRate;
 	}
-	// Manual override: force a specific fullscreen display mode (e.g. when auto-detection is wrong, or to
-	// run the screen at a non-native resolution on purpose).
+	// Manual FullscreenWidth/Height/Refresh override.
 	if (g_fsW > 0 && g_fsH > 0) {
 		*w = g_fsW; *h = g_fsH;
 		if (g_fsRefresh > 0) *refresh = g_fsRefresh;
@@ -381,13 +371,11 @@ static void validateExclusiveMode(UINT *w, UINT *h, UINT *refresh, D3DFORMAT fmt
 	}
 }
 
-// Decide how to shape the present parameters for this (Create)Device/Reset call. Fullscreen requests
-// (Windowed == FALSE) are forced to the native desktop mode so the monitor is never rescaled; windowed
-// requests pass through untouched. `pp` is always OUR COPY of the game's struct (see syncPresentParams):
-// the game's own global (0x8A0F68) must keep its real values - its Alt+Enter toggle just flips that
-// struct's Windowed, its post-toggle window code and device-lost recovery read it back, and other mods
-// read it too. Writing Windowed=TRUE (borderless) or the native size into it made Alt+Enter unable to
-// leave borderless.
+// Shape the present parameters for this (Create)Device/Reset: fullscreen requests are forced to the native
+// desktop mode so the monitor is never rescaled; windowed requests pass through untouched. `pp` is always
+// OUR COPY of the game's struct: the global (0x8A0F68) must keep its real values - Alt+Enter just flips its
+// Windowed, the post-toggle window code, device-lost recovery and other mods read it back. Writing
+// Windowed=TRUE (borderless) or the native size into it made Alt+Enter unable to leave borderless.
 static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (!g_enabled || !pp) { g_active = false; return; }
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
@@ -404,9 +392,8 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	}
 
 	if (g_borderless) {
-		// Borderless: a windowed device with a native-sized backbuffer; we cover the monitor with a
-		// borderless window ourselves (done after the reset, in enterBorderlessFullscreen). No exclusive
-		// mode-set, so no low-latency direct-flip - but it is friendlier to alt-tab / overlays.
+		// Borderless: a windowed device with a native-sized backbuffer; enterBorderlessFullscreen covers
+		// the monitor after the reset.
 		pp->Windowed = TRUE;
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
@@ -414,7 +401,6 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 		g_borderlessActive = true;
 		logf("borderless fullscreen -> native %ux%u (windowed device)", w, h);
 	} else {
-		// Exclusive: true fullscreen at the native mode (no monitor rescale, gets Independent Flip).
 		validateExclusiveMode(&w, &h, &refresh, fmt);
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
@@ -488,7 +474,7 @@ static void createCapture(IDirect3DDevice9 *dev) {
 	if (!g_sceneDirect)
 		hrStage = dev->CreateRenderTarget(g_bbW, g_bbH, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
 		                                  &g_stageSurf, nullptr);
-	// Compile-once pixel shader for the Sharp filter (falls back to StretchRect if this fails).
+	// Sharp filter shader (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
 	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx stage=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat,
@@ -504,24 +490,19 @@ static bool g_presentLogged = false;
 // own output and upscale it again (a flash of a zoomed corner). Render thread only.
 static bool g_composited = false;
 
-// Sharp-bilinear upscale: draw a full-screen quad over the (centered) destination rect, sampling the
-// captured 640 texture through the sharp-bilinear shader. The quad is shifted by the D3D9 -0.5 half-pixel
-// offset so an output pixel at screen x samples texel-space (x+0.5)/scale, i.e. output pixel centers land
-// on (k+0.5)/N. WITHOUT the offset, at scale N every output pixel samples exactly k/N, which for integer N
-// only ever hits texel positions where the sharp-bilinear math is a no-op (at 2x only s=0.0 -> fixed 50/50
-// blend and s=0.5 -> exact texel), so Sharpness has NO visible effect. See
-// docs/WindowResizer-rendering-research.md L166-173. Sharpness 1 = aligned bilinear; higher narrows the
-// interpolation band toward point (~1.5 matches WR).
+// Sharp-bilinear upscale: draw a quad over the centered destination rect, sampling the captured 640 texture
+// through the sharp-bilinear shader. The quad needs the D3D9 -0.5 half-pixel offset so output pixel centers
+// sample (k+0.5)/N; WITHOUT it every output pixel samples exactly k/N, where at integer N the sharp-bilinear
+// math is a no-op, so Sharpness has NO visible effect (docs/WindowResizer-rendering-research.md L166-173).
+// Sharpness 1 = aligned bilinear; higher narrows the interpolation band toward point (~1.5 matches WR).
 //
-// Normally (g_sceneDirect) the scene is opened and closed with the runtime's own BeginScene/EndScene, so no
-// other mod's scene hook runs for our pass and the quad goes straight into the backbuffer (`target` == bb).
-// Otherwise the calls go through the vtable (and every mod hooked there): then the quad is drawn into
-// `target` (the offscreen stage) while the backbuffer is bound at BeginScene and again at EndScene, because a
-// mod may redraw its 640x480 menu (PracticeEx) into whatever is bound then - it lands in the backbuffer, which
-// the caller wipes and overwrites with the stage, instead of on the upscaled frame.
+// Normally (g_sceneDirect) the runtime's own BeginScene/EndScene are called, so no other mod's scene hook runs
+// and the quad goes straight into the backbuffer (`target` == bb). Otherwise they go through the vtable and
+// the quad is drawn into the offscreen stage while the backbuffer is bound at BeginScene/EndScene: a mod may
+// redraw its 640x480 menu (PracticeEx) into whatever is bound then, and the caller overwrites that.
 //
-// Returns false if nothing was drawn (a resource is missing, or BeginScene / the draw failed), so the
-// caller can fall back to a StretchRect upscale instead of presenting a stale or uninitialised stage.
+// Returns false if nothing was drawn, so the caller can fall back to StretchRect instead of presenting a
+// stale or uninitialised stage.
 static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
                       const RECT *dstRect) {
 	if (!g_ps || !g_captureTex || !g_stateBlock) return false;
@@ -675,9 +656,8 @@ static bool isGameSwapChain(IDirect3DSwapChain9 *sc) {
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	if (!isGameSwapChain(sc)) return oSCPresent(sc, src, dst, wnd, dirty, flags);
-	// Post-process: the game has rendered its g_srcW x g_srcH surface into the top-left of a native-
-	// resolution backbuffer. Grab that region, fill the borders, and upscale it centered straight into the
-	// backbuffer. Point/Linear/Auto go through StretchRect; Sharp goes through the shader quad.
+	// Post-process: grab the game's g_srcW x g_srcH frame from the backbuffer's top-left, fill the borders
+	// and upscale it centered into the backbuffer.
 	if (g_active && g_captureSurf && !g_composited) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		IDirect3DSurface9 *bb = nullptr;
@@ -689,10 +669,9 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
 			HRESULT a = dev->StretchRect(bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE); // 1:1 grab
 			// Every output pixel comes from this one upscale pass - never re-blit part of the frame with a
-			// different filter (that made the corner overlapping the grab region blurry at non-integer
-			// FitToScreen scales, e.g. 2.25x on a 1080p screen). Without direct scene calls the upscale is
-			// composed into the stage and the backbuffer is only filled + copied AFTER it, which also wipes
-			// the un-upscaled menu dupe PracticeEx redraws into the backbuffer during drawSharp's scene.
+			// different filter (that blurred the corner overlapping the grab region at non-integer scales,
+			// KNOWN-BUGS Bug 4). Without direct scene calls the upscale goes into the stage and the backbuffer
+			// is filled + copied AFTER it, which also wipes PracticeEx's menu dupe from drawSharp's scene.
 			IDirect3DSurface9 *target = g_stageSurf ? g_stageSurf : bb;
 			HRESULT b = S_OK, c = S_OK;
 			if (!g_stageSurf) fillBorders(dev, bb, dstRect);
@@ -833,11 +812,10 @@ static bool hookDevice(IDirect3DDevice9 *dev) {
 	return true;
 }
 
-// WindowResizer and the older IntegerFullscreen / ExclusiveFullscreen mods do the same job (fullscreen
-// override, upscale, window management); on top of them DM would process every frame twice and fight over
-// the window. Mod load order means they may load after our Initialize, so this is checked when the game's
-// device is created (or found by the device watch). If one is loaded, DM stands down completely: no device
-// hooks, no fullscreen override, no post-process, no window management or hotkeys, no ini writes.
+// WindowResizer and the older IntegerFullscreen / ExclusiveFullscreen do the same job; together with them DM
+// would process every frame twice and fight over the window. They may load after our Initialize, so this is
+// checked when the game's device is created (or found by the device watch). If one is loaded, DM stands down
+// completely (clears g_enabled: no hooks, override, post-process, window management, hotkeys or ini writes).
 static const char *const CONFLICTING_MODS[] = { "WindowResizer.dll", "IntegerFullscreen.dll",
                                                 "ExclusiveFullscreen.dll" };
 static bool conflictingModLoaded() {
@@ -1100,8 +1078,7 @@ static void loadConfig() {
 
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 
-	// [Hotkeys] - the modifier plus a per-action key (single letter/digit). A missing/commented/blank
-	// line disables that hotkey (default is empty, so commenting a line out turns it off).
+	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
 	GetPrivateProfileStringA("Hotkeys", "Modifier", "Alt", modn, sizeof(modn), g_iniPath);
 	if      (StrCmpIA(modn, "Ctrl") == 0 || StrCmpIA(modn, "Control") == 0) g_modifier = MODK_CTRL;
@@ -1129,10 +1106,8 @@ static void writeIniIfChanged(const char *key, const char *val) {
 		WritePrivateProfileStringA("Display", key, val, g_iniPath);
 }
 
-// Persist the current scaling settings (Mode + FullscreenScale + WindowScale + Filter + Sharpness) to the ini
-// so the next launch restores them - including live Alt+F / Alt+K / Alt+L tuning. Window position is deliberately
-// NOT saved. Only keys that actually changed are written (see writeIniIfChanged), so if the user changed
-// nothing the file is left untouched.
+// Save Mode, FullscreenScale, WindowScale, Filter and Sharpness (incl. live hotkey changes) to the ini at
+// exit. Window position is deliberately NOT saved; unchanged keys are not rewritten.
 static void persistState() {
 	if (!g_persist || !g_enabled) return;   // (g_enabled is cleared when standing down for another mod)
 	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
@@ -1157,10 +1132,9 @@ static void persistState() {
 }
 
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..6 = x1..x6, Alt+P/F/K/L ------------
-// A WH_KEYBOARD hook on the game's UI thread (the same technique WindowResizer uses for its Alt+number
-// hotkeys). This fires for the game's own key messages, so it works in exclusive fullscreen - unlike a
-// GetAsyncKeyState poll, which the exclusive-fullscreen input path doesn't cooperate with. The change is
-// applied live: it only affects the post-process output size, so no device reset is needed.
+// A WH_KEYBOARD hook on the game's UI thread (as WindowResizer does): it sees the game's own key messages,
+// so it works in exclusive fullscreen, where a GetAsyncKeyState poll did not. Changes apply live (they only
+// affect the post-process), no device reset.
 static HHOOK g_kbHook = nullptr;
 
 // lParam bit 30 = previous key state, bit 31 = transition. Both 0 means a fresh key-down (not a repeat
@@ -1175,13 +1149,10 @@ static void windowBorders(int *bx, int *by) {
 	*bx = r.right - r.left; *by = r.bottom - r.top;
 }
 
-// Resize the game's window so its client area is exactly (srcW*n) x (srcH*n). We only move the window's
-// borders - the game keeps rendering to its existing backbuffer and D3D9's windowed present stretches it
-// to the new client, so no (unsafe, external) device reset is needed. Mirrors WindowResizer. Also moves
-// the window's top-left to `pos` when given (null = keep the current position).
-// Clamped to the work area of the monitor it lands on: the largest integer scale that fits (at least x1),
-// moved back on-screen if it would stick out. The side/bottom slack allows for Windows 10's invisible
-// resize borders, which are part of the window rect but not of what's visible.
+// Resize the game's window to a (srcW*n) x (srcH*n) client, optionally moving its top-left to `pos`. Only the
+// window changes: D3D9's windowed present stretches the existing backbuffer, so no (unsafe, external) device
+// reset is needed. Mirrors WindowResizer. Clamped to the work area of the monitor it lands on (largest
+// integer scale that fits, moved back on-screen); the slack allows for Windows 10's invisible resize borders.
 static void setWindowScaled(int n, const POINT *pos) {
 	if (!g_hwnd || n < 1) return;
 	int bx, by; windowBorders(&bx, &by);
@@ -1247,11 +1218,10 @@ static void applyWindowState() {
 	else if (g_borderless && g_active) enterBorderlessFullscreen();
 }
 
-// Subclassed window procedure: while windowed and resizable, lock a drag-resize to the source aspect
-// ratio (and a minimum of one source-size) so the stretched image never gets squashed.
 static WNDPROC g_origWndProc = nullptr;
 
-// Also runs the deferred window-state apply posted by postWindowApply.
+// Subclassed window procedure: runs the deferred apply posted by postWindowApply, and while windowed and
+// resizable locks a drag-resize to 4:3 (at least 640x480) so the stretched image never gets squashed.
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	if (g_applyMsg && msg == g_applyMsg) {
 		applyWindowState();
@@ -1307,8 +1277,7 @@ static void postWindowApply(bool firstTime) {
 	applyWindowState();
 }
 
-// Turn the game's window into a borderless popup covering its monitor (used in borderless-fullscreen
-// mode).
+// Turn the game's window into a borderless popup covering its monitor.
 static void enterBorderlessFullscreen() {
 	if (!g_hwnd) return;
 	if (!g_styleSaved) {
@@ -1335,9 +1304,8 @@ static void enterBorderlessFullscreen() {
 	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_topmost);
 }
 
-// Run a hotkey action. "Scale N" means "N x" for whichever state the game is in: in fullscreen it sets
-// Mode=IntegerScaling xN (as before); windowed it only resizes the window (g_winScale), so sizing the
-// window never changes the fullscreen mode (a FitToScreen/CustomResolution user stays that way).
+// Run a hotkey action. "Scale N" applies to the current state: fullscreen sets Mode=IntegerScaling xN;
+// windowed only resizes the window (g_winScale), so it never changes the fullscreen mode.
 static void doAction(int act) {
 	switch (act) {
 	case ACT_FIT:
@@ -1411,9 +1379,8 @@ static LRESULT CALLBACK keyboardHook(int code, WPARAM wParam, LPARAM lParam) {
 	return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-// Install the keyboard hook on the GAME WINDOW's thread. We must target that thread explicitly (rather
-// than the current one): SokuDirectXOptimizations moves rendering/present onto a separate thread, so the
-// thread that calls CreateDevice/Present is not the window's message thread that receives key input.
+// Install the keyboard hook on the GAME WINDOW's thread, not the current one: SokuDirectXOptimizations
+// moves rendering/present (and so CreateDevice) onto a separate thread that receives no key input.
 static void installKeyboardHook() {
 	if (g_kbHook || !g_hwnd) return;
 	DWORD tid = GetWindowThreadProcessId(g_hwnd, nullptr);
@@ -1444,8 +1411,6 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
 		atexit(persistState);
-		// Fallback for when our Direct3DCreate9 hook never fires (e.g. SokuDirectXOptimizations with
-		// use_d3d9ex=1 creates a Direct3D9Ex device): watch for the device global and hook it directly.
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
