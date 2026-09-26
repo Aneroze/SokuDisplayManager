@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+**Fixed**
+- An ini from before 1.0.3 got `WindowScale` added at the end of `[Display]` (after `Borderless`) without its
+  comment. It is now inserted, with its comment, right after `FullscreenScale` (only with `PersistState=1`).
+
 **Removed**
 - The `Auto` filter (point at integer scales, linear otherwise). An ini that still says `Filter=Auto` uses the
   default, `Sharp`. Alt+F now cycles Point → Linear → Sharp.

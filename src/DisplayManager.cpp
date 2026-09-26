@@ -1003,12 +1003,25 @@ static bool iniHasKey(const char *key) {
 	return lstrcmpA(v, "\x01") != 0;
 }
 
-// One-time ini migration (only with PersistState=1, i.e. when the user lets us write the ini): rename the
-// [Display] key IntegerScaling to FullscreenScale IN PLACE, so the value, the surrounding comments and the key
-// order are kept (WritePrivateProfileString would append a new key at the end of the section instead).
-// Skipped for UTF-16 inis and on any I/O error - the fallback read in loadConfig keeps old files working.
+// Line starting (after blanks) with `key`, optional blanks, '='? Case-insensitive, like GetPrivateProfileString.
+static bool isKeyLine(const char *p, const char *key) {
+	int n = lstrlenA(key);
+	if (StrCmpNIA(p, key, n) != 0) return false;
+	p += n;
+	while (*p == ' ' || *p == '\t') p++;
+	return *p == '=';
+}
+
+// One-time ini upgrades for inis from older versions (only with PersistState=1, i.e. when the user lets us
+// write the ini), done in place so values, comments and key order are kept (WritePrivateProfileString would
+// append new keys at the end of the section instead):
+//   - rename IntegerScaling (<= 1.0.3) to FullscreenScale;
+//   - add WindowScale (1.0.3+) with its comment right after it, set to the value loadConfig falls back to.
+// Skipped for UTF-16 inis and on any I/O error - the fallback reads in loadConfig keep old files working.
 static void migrateIni() {
-	if (!iniHasKey(LEGACY_FS_SCALE_KEY) || iniHasKey("FullscreenScale")) return;
+	const bool rename = iniHasKey(LEGACY_FS_SCALE_KEY) && !iniHasKey("FullscreenScale");
+	const bool addWin = !iniHasKey("WindowScale");
+	if (!rename && !addWin) return;
 	HANDLE f = CreateFileA(g_iniPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
 	if (f == INVALID_HANDLE_VALUE) return;
 	DWORD size = GetFileSize(f, nullptr), got = 0;
@@ -1017,36 +1030,59 @@ static void migrateIni() {
 	CloseHandle(f);
 	if (!ok || (size >= 2 && (BYTE)buf[0] == 0xFF && (BYTE)buf[1] == 0xFE)) { free(buf); return; }
 	buf[size] = 0;
-	// Find the key line inside [Display]: optional blanks, the key (any case), optional blanks, '='.
-	const int keyLen = lstrlenA(LEGACY_FS_SCALE_KEY);
+	// The fullscreen scale line in [Display], under the name it has now.
+	const char *key = rename ? LEGACY_FS_SCALE_KEY : "FullscreenScale";
 	bool inDisplay = false;
 	char *hit = nullptr;
 	for (char *line = buf; *line && !hit; ) {
 		char *p = line;
 		while (*p == ' ' || *p == '\t') p++;
 		if (*p == '[') inDisplay = StrCmpNIA(p, "[Display]", 9) == 0;
-		else if (inDisplay && StrCmpNIA(p, LEGACY_FS_SCALE_KEY, keyLen) == 0) {
-			char *q = p + keyLen;
-			while (*q == ' ' || *q == '\t') q++;
-			if (*q == '=') hit = p;
-		}
+		else if (inDisplay && isKeyLine(p, key)) hit = p;
 		char *nl = strchr(line, '\n');
 		line = nl ? nl + 1 : line + lstrlenA(line);
 	}
-	if (hit) {
-		char tmp[1024 + MAX_PATH + 8];
-		wsprintfA(tmp, "%s.tmp", g_iniPath);
-		HANDLE o = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-		if (o != INVALID_HANDLE_VALUE) {
-			DWORD w1 = 0, w2 = 0, w3 = 0, pre = (DWORD)(hit - buf), rest = size - pre - keyLen;
-			bool wrote = WriteFile(o, buf, pre, &w1, nullptr) && WriteFile(o, "FullscreenScale", 15, &w2, nullptr) &&
-			             WriteFile(o, hit + keyLen, rest, &w3, nullptr) && w1 == pre && w2 == 15 && w3 == rest;
-			CloseHandle(o);
-			if (wrote && MoveFileExA(tmp, g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-				logf("ini migrated: IntegerScaling -> FullscreenScale");
-			else
-				DeleteFileA(tmp);
+	if (!hit) { free(buf); return; }
+
+	const char *eolStr = strstr(buf, "\r\n") ? "\r\n" : "\n";   // match the file's line endings
+	char *eol = strchr(hit, '\n');
+	char *after = eol ? eol + 1 : buf + size;                    // start of the line after the scale line
+	char ins[640] = "";
+	if (addWin) {                                                // same text as the shipped ini
+		char val[32] = {0};
+		GetPrivateProfileStringA("Display", key, "x2", val, sizeof(val), g_iniPath);
+		const char *e = eolStr;
+		wsprintfA(ins, "%s%s"
+		          "; WINDOW size (windowed mode), as a whole-number scale of 640x480%s"
+		          "; (x2 = a 1280x960 client area). The Scale hotkeys change it while windowed;%s"
+		          "; it is separate from the fullscreen Mode above. Reduced to the largest scale%s"
+		          "; that fits your monitor's work area, and the window is kept on-screen. If%s"
+		          "; missing, the FullscreenScale value is used.%s"
+		          "WindowScale=%s%s",
+		          eol ? "" : e, e, e, e, e, e, e, val, e);
+	}
+	const char *keyEnd = hit + lstrlenA(key);
+	char tmp[1024 + MAX_PATH + 8];
+	wsprintfA(tmp, "%s.tmp", g_iniPath);
+	HANDLE o = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (o != INVALID_HANDLE_VALUE) {
+		struct { const char *p; DWORD n; } parts[] = {
+			{ buf,               (DWORD)(hit - buf) },            // up to the scale key
+			{ "FullscreenScale", 15 },                            // its (new) name
+			{ keyEnd,            (DWORD)(after - keyEnd) },       // the rest of that line
+			{ ins,               (DWORD)lstrlenA(ins) },          // the WindowScale block, if added
+			{ after,             (DWORD)(buf + size - after) },   // the rest of the file
+		};
+		bool wrote = true;
+		for (auto &pt : parts) {
+			DWORD w = 0;
+			if (pt.n && !(WriteFile(o, pt.p, pt.n, &w, nullptr) && w == pt.n)) { wrote = false; break; }
 		}
+		CloseHandle(o);
+		if (wrote && MoveFileExA(tmp, g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+			logf("ini migrated:%s%s", rename ? " IntegerScaling -> FullscreenScale" : "", addWin ? " added WindowScale" : "");
+		else
+			DeleteFileA(tmp);
 	}
 	free(buf);
 }
