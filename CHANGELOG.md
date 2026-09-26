@@ -6,6 +6,13 @@
 - `VSync` option (`-1` = the game's own setting, `0` = off, `1` = on) for exclusive fullscreen, and a note on
   what 62 fps (giuroll `enable_f62`) looks like on a 60 Hz screen: rolling tear with vsync off, ~2 skipped
   frames per second with it on.
+- `[Input] AllowWinKey` (default `0`): `1` lets the Windows key work while the game has focus (Win+Shift+S
+  screenshots, virtual-desktop switching). The base game blocks it itself - its DirectInput keyboard is created
+  with `DISCL_NOWINKEY` - and this clears just that flag.
+- For other mods: the export `DisplayManager_GetGameRect(RECT *)` gives the rect the 640x480 image occupies in
+  the game window's client area, so overlays/side panels (e.g. ReplayInputView++'s F6 panel) can map mouse
+  positions in fullscreen, where the client covers the whole monitor. README notes how to tell whether the device
+  is really windowed in `Borderless=1` (ask the swap chain, not the game's present-parameters global).
 
 ## 1.0.4 — 2026-09-25
 

@@ -62,6 +62,14 @@ static const DWORD ADDR_D3DCREATE9_IAT = 0x008572A0;
 #define GAME_SWAPCHAIN (*reinterpret_cast<IDirect3DSwapChain9 **>(0x008A0E34))
 // D3DDISPLAYMODE the game fetched via GetAdapterDisplayMode at startup (Width+0, Height+4, Refresh+8, Format+0xC).
 static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
+// DirectInput keyboard setup (0x40D830, called once from the game's init at 0x407A63, after the window exists):
+// CreateDevice(GUID_SysKeyboard) -> SetDataFormat(c_dfDIKeyboard) -> SetCooperativeLevel(hwnd, 0x16), whose flags
+// are the `push 0x16` (6A 16) at 0x40D8B3. 0x16 = DISCL_NONEXCLUSIVE | DISCL_FOREGROUND | DISCL_NOWINKEY: the
+// NOWINKEY bit is what disables the Windows key while the game is in the foreground. (Mouse: flags 6 at 0x40DB6C,
+// joypads: 5 at 0x40DDA2 - neither has NOWINKEY.) The keyboard device pointer is stored at 0x8A01A0.
+static const DWORD ADDR_KB_COOPLEVEL_PUSH = 0x0040D8B3;
+static const DWORD ADDR_KB_DEVICE         = 0x008A01A0;
+static const BYTE  DI_NONEXCLUSIVE = 0x02, DI_FOREGROUND = 0x04, DI_NOWINKEY = 0x10;   // dinput.h DISCL_*
 
 // ---- vtable indices (verified against d3d9.h) ----------------------------------------------------
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
@@ -101,6 +109,7 @@ static int     g_fsW       = 0;        // manual fullscreen display-mode overrid
 static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
+static bool    g_allowWinKey = false;  // [Input] AllowWinKey: drop the game's DISCL_NOWINKEY (vanilla blocks the Win key)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -1100,6 +1109,7 @@ static void loadConfig() {
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
+	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
@@ -1413,6 +1423,54 @@ static void setupHooks() {
 	VirtualProtect(slot, sizeof(DWORD), old, &old);
 }
 
+// [Input] AllowWinKey=1: let the Windows key through while the game has focus (Win+Shift+S screenshots,
+// virtual-desktop switching, ...). Vanilla th123 blocks it itself: its DirectInput keyboard is set up with
+// DISCL_NOWINKEY (see ADDR_KB_COOPLEVEL_PUSH), which makes DirectInput swallow the Win keys while the device
+// is acquired. We clear just that bit in the immediate; the keyboard stays non-exclusive + foreground, so game
+// input is unchanged. Must run before the game creates its keyboard (Initialize runs before the game's init).
+// Checks the exact bytes first and leaves anything unexpected (another patch) alone.
+static void applyAllowWinKey() {
+	BYTE *p = reinterpret_cast<BYTE *>(ADDR_KB_COOPLEVEL_PUSH);
+	const BYTE want = DI_NONEXCLUSIVE | DI_FOREGROUND;
+	if (p[0] != 0x6A || (p[1] & ~DI_NOWINKEY) != want) {
+		logf("AllowWinKey: unexpected code at 0x%08lx (%02x %02x) - not patched", ADDR_KB_COOPLEVEL_PUSH, p[0], p[1]);
+		return;
+	}
+	if (p[1] & DI_NOWINKEY) {
+		DWORD old;
+		VirtualProtect(p + 1, 1, PAGE_EXECUTE_READWRITE, &old);
+		p[1] = want;
+		VirtualProtect(p + 1, 1, old, &old);
+		FlushInstructionCache(GetCurrentProcess(), p, 2);
+	}
+	bool late = *reinterpret_cast<void **>(ADDR_KB_DEVICE) != nullptr;
+	logf("AllowWinKey: keyboard cooperative level 0x16 -> 0x%02x (Windows key allowed)%s", want,
+	     late ? " - but the keyboard already exists; takes effect next launch" : "");
+}
+
+// For other mods (e.g. an overlay that maps mouse positions onto the game): where the game's 640x480 image is
+// inside the game window's CLIENT area, in client pixels (the space of WM_MOUSEMOVE / ScreenToClient). Windowed,
+// that is the whole client (D3D9 stretches the 640x480 backbuffer over it). In fullscreen (exclusive or
+// borderless) the client covers the monitor and the image is the centered, scaled rect DM draws (pillar/
+// letterboxed; smaller with IntegerScaling/CustomResolution). Returns FALSE when DM is off or standing down, or
+// the window isn't known yet - the caller should then assume a 4:3 image centered in the client.
+// Look it up with GetProcAddress(GetModuleHandleA("DisplayManager.dll"), "DisplayManager_GetGameRect").
+extern "C" __declspec(dllexport) BOOL DisplayManager_GetGameRect(RECT *out) {
+	if (!out || !g_enabled || !g_hwnd) return FALSE;
+	RECT c;
+	if (!GetClientRect(g_hwnd, &c) || c.right <= 0 || c.bottom <= 0) return FALSE;
+	UINT bbW = g_bbW, bbH = g_bbH;
+	if (!g_active || !bbW || !bbH) { *out = c; return TRUE; }
+	int w = g_scaleW, h = g_scaleH;
+	int x = ((int)bbW - w) / 2, y = ((int)bbH - h) / 2;
+	// Backbuffer -> client pixels (the same size in practice; scaled in case the client differs).
+	out->left   = MulDiv(x,     c.right,  (int)bbW);
+	out->top    = MulDiv(y,     c.bottom, (int)bbH);
+	out->right  = MulDiv(x + w, c.right,  (int)bbW);
+	out->bottom = MulDiv(y + h, c.bottom, (int)bbH);
+	return TRUE;
+}
+
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 	return ::memcmp(TARGET_HASH, hash, sizeof TARGET_HASH) == 0;
 }
@@ -1422,13 +1480,14 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	loadConfig();
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
+		if (g_allowWinKey) applyAllowWinKey();   // input-only; independent of the display handling
 		atexit(persistState);
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
+	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d",
 	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
+	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey);
 	return TRUE;
 }
 

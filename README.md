@@ -49,6 +49,7 @@ All options live in `DisplayManager.ini`:
 | `VSync` | `-1` | *(advanced)* Vertical sync in exclusive fullscreen: `-1` = the game's own setting (off in vanilla; SokuDirectXOptimizations' `vsync` can turn it on), `0` = force off, `1` = force on. See the 62 fps note below. No effect with `Borderless=1`, which the desktop always syncs. |
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
+| `AllowWinKey` *(section `[Input]`)* | `0` | `1` = let the Windows key work while the game has focus (Win+Shift+S screenshots, virtual-desktop switching, ...). The base game itself blocks it: its DirectInput keyboard is created with `DISCL_NOWINKEY`, and this clears just that flag. In exclusive fullscreen, opening the Start menu minimizes the game like Alt+Tab. Restart the game to change it. |
 
 The `[Hotkeys]` section sets `Modifier` (`Alt`/`Ctrl`/`Shift`/`Win`/`None`) and rebinds each hotkey (a letter/digit; commented-out or blank = disabled): `FitToScreen`, `Scale1`…`Scale6`, `AlwaysOnTop`, `CycleFilter`, `SharpnessDown`, `SharpnessUp`.
 
@@ -65,6 +66,9 @@ Only the value for the active `Mode` matters; the others are ignored. Hotkey cha
 - If the graphics driver refuses the native fullscreen mode (custom CRU modes, rotated screens, Wine/DXVK), DisplayManager retries with the default refresh rate and then falls back to the game's own (vanilla) fullscreen instead of hanging; `Log=1` shows each step.
 - **62 fps (giuroll `enable_f62`) on a 60 Hz screen:** the game runs faster than the screen refreshes. In exclusive fullscreen with vsync off (the vanilla default) a tear line rolls up the whole screen about twice a second; with `VSync=1`, or in borderless/WindowResizer, the tear is gone but about 2 frames per second are skipped and latency goes up by up to a frame. A 120 Hz or faster screen avoids both, as does G-Sync/FreeSync. At 60 fps none of this applies.
 - Some other mods can freeze Alt+Enter if they create Direct3D resources in `D3DPOOL_DEFAULT` without handling a device reset. That's a bug in those mods, not this one.
+- **For mod authors** (overlays, side windows, mouse input):
+  - In fullscreen the game window's client area covers the whole monitor and the 640×480 image is a centered, scaled rect inside it, so mouse coordinates can't be mapped by dividing by the client size. `DisplayManager.dll` exports `BOOL DisplayManager_GetGameRect(RECT *out)` (cdecl): the image's rect in client pixels (the whole client when windowed); `FALSE` if DisplayManager is off — then assume a 4:3 image centered in the client.
+  - With `Borderless=1` the game's own present parameters (`0x8A0F68`) still say fullscreen (`Windowed=0`) — DisplayManager only changes its own copy, which is what keeps Alt+Enter working — while the device is actually windowed. To know whether the device is windowed (e.g. before creating an additional swap chain for a side window), ask the device: `GetSwapChain(0)` → `GetPresentParameters`.
 
 ## How it works
 
