@@ -100,6 +100,7 @@ static bool    g_borderless = false;   // fullscreen as a borderless window inst
 static int     g_fsW       = 0;        // manual fullscreen display-mode override (0 = auto / native)
 static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
+static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -424,7 +425,11 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 		pp->BackBufferWidth  = w;
 		pp->BackBufferHeight = h;
 		pp->FullScreen_RefreshRateInHz = refresh;
-		logf("exclusive fullscreen -> native %ux%u @%uHz", w, h, refresh);
+		// th123 presents IMMEDIATE unless SokuDirectXOptimizations patches it (62 fps on 60 Hz: rolling tear).
+		if (g_vsync >= 0)
+			pp->PresentationInterval = g_vsync ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+		logf("exclusive fullscreen -> native %ux%u @%uHz, present interval 0x%x", w, h, refresh,
+		     pp->PresentationInterval);
 	}
 	g_bbW = w; g_bbH = h; g_bbFormat = fmt; g_active = true;
 	computeOutput();
@@ -1094,6 +1099,7 @@ static void loadConfig() {
 	g_fsW          = GetPrivateProfileIntA("Display", "FullscreenWidth", 0, g_iniPath);
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
+	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};

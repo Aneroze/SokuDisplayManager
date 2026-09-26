@@ -46,6 +46,7 @@ All options live in `DisplayManager.ini`:
 | `PositionX` / `PositionY` | `-1` | Where the window spawns on launch, in screen pixels. `-1` = leave the initial position alone. The live position is never written back to the ini. |
 | `FullscreenWidth` / `FullscreenHeight` | `0` | *(advanced)* Force the fullscreen **display mode** — the actual screen resolution the monitor switches to (not the game surface, not the scaled output). `0` = auto-detect your monitor's native resolution (recommended). Set both to override if auto-detection picks the wrong mode. A mode your monitor doesn't list falls back to the current desktop mode. |
 | `FullscreenRefresh` | `0` | *(advanced)* Refresh rate for the forced mode; `0` keeps the native refresh. A rate the mode doesn't have snaps to the closest one it does. |
+| `VSync` | `-1` | *(advanced)* Vertical sync in exclusive fullscreen: `-1` = the game's own setting (off in vanilla; SokuDirectXOptimizations' `vsync` can turn it on), `0` = force off, `1` = force on. See the 62 fps note below. No effect with `Borderless=1`, which the desktop always syncs. |
 | `Log` | `0` | Set to `1` to write a `DisplayManager.log` next to the ini for troubleshooting. |
 | `Borderless` | `0` | Use a borderless window for "fullscreen" instead of true exclusive fullscreen. **Not recommended:** borderless loses the low-latency direct-flip path (a legacy D3D9 game can't get Independent Flip in a window), so it has more input latency. Enable only if you want easier alt-tab/overlays. |
 
@@ -62,6 +63,7 @@ Only the value for the active `Mode` matters; the others are ignored. Hotkey cha
 - In windowed mode the game's rendering is left alone; the mod only manages the window: at launch it sizes it to the `WindowScale` scale (and moves it to `PositionX`/`PositionY` if set), keeps drag-resizing at 4:3, and handles always-on-top. Coming back from fullscreen (Alt+Enter) restores the window's previous position, the `WindowScale` size and always-on-top. Window sizes are capped to what fits the monitor's work area, and the window is kept on-screen.
 - Borderless fullscreen covers the monitor the window was on when you pressed Alt+Enter; exclusive fullscreen uses the monitor of the adapter the game started on.
 - If the graphics driver refuses the native fullscreen mode (custom CRU modes, rotated screens, Wine/DXVK), DisplayManager retries with the default refresh rate and then falls back to the game's own (vanilla) fullscreen instead of hanging; `Log=1` shows each step.
+- **62 fps (giuroll `enable_f62`) on a 60 Hz screen:** the game runs faster than the screen refreshes. In exclusive fullscreen with vsync off (the vanilla default) a tear line rolls up the whole screen about twice a second; with `VSync=1`, or in borderless/WindowResizer, the tear is gone but about 2 frames per second are skipped and latency goes up by up to a frame. A 120 Hz or faster screen avoids both, as does G-Sync/FreeSync. At 60 fps none of this applies.
 - Some other mods can freeze Alt+Enter if they create Direct3D resources in `D3DPOOL_DEFAULT` without handling a device reset. That's a bug in those mods, not this one.
 
 ## How it works

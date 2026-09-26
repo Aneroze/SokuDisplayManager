@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Added**
+- `VSync` option (`-1` = the game's own setting, `0` = off, `1` = on) for exclusive fullscreen, and a note on
+  what 62 fps (giuroll `enable_f62`) looks like on a 60 Hz screen: rolling tear with vsync off, ~2 skipped
+  frames per second with it on.
+
 ## 1.0.4 — 2026-09-25
 
 **Changed**
