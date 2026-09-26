@@ -401,15 +401,14 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
 	g_wantFullscreen = !pp->Windowed;                    // the game's real intent (before we override it)
 
-	UINT w = 0, h = 0, refresh = 0;
-	nativeMode(&w, &h, &refresh);
-
-	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
-
 	if (pp->Windowed) {
 		g_active = false;
 		return;
 	}
+
+	UINT w = 0, h = 0, refresh = 0;
+	nativeMode(&w, &h, &refresh);
+	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
 
 	if (g_borderless) {
 		// Borderless: a windowed device with a native-sized backbuffer; enterBorderlessFullscreen covers
@@ -929,7 +928,7 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 		return oCreateDevice(self, adapter, type, focus, behavior, p, out);
 	}, pp, use);
 	if (pp) syncPresentParams(pp, &local);
-	if (SUCCEEDED(hr) && out && *out) {
+	if (SUCCEEDED(hr) && *out) {           // out == &GAME_DEVICE here, never null
 		hookDevice(*out);
 		if (g_active) {
 			createCapture(*out);
@@ -1049,7 +1048,8 @@ static void loadConfig() {
 	PathAppendA(g_iniPath, "DisplayManager.ini");
 	g_enabled = GetPrivateProfileIntA("Display", "Enabled", 1, g_iniPath) != 0;
 	g_log = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;   // early, so migrateIni can log
-	if (GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0) migrateIni();
+	g_persist = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
+	if (g_persist) migrateIni();
 
 	char mode[64] = {0};
 	GetPrivateProfileStringA("Display", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
@@ -1088,15 +1088,12 @@ static void loadConfig() {
 	clampSharpness();
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
-	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
 	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
 	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
 	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
 	g_fsW          = GetPrivateProfileIntA("Display", "FullscreenWidth", 0, g_iniPath);
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
-
-	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
