@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.5 — 2026-09-26
 
 **Fixed**
 - An ini from before 1.0.3 got `WindowScale` added at the end of `[Display]` (after `Borderless`) without its
