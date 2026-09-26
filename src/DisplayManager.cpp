@@ -66,6 +66,7 @@ static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 // ---- vtable indices (verified against d3d9.h) ----------------------------------------------------
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
 static const int VT_DEV_RESET         = 16;   // IDirect3DDevice9::Reset          (+0x40)
+static const int VT_DEV_PRESENT       = 17;   // IDirect3DDevice9::Present         (+0x44)
 static const int VT_DEV_SETRT         = 37;   // IDirect3DDevice9::SetRenderTarget (+0x94)
 static const int VT_DEV_BEGINSCENE    = 41;   // IDirect3DDevice9::BeginScene      (+0xA4)
 static const int VT_DEV_ENDSCENE      = 42;   // IDirect3DDevice9::EndScene        (+0xA8)
@@ -188,6 +189,25 @@ static void logf(const char *fmt, ...) {
 	va_end(ap);
 	fputc('\n', g_logFile);
 	fflush(g_logFile);
+}
+
+// ini names of the current Mode / Filter.
+static const char *modeName() {
+	return g_mode == MODE_INTEGER ? "IntegerScaling" : g_mode == MODE_CUSTOM ? "CustomResolution" : "FitToScreen";
+}
+static const char *filterName() {
+	return g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear" : g_filterCfg == 3 ? "Sharp" : "Auto";
+}
+
+// g_sharpness as "X.XX" (wsprintf has no %f).
+static void formatSharpness(char *buf) {
+	int hundredths = (int)(g_sharpness * 100.0f + 0.5f);
+	wsprintfA(buf, "%d.%02d", hundredths / 100, hundredths % 100);
+}
+
+static void clampSharpness() {
+	if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
+	if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
 }
 
 // forward declarations
@@ -624,10 +644,11 @@ static void drawOsd(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *ou
 	}
 }
 
-static void sharpOsdText(char *buf, int cap) {
-	int hn = (int)(g_sharpness * 100.0f + 0.5f);
-	wsprintfA(buf, "SHARP %d.%02d", hn / 100, hn % 100);
-	(void)cap;
+static void showSharpnessOsd() {
+	char num[16], msg[32];
+	formatSharpness(num);
+	wsprintfA(msg, "SHARP %s", num);
+	showOsd(msg);
 }
 
 // Fill everything outside the centered game rect with the border color (up to four rects). The game rect
@@ -851,7 +872,7 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 	for (int i = 0; i < 1200 && !g_deviceHooked && !g_createDeviceHooked; i++) {   // ~60s
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		void **vt = dev ? *(void ***)dev : nullptr;
-		if (vt && isExecutableImage(vt[VT_DEV_RESET]) && isExecutableImage(vt[17])) {   // 17 = Present
+		if (vt && isExecutableImage(vt[VT_DEV_RESET]) && isExecutableImage(vt[VT_DEV_PRESENT])) {
 			if (!g_enabled || conflictingModLoaded()) return 0;
 			IDirect3DSwapChain9 *sc = nullptr;
 			BOOL windowed = TRUE;
@@ -1064,8 +1085,7 @@ static void loadConfig() {
 	char sharp[32] = {0};
 	GetPrivateProfileStringA("Display", "Sharpness", "1.50", sharp, sizeof(sharp), g_iniPath);
 	g_sharpness = (float)atof(sharp);
-	if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
-	if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
+	clampSharpness();
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
 	g_persist   = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
@@ -1110,24 +1130,18 @@ static void writeIniIfChanged(const char *key, const char *val) {
 // exit. Window position is deliberately NOT saved; unchanged keys are not rewritten.
 static void persistState() {
 	if (!g_persist || !g_enabled) return;   // (g_enabled is cleared when standing down for another mod)
-	const char *m = g_mode == MODE_INTEGER ? "IntegerScaling"
-	              : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
-	writeIniIfChanged("Mode", m);
+	writeIniIfChanged("Mode", modeName());
 	writeIniIfChanged("FullscreenScale", scale);
 	if (iniHasKey(LEGACY_FS_SCALE_KEY))                       // leftover pre-1.0.4 key (migration skipped)
 		WritePrivateProfileStringA("Display", LEGACY_FS_SCALE_KEY, nullptr, g_iniPath);
 	wsprintfA(scale, "x%d", g_winScale);
 	writeIniIfChanged("WindowScale", scale);
 
-	const char *f = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
-	              : g_filterCfg == 3 ? "Sharp" : "Auto";
-	writeIniIfChanged("Filter", f);
-	// wsprintf has no %f; format the sharpness manually (2 decimals).
-	int hundredths = (int)(g_sharpness * 100.0f + 0.5f);
-	char sh[32];
-	wsprintfA(sh, "%d.%02d", hundredths / 100, hundredths % 100);
+	writeIniIfChanged("Filter", filterName());
+	char sh[16];
+	formatSharpness(sh);
 	writeIniIfChanged("Sharpness", sh);
 }
 
@@ -1332,27 +1346,22 @@ static void doAction(int act) {
 		applyTopmost();
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
-	case ACT_FILTER: {
+	case ACT_FILTER:
 		g_filterCfg = (g_filterCfg + 1) % 4;   // Auto -> Point -> Linear -> Sharp -> Auto
 		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
-		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
-		              : g_filterCfg == 3 ? "Sharp" : "Auto";
-		if (g_filterCfg == 3) { char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg); }
+		if (g_filterCfg == 3) showSharpnessOsd();
 		else showOsd(g_filterCfg == 1 ? "POINT" : g_filterCfg == 2 ? "LINEAR" : "AUTO");
-		logf("hotkey: filter -> %s", n);
+		logf("hotkey: filter -> %s", filterName());
 		break;
-	}
 	case ACT_SHARP_DOWN:
-	case ACT_SHARP_UP: {
+	case ACT_SHARP_UP:
 		g_filterCfg = 3;                        // sharpness only affects Sharp, so switch to it
 		if (g_active) computeOutput();
 		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
-		if (g_sharpness < SHARP_MIN) g_sharpness = SHARP_MIN;
-		if (g_sharpness > SHARP_MAX) g_sharpness = SHARP_MAX;
-		char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg);
+		clampSharpness();
+		showSharpnessOsd();
 		logf("hotkey: filter=Sharp sharpness -> %.2f", g_sharpness);
 		break;
-	}
 	}
 }
 
@@ -1413,11 +1422,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		atexit(persistState);
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
-	const char *modeName = g_mode == MODE_INTEGER ? "IntegerScaling"
-	                     : g_mode == MODE_CUSTOM  ? "CustomResolution" : "FitToScreen";
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
 	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d",
-	     g_enabled, modeName, g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
+	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_posX, g_posY, g_borderless);
 	return TRUE;
 }
