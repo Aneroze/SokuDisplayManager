@@ -1,8 +1,6 @@
 # DisplayManager
 
-A [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutensoku (th123) 1.10a that handles fullscreen scaling and window sizing. It is an alternative to WindowResizer: use one or the other, not both.
-
-In fullscreen, the base game switches the monitor to 640×480 and leaves the scaling to the monitor. DisplayManager keeps the desktop resolution and scales the 640×480 image itself, centered with borders. It uses exclusive fullscreen by default, or a borderless window with `Borderless=1`. In windowed mode it sizes and positions the window and keeps it at 4:3.
+A [SWRSToys](https://github.com/SokuDev/SokuMods) mod for Touhou Hisoutensoku (th123) 1.10a that handles fullscreen scaling and window sizing. It is capable of exclusive fullscreen mode with control over visual filters, which can improve display latency by 10-20ms. It is an alternative to WindowResizer: use one or the other, not both.
 
 ## Scaling
 
@@ -24,7 +22,7 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | --- | --- | --- |
 | Alt+1…6 | `Scale1`…`Scale6` | Fullscreen: `IntegerScaling` at ×N. Windowed: resize the window to ×N. |
 | Alt+0 | `FitToScreen` | Switch to `FitToScreen`. |
-| Alt+F | `CycleFilter` | Cycle the filter: Point → Linear → Sharp. |
+| Alt+F | `CycleFilter` | Cycle the filter. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
@@ -64,11 +62,8 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Notes
 
-- **SokuDirectXOptimizations:** set its `use_d3d9ex=0`. With Direct3D 9Ex on, DisplayManager can't attach to the device.
+- **SokuDirectXOptimizations:** set its `use_d3d9ex=0`. With Direct3D 9Ex on, DisplayManager can have trouble attaching to the device.
 - Exclusive fullscreen minimizes on Alt+Tab. It uses the monitor the game started on; borderless covers the monitor the window was on.
-- If the driver rejects the fullscreen mode, DisplayManager retries with the default refresh rate, then falls back to the game's own fullscreen. `Log=1` shows each step.
-- **62 fps (giuroll `enable_f62`) on a 60 Hz screen:** with vsync off (the vanilla default), a tear line rolls up the screen about twice a second. With vsync on, or in borderless or WindowResizer, there is no tearing, but about 2 frames per second are skipped. A 120 Hz+ or variable-refresh screen avoids both.
-- A freeze on Alt+Enter is usually a mod that doesn't release its `D3DPOOL_DEFAULT` resources before a device reset.
 
 ## For mod authors
 
