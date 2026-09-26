@@ -6,7 +6,7 @@
 // 4:3, so 480 logical pixels get a non-integer scale (e.g. 1080/480 = 2.25x) and look blurry. This mod
 // keeps the desktop at its native resolution and renders the game centered with borders: FitToScreen
 // (default), IntegerScaling or CustomResolution (Mode in the ini, Alt+0..6), with a Sharp (tunable
-// sharp-bilinear, default), Point, Linear or Auto filter. True exclusive fullscreen keeps the low-latency
+// sharp-bilinear, default), Point or Linear filter. True exclusive fullscreen keeps the low-latency
 // "Independent Flip" present path, which a legacy D3D9 / DISCARD game can't get in a borderless window
 // (an optional borderless mode exists anyway). Windowed, it sizes the game window (4:3 drag-resize,
 // Alt+1..6 scale, spawn position, always-on-top).
@@ -98,7 +98,8 @@ static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // th123's fixed render size (grab region / pinned viewport); const
 static int     g_srcH      = 480;      // - th123 always renders 640x480, so this is not configurable
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
-static int     g_filterCfg = 3;              // 0 = Auto (point at integer scales, linear otherwise), 1 = Point, 2 = Linear, 3 = Sharp
+enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_COUNT };
+static int     g_filterCfg = FILTER_SHARP;
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -206,7 +207,7 @@ static const char *modeName() {
 	return g_mode == MODE_INTEGER ? "IntegerScaling" : g_mode == MODE_CUSTOM ? "CustomResolution" : "FitToScreen";
 }
 static const char *filterName() {
-	return g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear" : g_filterCfg == 3 ? "Sharp" : "Auto";
+	return g_filterCfg == FILTER_POINT ? "Point" : g_filterCfg == FILTER_LINEAR ? "Linear" : "Sharp";
 }
 
 // g_sharpness as "X.XX" (wsprintf has no %f).
@@ -297,14 +298,8 @@ static void computeOutput() {
 	if (outW < 1) outW = 1;
 	if (outH < 1) outH = 1;
 	g_scaleW = outW; g_scaleH = outH;
-	// Filter: Auto = point at exact integer multiples (crisp) and linear otherwise (avoids the uneven
-	// doubled/tripled pixels of non-integer point scaling); or force one via the ini. Point keeps hard
-	// pixels even at non-integer scales (sharper, slightly uneven - what WindowResizer's stretch does).
-	if (g_filterCfg == 1)      g_filter = D3DTEXF_POINT;
-	else if (g_filterCfg == 2) g_filter = D3DTEXF_LINEAR;
-	else if (g_filterCfg == 3) g_filter = D3DTEXF_LINEAR;   // Sharp: shader does the work; StretchRect fallback
-	else                       g_filter = (outW % g_srcW == 0 && outH % g_srcH == 0) ? D3DTEXF_POINT
-	                                                                                 : D3DTEXF_LINEAR;
+	// Sharp draws with its shader; linear is only its StretchRect fallback.
+	g_filter = g_filterCfg == FILTER_POINT ? D3DTEXF_POINT : D3DTEXF_LINEAR;
 	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
 	     ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
 	     g_filter == D3DTEXF_POINT ? "point" : "linear");
@@ -711,7 +706,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			if (!g_stageSurf) fillBorders(dev, bb, dstRect);
 			// Sharp falls back to StretchRect (g_filter resolves to linear for Sharp) if the shader pass
 			// couldn't draw - otherwise a stale / uninitialised frame would be shown.
-			if (g_filterCfg != 3 || !drawSharp(dev, bb, target, &dstRect))
+			if (g_filterCfg != FILTER_SHARP || !drawSharp(dev, bb, target, &dstRect))
 				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			if (g_stageSurf) {
 				b = dev->ColorFill(bb, nullptr, g_bgColor);                                  // borders
@@ -1091,10 +1086,9 @@ static void loadConfig() {
 
 	char filt[32] = {0};
 	GetPrivateProfileStringA("Display", "Filter", "Sharp", filt, sizeof(filt), g_iniPath);
-	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = 1;
-	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = 2;
-	else if (StrCmpIA(filt, "Auto") == 0)   g_filterCfg = 0;
-	else                                    g_filterCfg = 3;   // Sharp (the default)
+	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = FILTER_POINT;
+	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = FILTER_LINEAR;
+	else                                    g_filterCfg = FILTER_SHARP;   // the default; also the removed "Auto"
 
 	char sharp[32] = {0};
 	GetPrivateProfileStringA("Display", "Sharpness", "1.50", sharp, sizeof(sharp), g_iniPath);
@@ -1360,15 +1354,15 @@ static void doAction(int act) {
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
 	case ACT_FILTER:
-		g_filterCfg = (g_filterCfg + 1) % 4;   // Auto -> Point -> Linear -> Sharp -> Auto
-		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
-		if (g_filterCfg == 3) showSharpnessOsd();
-		else showOsd(g_filterCfg == 1 ? "POINT" : g_filterCfg == 2 ? "LINEAR" : "AUTO");
+		g_filterCfg = (g_filterCfg + 1) % FILTER_COUNT;   // Point -> Linear -> Sharp -> Point
+		if (g_active) computeOutput();                    // re-resolve g_filter now; next frame's present uses it
+		if (g_filterCfg == FILTER_SHARP) showSharpnessOsd();
+		else showOsd(g_filterCfg == FILTER_POINT ? "POINT" : "LINEAR");
 		logf("hotkey: filter -> %s", filterName());
 		break;
 	case ACT_SHARP_DOWN:
 	case ACT_SHARP_UP:
-		g_filterCfg = 3;                        // sharpness only affects Sharp, so switch to it
+		g_filterCfg = FILTER_SHARP;             // sharpness only affects Sharp, so switch to it
 		if (g_active) computeOutput();
 		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
 		clampSharpness();

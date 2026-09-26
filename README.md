@@ -15,7 +15,6 @@ Upscale filter (`Filter`):
 - `Sharp` (default): sharp-bilinear with adjustable `Sharpness`. At the default 1.5 it closely matches WindowResizer's look.
 - `Point`: hard pixels. Pixels are only even at integer scales.
 - `Linear`: bilinear.
-- `Auto`: point at integer scales, linear otherwise.
 
 ## Hotkeys
 
@@ -25,7 +24,7 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | --- | --- | --- |
 | Alt+1…6 | `Scale1`…`Scale6` | Fullscreen: `IntegerScaling` at ×N. Windowed: resize the window to ×N. |
 | Alt+0 | `FitToScreen` | Switch to `FitToScreen`. |
-| Alt+F | `CycleFilter` | Cycle the filter: Auto → Point → Linear → Sharp. |
+| Alt+F | `CycleFilter` | Cycle the filter: Point → Linear → Sharp. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
