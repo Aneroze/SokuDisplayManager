@@ -114,7 +114,7 @@ enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_T
               ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
-static int g_modifier = MODK_ALT;      // the modifier held with each hotkey key
+static int g_modifier = MODK_ALT;
 
 // ---- runtime state -------------------------------------------------------------------------------
 static volatile bool g_createDeviceHooked = false;   // (volatile: polled by the device-watch thread)
@@ -196,7 +196,7 @@ static void logf(const char *fmt, ...) {
 	fflush(g_logFile);
 }
 
-// forward declarations (definitions live further down)
+// forward declarations
 static void installKeyboardHook();
 static void installWndProc();
 static void setWindowScaled(int n, const POINT *pos);
@@ -396,16 +396,13 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	UINT w = 0, h = 0, refresh = 0;
 	nativeMode(&w, &h, &refresh);
 
-	// Border/letterbox format & backbuffer target used by both fullscreen paths.
 	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
 
 	if (pp->Windowed) {
-		// The game wants a normal window: its own size (640x480), untouched.
 		g_active = false;
 		return;
 	}
 
-	// The game wants fullscreen.
 	if (g_borderless) {
 		// Borderless: a windowed device with a native-sized backbuffer; we cover the monitor with a
 		// borderless window ourselves (done after the reset, in enterBorderlessFullscreen). No exclusive
@@ -483,7 +480,6 @@ static void createCapture(IDirect3DDevice9 *dev) {
 		g_bbSurf = bb;
 		bb->Release();
 	}
-	// A render-target texture (usable both as a StretchRect surface and a shader source).
 	HRESULT hr = dev->CreateTexture((UINT)g_srcW, (UINT)g_srcH, 1, D3DUSAGE_RENDERTARGET, g_bbFormat,
 	                                D3DPOOL_DEFAULT, &g_captureTex, nullptr);
 	if (SUCCEEDED(hr) && g_captureTex)
@@ -529,7 +525,7 @@ static bool g_composited = false;
 static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
                       const RECT *dstRect) {
 	if (!g_ps || !g_captureTex || !g_stateBlock) return false;
-	g_stateBlock->Capture();                                  // save all device state
+	g_stateBlock->Capture();
 	dev->SetRenderTarget(0, bb);
 	HRESULT hrScene = g_sceneDirect ? g_origBeginScene(dev) : dev->BeginScene();
 	if (FAILED(hrScene)) { g_stateBlock->Apply(); return false; }
@@ -563,7 +559,7 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 	HRESULT hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
 	if (target != bb) dev->SetRenderTarget(0, bb);
 	if (g_sceneDirect) g_origEndScene(dev); else dev->EndScene();
-	g_stateBlock->Apply();                                    // restore all device state
+	g_stateBlock->Apply();
 	return SUCCEEDED(hr);
 }
 
@@ -647,7 +643,6 @@ static void drawOsd(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *ou
 	}
 }
 
-// Build "SHARP X.XX" from the current sharpness into buf.
 static void sharpOsdText(char *buf, int cap) {
 	int hn = (int)(g_sharpness * 100.0f + 0.5f);
 	wsprintfA(buf, "SHARP %d.%02d", hn / 100, hn % 100);
@@ -1103,9 +1098,6 @@ static void loadConfig() {
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 
-	// g_srcW/g_srcH are fixed at 640x480: th123 always renders its scene at that size, so the grab
-	// region and the pinned viewport must both be exactly 640x480 - there is no useful reason to make
-	// it configurable (a wrong value can only clip the game or grab garbage).
 	g_log     = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;
 
 	// [Hotkeys] - the modifier plus a per-action key (single letter/digit). A missing/commented/blank
@@ -1123,7 +1115,7 @@ static void loadConfig() {
 	                                 "SharpnessDown", "SharpnessUp" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
-		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);  // "" = disabled
+		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
 		g_hotkeyVk[a] = parseKey(k);
 	}
 }
@@ -1377,7 +1369,7 @@ static void doAction(int act) {
 		if (g_active) computeOutput();         // re-resolve g_filter now; next frame's present uses it
 		const char *n = g_filterCfg == 1 ? "Point" : g_filterCfg == 2 ? "Linear"
 		              : g_filterCfg == 3 ? "Sharp" : "Auto";
-		if (g_filterCfg == 3) { char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg); }  // Sharp: show value
+		if (g_filterCfg == 3) { char msg[32]; sharpOsdText(msg, sizeof(msg)); showOsd(msg); }
 		else showOsd(g_filterCfg == 1 ? "POINT" : g_filterCfg == 2 ? "LINEAR" : "AUTO");
 		logf("hotkey: filter -> %s", n);
 		break;
