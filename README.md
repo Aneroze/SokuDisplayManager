@@ -25,6 +25,7 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | Alt+0 | `FitToScreen` | Switch to `FitToScreen`. |
 | Alt+F | `CycleFilter` | Cycle the filter. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
+| Alt+M | `ToggleMSAA` | Fullscreen: turn MSAA on (`MultiSample`, or ×8 if that is 0) / off. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
 In fullscreen, scale and filter changes are shown briefly on screen.
@@ -51,6 +52,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Size for `Mode=CustomResolution`. |
 | `BackgroundColor` | `000000` | Border color, `RRGGBB`. |
 | `Filter` | `Sharp` | Upscale filter, see [Scaling](#scaling). |
+| `MultiSample` | `0` | Fullscreen MSAA: `0` (off), `2`, `4` or `8`. Only smooths polygon edges; the game's sprites and stages mostly aren't affected. |
 | `Sharpness` | `1.50` | For `Filter=Sharp`: `1.0` (bilinear) to `4.0` (about the same as point). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (kept at 4:3). |
 | `PersistState` | `1` | Save hotkey changes (mode, scales, filter, sharpness) to the ini on exit. |

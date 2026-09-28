@@ -5,6 +5,9 @@
 **Added**
 - `Filter=xBR` (experimental): the xBR-lv2 pixel-art upscaler (Hyllian, MIT), in the Alt+F cycle after Sharp. Falls
   back to Linear if the GPU can't run its shader.
+- `MultiSample=0/2/4/8`: MSAA for the game's rendering in fullscreen, and the `ToggleMSAA` hotkey (Alt+M) to switch
+  it on (×8 by default) and off live. It only smooths polygon edges; on the stages we measured it changes almost
+  nothing, but overlays drawn as shapes (e.g. hitbox displays) may differ.
 
 ## 1.0.6 — 2026-09-28
 

@@ -113,14 +113,16 @@ static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
 static bool    g_allowWinKey = false;  // [Input] AllowWinKey: drop the game's DISCL_NOWINKEY (vanilla blocks the Win key)
-static int     g_msaaCfg   = 0;        // MultiSample: requested MSAA sample count (0 = off)
+static volatile int g_msaaCfg = 0;     // MultiSample: requested MSAA sample count (0 = off); ToggleMSAA flips it
+static int     g_msaaIni   = 0;        // MultiSample as read from the ini (what ToggleMSAA turns on, 8 if it's 0)
+static volatile bool g_msaaApply = false;   // ToggleMSAA pressed: the render thread recreates the MSAA targets
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
 // Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
 // also what a commented-out / missing ini line produces).
 enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER,
-              ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_COUNT };
+              ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;
@@ -495,8 +497,10 @@ static HRESULT callWithFallback(const char *what, F call, const D3DPRESENT_PARAM
 }
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
-static void releaseCapture() {
-	if (g_msRT) {   // Reset needs our default-pool surfaces unbound and released: put the device's own back
+// Unbind and release the MSAA targets, putting the device's own backbuffer and depth buffer back (needed before a
+// Reset, and when ToggleMSAA turns MSAA off).
+static void releaseMsaa() {
+	if (g_msRT) {
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		if (dev) {
 			if (g_bbSurf) dev->SetRenderTarget(0, g_bbSurf);
@@ -507,6 +511,10 @@ static void releaseCapture() {
 	if (g_msRT)        { g_msRT->Release();        g_msRT = nullptr; }
 	g_autoDS = nullptr;
 	g_msType = D3DMULTISAMPLE_NONE;
+}
+
+static void releaseCapture() {
+	releaseMsaa();
 	g_bbSurf = nullptr;
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
@@ -678,7 +686,7 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 // exclusive flip, and (unlike a DrawPrimitiveUP quad) needs no BeginScene/EndScene, so it can't
 // re-trigger a mod's per-scene overlay redraw. Rows are 5 bits, MSB = leftmost column. Only the
 // characters used by the OSD messages are defined; OSD_CHARS is the parallel lookup key (uppercase).
-static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXB";
+static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXBM";
 static const BYTE OSD_FONT[][7] = {
 	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
 	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
@@ -708,6 +716,7 @@ static const BYTE OSD_FONT[][7] = {
 	{0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, // U
 	{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // X
 	{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B
+	{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, // M
 };
 static int osdGlyph(char c) {
 	for (int i = 0; OSD_CHARS[i]; i++) if (OSD_CHARS[i] == c) return i;
@@ -858,6 +867,16 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 	}
 	HRESULT hr = oSCPresent(sc, src, dst, wnd, dirty, flags);
 	if (hr != D3DERR_WASSTILLDRAWING) g_composited = false;   // presented (or dropped): next call is a new frame
+	if (g_msaaApply && g_active) {                             // ToggleMSAA: recreate for the next frame
+		g_msaaApply = false;
+		IDirect3DDevice9 *dev = GAME_DEVICE;
+		if (dev && g_bbSurf) {
+			releaseMsaa();
+			createMsaa(dev);                                   // binds the new target, or leaves the backbuffer
+			setGameViewport(dev);
+			logf("MSAA toggled: requested x%d -> x%d", (int)g_msaaCfg, (int)g_msType);
+		}
+	}
 	if (g_msRT && g_active) {                                  // the next frame draws into the MSAA target again
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		if (dev) bindMsaa(dev);
@@ -1283,6 +1302,7 @@ static void loadConfig() {
 	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
 	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
 	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
+	g_msaaIni      = g_msaaCfg;
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
@@ -1295,7 +1315,7 @@ static void loadConfig() {
 
 	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
 	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter",
-	                                 "SharpnessDown", "SharpnessUp" };
+	                                 "SharpnessDown", "SharpnessUp", "ToggleMSAA" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
@@ -1548,6 +1568,18 @@ static void doAction(int act) {
 		showSharpnessOsd();
 		logf("hotkey: filter=Sharp sharpness -> %.2f", g_sharpness);
 		break;
+	case ACT_MSAA: {
+		// Off <-> MultiSample from the ini (x8 when that is 0). Session only: not written to the ini. Applied on the
+		// render thread after the next Present; windowed, it takes effect when going fullscreen.
+		int on = g_msaaIni >= 2 ? g_msaaIni : 8;
+		g_msaaCfg = g_msaaCfg >= 2 ? 0 : on;
+		g_msaaApply = true;
+		char msg[32];
+		if (g_msaaCfg) wsprintfA(msg, "MSAA X%d", g_msaaCfg); else lstrcpyA(msg, "MSAA OFF");
+		showOsd(msg);
+		logf("hotkey: MSAA -> %d", (int)g_msaaCfg);
+		break;
+	}
 	}
 }
 
