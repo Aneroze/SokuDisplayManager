@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+**Added**
+- `Filter=xBR` (experimental): the xBR-lv2 pixel-art upscaler (Hyllian, MIT), in the Alt+F cycle after Sharp. Falls
+  back to Linear if the GPU can't run its shader.
+
 ## 1.0.6 — 2026-09-28
 
 **Added**

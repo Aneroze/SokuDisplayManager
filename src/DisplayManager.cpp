@@ -45,6 +45,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
+#include "xbr.h"             // compiled ps_2_a / ps_2_b bytecode: g_xbrPS2a[], g_xbrPS2b[]
 #include "DisplayManagerOverlay.h"
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
@@ -99,7 +100,7 @@ static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // th123's fixed render size (grab region / pinned viewport); const
 static int     g_srcH      = 480;      // - th123 always renders 640x480, so this is not configurable
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
-enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_COUNT };
+enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_XBR, FILTER_COUNT };
 static int     g_filterCfg = FILTER_SHARP;
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
@@ -146,6 +147,7 @@ static Scene_t g_origBeginScene = nullptr;
 static Scene_t g_origEndScene   = nullptr;
 static bool    g_sceneDirect    = false;   // true when the two pointers above are trusted to be the runtime's
 static IDirect3DPixelShader9  *g_ps          = nullptr;  // sharp-bilinear upscale shader (Filter=Sharp)
+static IDirect3DPixelShader9  *g_psXbr       = nullptr;  // xBR-lv2 pixel-art upscale shader (Filter=xBR)
 static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device state around the shader draw
 // The game swapchain's backbuffer surface, for identity checks in the SetRenderTarget hook only. NOT
 // AddRef'd (the swapchain owns it); cached after CreateDevice/Reset and each Present, dropped before Reset.
@@ -208,7 +210,8 @@ static const char *modeName() {
 	return g_mode == MODE_INTEGER ? "IntegerScaling" : g_mode == MODE_CUSTOM ? "CustomResolution" : "FitToScreen";
 }
 static const char *filterName() {
-	return g_filterCfg == FILTER_POINT ? "Point" : g_filterCfg == FILTER_LINEAR ? "Linear" : "Sharp";
+	return g_filterCfg == FILTER_POINT ? "Point" : g_filterCfg == FILTER_LINEAR ? "Linear" :
+	       g_filterCfg == FILTER_XBR ? "xBR" : "Sharp";
 }
 
 // g_sharpness as "X.XX" (wsprintf has no %f).
@@ -299,7 +302,7 @@ static void computeOutput() {
 	if (outW < 1) outW = 1;
 	if (outH < 1) outH = 1;
 	g_scaleW = outW; g_scaleH = outH;
-	// Sharp draws with its shader; linear is only its StretchRect fallback.
+	// Sharp and xBR draw with their shaders; linear is only their StretchRect fallback.
 	g_filter = g_filterCfg == FILTER_POINT ? D3DTEXF_POINT : D3DTEXF_LINEAR;
 	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
 	     ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
@@ -483,6 +486,7 @@ static void releaseCapture() {
 	g_bbSurf = nullptr;
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
+	if (g_psXbr)       { g_psXbr->Release();       g_psXbr = nullptr; }
 	if (g_stageSurf)   { g_stageSurf->Release();   g_stageSurf = nullptr; }
 	if (g_captureSurf) { g_captureSurf->Release(); g_captureSurf = nullptr; }
 	if (g_captureTex)  { g_captureTex->Release();  g_captureTex = nullptr; }
@@ -505,6 +509,10 @@ static void createCapture(IDirect3DDevice9 *dev) {
 		                                  &g_stageSurf, nullptr);
 	// Sharp filter shader (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
+	// xBR needs more than ps_2_0: ps_2_a, else ps_2_b (any ps_3_0-class GPU takes either). Falls back to Sharp.
+	HRESULT hrXbr = dev->CreatePixelShader((const DWORD *)g_xbrPS2a, &g_psXbr);
+	if (FAILED(hrXbr)) hrXbr = dev->CreatePixelShader((const DWORD *)g_xbrPS2b, &g_psXbr);
+	logf("xBR shader: 0x%08lx", (long)hrXbr);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
 	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx stage=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat,
 	     (long)hr, (long)hrStage, (long)hrPs);
@@ -532,20 +540,21 @@ static bool g_composited = false;
 //
 // Returns false if nothing was drawn, so the caller can fall back to StretchRect instead of presenting a
 // stale or uninitialised stage.
-static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
-                      const RECT *dstRect) {
-	if (!g_ps || !g_captureTex || !g_stateBlock) return false;
+static bool drawShaderQuad(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target,
+                           const RECT *dstRect, IDirect3DPixelShader9 *ps, const float (*consts)[4], UINT nConsts,
+                           D3DTEXTUREFILTERTYPE samplerFilter) {
+	if (!ps || !g_captureTex || !g_stateBlock) return false;
 	g_stateBlock->Capture();
 	dev->SetRenderTarget(0, bb);
 	HRESULT hrScene = g_sceneDirect ? g_origBeginScene(dev) : dev->BeginScene();
 	if (FAILED(hrScene)) { g_stateBlock->Apply(); return false; }
 	if (target != bb) dev->SetRenderTarget(0, target);
-	dev->SetPixelShader(g_ps);
+	dev->SetPixelShader(ps);
 	dev->SetVertexShader(nullptr);
 	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
 	dev->SetTexture(0, g_captureTex);
-	dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+	dev->SetSamplerState(0, D3DSAMP_MINFILTER, samplerFilter);
+	dev->SetSamplerState(0, D3DSAMP_MAGFILTER, samplerFilter);
 	dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
 	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -557,8 +566,7 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 	dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
 	dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
 	dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
-	float c0[4] = { (float)g_srcW, (float)g_srcH, g_sharpness, 0.0f };
-	dev->SetPixelShaderConstantF(0, c0, 1);
+	dev->SetPixelShaderConstantF(0, &consts[0][0], nConsts);
 	float L = dstRect->left - 0.5f, T = dstRect->top - 0.5f, R = dstRect->right - 0.5f, B = dstRect->bottom - 0.5f;
 	struct V { float x, y, z, rhw, u, v; } q[4] = {
 		{ L, T, 0.0f, 1.0f, 0.0f, 0.0f },
@@ -571,6 +579,19 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 	if (g_sceneDirect) g_origEndScene(dev); else dev->EndScene();
 	g_stateBlock->Apply();
 	return SUCCEEDED(hr);
+}
+
+static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target, const RECT *dstRect) {
+	const float c[1][4] = { { (float)g_srcW, (float)g_srcH, g_sharpness, 0.0f } };
+	return drawShaderQuad(dev, bb, target, dstRect, g_ps, c, 1, D3DTEXF_LINEAR);
+}
+
+// xBR-lv2 (shader/xbr.hlsl): point-sampled neighbourhood; its edge blending width follows the output scale.
+static bool drawXbr(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target, const RECT *dstRect) {
+	float scale = (float)(dstRect->right - dstRect->left) / (float)g_srcW;
+	const float c[2][4] = { { (float)g_srcW, (float)g_srcH, 1.0f / g_srcW, 1.0f / g_srcH },
+	                        { scale > 0.0f ? 1.0f / scale : 1.0f, 0.0f, 0.0f, 0.0f } };
+	return drawShaderQuad(dev, bb, target, dstRect, g_psXbr, c, 2, D3DTEXF_POINT);
 }
 
 // Pin the game's viewport to its 640x480 (g_srcW x g_srcH) frame. th123 never calls SetViewport: it
@@ -590,7 +611,7 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 // exclusive flip, and (unlike a DrawPrimitiveUP quad) needs no BeginScene/EndScene, so it can't
 // re-trigger a mod's per-scene overlay redraw. Rows are 5 bits, MSB = leftmost column. Only the
 // characters used by the OSD messages are defined; OSD_CHARS is the parallel lookup key (uppercase).
-static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUX";
+static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXB";
 static const BYTE OSD_FONT[][7] = {
 	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
 	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
@@ -619,6 +640,7 @@ static const BYTE OSD_FONT[][7] = {
 	{0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, // T
 	{0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, // U
 	{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // X
+	{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B
 };
 static int osdGlyph(char c) {
 	for (int i = 0; OSD_CHARS[i]; i++) if (OSD_CHARS[i] == c) return i;
@@ -733,9 +755,11 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			IDirect3DSurface9 *target = g_stageSurf ? g_stageSurf : bb;
 			HRESULT b = S_OK, c = S_OK;
 			if (!g_stageSurf) fillBorders(dev, bb, dstRect);
-			// Sharp falls back to StretchRect (g_filter resolves to linear for Sharp) if the shader pass
+			// Sharp and xBR fall back to StretchRect (g_filter resolves to linear for them) if the shader pass
 			// couldn't draw - otherwise a stale / uninitialised frame would be shown.
-			if (g_filterCfg != FILTER_SHARP || !drawSharp(dev, bb, target, &dstRect))
+			bool drawn = g_filterCfg == FILTER_SHARP ? drawSharp(dev, bb, target, &dstRect) :
+			             g_filterCfg == FILTER_XBR   ? drawXbr(dev, bb, target, &dstRect) : false;
+			if (!drawn)
 				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
 			if (g_stageSurf) {
 				b = dev->ColorFill(bb, nullptr, g_bgColor);                                  // borders
@@ -1155,6 +1179,7 @@ static void loadConfig() {
 	GetPrivateProfileStringA("Display", "Filter", "Sharp", filt, sizeof(filt), g_iniPath);
 	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = FILTER_POINT;
 	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = FILTER_LINEAR;
+	else if (StrCmpIA(filt, "xBR") == 0)    g_filterCfg = FILTER_XBR;
 	else                                    g_filterCfg = FILTER_SHARP;   // the default; also the removed "Auto"
 
 	char sharp[32] = {0};
@@ -1421,10 +1446,10 @@ static void doAction(int act) {
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
 	case ACT_FILTER:
-		g_filterCfg = (g_filterCfg + 1) % FILTER_COUNT;   // Point -> Linear -> Sharp -> Point
+		g_filterCfg = (g_filterCfg + 1) % FILTER_COUNT;   // Point -> Linear -> Sharp -> xBR -> Point
 		if (g_active) computeOutput();                    // re-resolve g_filter now; next frame's present uses it
 		if (g_filterCfg == FILTER_SHARP) showSharpnessOsd();
-		else showOsd(g_filterCfg == FILTER_POINT ? "POINT" : "LINEAR");
+		else showOsd(g_filterCfg == FILTER_POINT ? "POINT" : g_filterCfg == FILTER_XBR ? "XBR" : "LINEAR");
 		logf("hotkey: filter -> %s", filterName());
 		break;
 	case ACT_SHARP_DOWN:
