@@ -45,7 +45,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
-#include "xbr.h"             // compiled ps_2_a / ps_2_b bytecode: g_xbrPS2a[], g_xbrPS2b[]
+#include "xbr.h"             // compiled ps_2_b bytecode: g_xbrPS2b[]
 #include "DisplayManagerOverlay.h"
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
@@ -102,6 +102,11 @@ static int     g_srcH      = 480;      // - th123 always renders 640x480, so thi
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
 enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_XBR, FILTER_COUNT };
 static int     g_filterCfg = FILTER_SHARP;
+// xBR knobs (shader/xbr.hlsl c1), live-cycled by the Xbr* hotkeys.
+static float   g_xbrStrength = 1.0f;   // 0..1 blend: plain texel .. full xBR
+static int     g_xbrCorner   = 1;      // corner type 0..3 = A..D
+static bool    g_xbrSlopes   = true;   // also smooth 30/60-degree edges (xBR level 2)
+static float   g_xbrWidth    = 1.0f;   // edge anti-aliasing band, x the original
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -122,7 +127,8 @@ static FILE   *g_logFile   = nullptr;
 // Hotkeys: the configured modifier + a per-action key. VK code 0 = that hotkey is disabled (which is
 // also what a commented-out / missing ini line produces).
 enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER,
-              ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_COUNT };
+              ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_XBR_STRENGTH, ACT_XBR_CORNER, ACT_XBR_SLOPES,
+              ACT_XBR_WIDTH, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;
@@ -228,6 +234,11 @@ static const char *filterName() {
 }
 
 // g_sharpness as "X.XX" (wsprintf has no %f).
+static void formatHundredths(float v, char *buf) {
+	int hundredths = (int)(v * 100.0f + 0.5f);
+	wsprintfA(buf, "%d.%02d", hundredths / 100, hundredths % 100);
+}
+
 static void formatSharpness(char *buf) {
 	int hundredths = (int)(g_sharpness * 100.0f + 0.5f);
 	wsprintfA(buf, "%d.%02d", hundredths / 100, hundredths % 100);
@@ -583,9 +594,8 @@ static void createCapture(IDirect3DDevice9 *dev) {
 		                                  &g_stageSurf, nullptr);
 	// Sharp filter shader (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
-	// xBR needs more than ps_2_0: ps_2_a, else ps_2_b (any ps_3_0-class GPU takes either). Falls back to Sharp.
-	HRESULT hrXbr = dev->CreatePixelShader((const DWORD *)g_xbrPS2a, &g_psXbr);
-	if (FAILED(hrXbr)) hrXbr = dev->CreatePixelShader((const DWORD *)g_xbrPS2b, &g_psXbr);
+	// xBR needs ps_2_b (any ps_3_0-class GPU takes it); if it can't be created, xBR falls back to StretchRect.
+	HRESULT hrXbr = dev->CreatePixelShader((const DWORD *)g_xbrPS2b, &g_psXbr);
 	logf("xBR shader: 0x%08lx", (long)hrXbr);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
 	createMsaa(dev);
@@ -665,7 +675,8 @@ static bool drawSharp(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSur
 static bool drawXbr(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect3DSurface9 *target, const RECT *dstRect) {
 	float scale = (float)(dstRect->right - dstRect->left) / (float)g_srcW;
 	const float c[2][4] = { { (float)g_srcW, (float)g_srcH, 1.0f / g_srcW, 1.0f / g_srcH },
-	                        { scale > 0.0f ? 1.0f / scale : 1.0f, 0.0f, 0.0f, 0.0f } };
+	                        { g_xbrWidth / (scale > 0.0f ? scale : 1.0f), g_xbrStrength, g_xbrSlopes ? 1.0f : 0.0f,
+	                          (float)g_xbrCorner } };
 	return drawShaderQuad(dev, bb, target, dstRect, g_psXbr, c, 2, D3DTEXF_POINT);
 }
 
@@ -686,7 +697,7 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 // exclusive flip, and (unlike a DrawPrimitiveUP quad) needs no BeginScene/EndScene, so it can't
 // re-trigger a mod's per-scene overlay redraw. Rows are 5 bits, MSB = leftmost column. Only the
 // characters used by the OSD messages are defined; OSD_CHARS is the parallel lookup key (uppercase).
-static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXBM";
+static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXBMDW";
 static const BYTE OSD_FONT[][7] = {
 	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
 	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
@@ -717,6 +728,8 @@ static const BYTE OSD_FONT[][7] = {
 	{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, // X
 	{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, // B
 	{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, // M
+	{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, // D
+	{0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, // W
 };
 static int osdGlyph(char c) {
 	for (int i = 0; OSD_CHARS[i]; i++) if (OSD_CHARS[i] == c) return i;
@@ -1303,6 +1316,21 @@ static void loadConfig() {
 	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
 	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
 	g_msaaIni      = g_msaaCfg;
+	{   // xBR knobs
+		char v[32] = {0};
+		GetPrivateProfileStringA("Display", "XbrStrength", "1.0", v, sizeof(v), g_iniPath);
+		g_xbrStrength = (float)atof(v);
+		if (g_xbrStrength < 0.0f) g_xbrStrength = 0.0f;
+		if (g_xbrStrength > 1.0f) g_xbrStrength = 1.0f;
+		GetPrivateProfileStringA("Display", "XbrCorner", "B", v, sizeof(v), g_iniPath);
+		char cc = v[0] >= 'a' ? v[0] - 32 : v[0];
+		g_xbrCorner = (cc >= 'A' && cc <= 'D') ? cc - 'A' : 1;
+		g_xbrSlopes = GetPrivateProfileIntA("Display", "XbrSlopes", 1, g_iniPath) != 0;
+		GetPrivateProfileStringA("Display", "XbrWidth", "1.0", v, sizeof(v), g_iniPath);
+		g_xbrWidth = (float)atof(v);
+		if (g_xbrWidth < 0.05f) g_xbrWidth = 0.05f;
+		if (g_xbrWidth > 4.0f) g_xbrWidth = 4.0f;
+	}
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
@@ -1315,7 +1343,8 @@ static void loadConfig() {
 
 	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
 	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter",
-	                                 "SharpnessDown", "SharpnessUp", "ToggleMSAA" };
+	                                 "SharpnessDown", "SharpnessUp", "ToggleMSAA", "XbrStrength", "XbrCorner",
+	                                 "XbrSlopes", "XbrWidth" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
@@ -1568,6 +1597,38 @@ static void doAction(int act) {
 		showSharpnessOsd();
 		logf("hotkey: filter=Sharp sharpness -> %.2f", g_sharpness);
 		break;
+	case ACT_XBR_STRENGTH: case ACT_XBR_CORNER: case ACT_XBR_SLOPES: case ACT_XBR_WIDTH: {
+		// Development knobs: each cycles one xBR setting and switches to xBR. Session only (not written to the ini);
+		// the log gets the resulting values so they can be copied into the ini.
+		static const float widths[] = { 0.25f, 0.5f, 1.0f, 2.0f };
+		char msg[32], num[16];
+		g_filterCfg = FILTER_XBR;
+		if (g_active) computeOutput();
+		if (act == ACT_XBR_STRENGTH) {
+			g_xbrStrength -= 0.2f;
+			if (g_xbrStrength < 0.15f) g_xbrStrength = 1.0f;       // 1.0 -> 0.8 -> ... -> 0.2 -> 1.0
+			formatHundredths(g_xbrStrength, num);
+			wsprintfA(msg, "XBR STR %s", num);
+		} else if (act == ACT_XBR_CORNER) {
+			g_xbrCorner = (g_xbrCorner + 1) % 4;                    // A -> B -> C -> D
+			wsprintfA(msg, "XBR CORNER %c", 'A' + g_xbrCorner);
+		} else if (act == ACT_XBR_SLOPES) {
+			g_xbrSlopes = !g_xbrSlopes;
+			wsprintfA(msg, "XBR 30 60 %s", g_xbrSlopes ? "ON" : "OFF");
+		} else {
+			int k = 0;
+			while (k < 3 && widths[k] < g_xbrWidth - 0.01f) k++;      // current (or next larger) step
+			g_xbrWidth = widths[(k + 1) % 4];                         // 1.0 -> 2.0 -> 0.25 -> 0.5 -> 1.0
+			formatHundredths(g_xbrWidth, num);
+			wsprintfA(msg, "XBR WIDTH %s", num);
+		}
+		showOsd(msg);
+		char s[16], w[16];
+		formatHundredths(g_xbrStrength, s);
+		formatHundredths(g_xbrWidth, w);
+		logf("hotkey: xBR XbrStrength=%s XbrCorner=%c XbrSlopes=%d XbrWidth=%s", s, 'A' + g_xbrCorner, g_xbrSlopes, w);
+		break;
+	}
 	case ACT_MSAA: {
 		// Off <-> MultiSample from the ini (x8 when that is 0). Session only: not written to the ini. Applied on the
 		// render thread after the next Present; windowed, it takes effect when going fullscreen.

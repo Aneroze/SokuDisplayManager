@@ -25,6 +25,7 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | Alt+0 | `FitToScreen` | Switch to `FitToScreen`. |
 | Alt+F | `CycleFilter` | Cycle the filter. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
+| Alt+S / C / E / W | `XbrStrength` / `XbrCorner` / `XbrSlopes` / `XbrWidth` | Development: cycle an xBR setting (switches to xBR). Not saved; see the ini. |
 | Alt+M | `ToggleMSAA` | Fullscreen: turn MSAA on (`MultiSample`, or ×8 if that is 0) / off. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 

@@ -1,13 +1,18 @@
-// xBR-lv2 pixel-art upscaler for DisplayManager. Build: fxc /T ps_2_a /E main /O3 /Vn g_xbrPS2a (and ps_2_b /
-// g_xbrPS2b), both concatenated into src/xbr.h. ps_2_x (not ps_3_0) so it runs with the pre-transformed quad and no
-// vertex shader; ps_2_0 is too small for it.
-// Algorithm and constants: xBR level 2 by Hyllian (MIT license, see below), corner type B, ported to D3D9 HLSL.
+// xBR-lv2 pixel-art upscaler for DisplayManager. Build: fxc /T ps_2_b /E main /O3 /Vn g_xbrPS2b /Fh src/xbr.h.
+// ps_2_b (32 temps, 512 slots; any ps_3_0-class GPU and DXVK accept it) because it needs no vertex shader with
+// the pre-transformed quad, unlike ps_3_0; ps_2_0 is too small and ps_2_a runs out of temp registers.
+// Algorithm and constants: xBR level 2 by Hyllian (MIT license, see below), ported to D3D9 HLSL, with its corner
+// types A-D, the 30/60-degree (level 2) edges, the edge width and a final blend with the plain texel as live knobs.
 // It finds edges in a 5x5 neighbourhood of each source texel (on a luma metric), decides which of the four corners
 // of the texel an edge crosses at 30/45/60 degrees, and blends the output pixel toward the neighbour across that edge;
 // flat areas stay point-sampled. Works at any output scale; the anti-aliasing width follows the scale.
 //
 // c0 = (texW, texH, 1/texW, 1/texH)
-// c1 = (1/scale, 0, 0, 0)    scale = output size / source size
+// c1 = (width/scale, strength, slopes, corner)
+//      width    edge anti-aliasing band, 1 = the original (scale = output size / source size)
+//      strength 0..1: blend between the plain texel (0) and the full xBR result (1)
+//      slopes   1 = also smooth 30/60-degree edges (level 2), 0 = 45-degree diagonals only
+//      corner   0..3 = corner type A (roundest) .. D (keeps the most corners / small details)
 // s0 = the captured 640x480 frame, POINT filtered, CLAMP addressed.
 //
 // Copyright (C) 2011-2016 Hyllian - sergiogdb@gmail.com
@@ -52,22 +57,20 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
 	float2 ctr    = (base + 0.5) * c0.zw;      // center of texel E
 	float  dx = c0.z, dy = c0.w;
 
-	float3 A1 = tex2D(s0, ctr + float2(-dx, -2*dy)).rgb, B1 = tex2D(s0, ctr + float2(0, -2*dy)).rgb, C1 = tex2D(s0, ctr + float2(dx, -2*dy)).rgb;
-	float3 A  = tex2D(s0, ctr + float2(-dx,   -dy)).rgb, B  = tex2D(s0, ctr + float2(0,   -dy)).rgb, C  = tex2D(s0, ctr + float2(dx,   -dy)).rgb;
-	float3 D  = tex2D(s0, ctr + float2(-dx,     0)).rgb, E  = tex2D(s0, ctr).rgb,                     F  = tex2D(s0, ctr + float2(dx,     0)).rgb;
-	float3 G  = tex2D(s0, ctr + float2(-dx,    dy)).rgb, H  = tex2D(s0, ctr + float2(0,    dy)).rgb, I  = tex2D(s0, ctr + float2(dx,    dy)).rgb;
-	float3 G5 = tex2D(s0, ctr + float2(-dx,  2*dy)).rgb, H5 = tex2D(s0, ctr + float2(0,  2*dy)).rgb, I5 = tex2D(s0, ctr + float2(dx,  2*dy)).rgb;
-	float3 A0 = tex2D(s0, ctr + float2(-2*dx, -dy)).rgb, D0 = tex2D(s0, ctr + float2(-2*dx,  0)).rgb, G0 = tex2D(s0, ctr + float2(-2*dx, dy)).rgb;
-	float3 C4 = tex2D(s0, ctr + float2( 2*dx, -dy)).rgb, F4 = tex2D(s0, ctr + float2( 2*dx,  0)).rgb, I4 = tex2D(s0, ctr + float2( 2*dx, dy)).rgb;
+	// Only the center and its 4 neighbours are needed as colors; the rest go straight to luma (keeps ps_2_a's
+	// temp registers in budget).
+	#define LUM(ox, oy) dot(tex2D(s0, ctr + float2((ox) * dx, (oy) * dy)).rgb, LUMA)
+	float3 B = tex2D(s0, ctr + float2(0, -dy)).rgb, D = tex2D(s0, ctr + float2(-dx, 0)).rgb, E = tex2D(s0, ctr).rgb;
+	float3 F = tex2D(s0, ctr + float2(dx, 0)).rgb,  H = tex2D(s0, ctr + float2(0, dy)).rgb;
 
 	// The four components are the four 90-degree rotations of the same neighbourhood (x = the bottom-right corner).
 	float4 b = float4(dot(B, LUMA), dot(D, LUMA), dot(H, LUMA), dot(F, LUMA));
-	float4 c = float4(dot(C, LUMA), dot(A, LUMA), dot(G, LUMA), dot(I, LUMA));
+	float4 c = float4(LUM(1, -1), LUM(-1, -1), LUM(-1, 1), LUM(1, 1));                 // C A G I
 	float4 e = dot(E, LUMA).xxxx;
 	float4 d = b.yzwx, f = b.wxyz, g = c.zwxy, h = b.zwxy, i = c.wxyz;
-	float4 i4 = float4(dot(I4, LUMA), dot(C1, LUMA), dot(A0, LUMA), dot(G5, LUMA));
-	float4 i5 = float4(dot(I5, LUMA), dot(C4, LUMA), dot(A1, LUMA), dot(G0, LUMA));
-	float4 h5 = float4(dot(H5, LUMA), dot(F4, LUMA), dot(B1, LUMA), dot(D0, LUMA));
+	float4 i4 = float4(LUM(2, 1), LUM(1, -2), LUM(-2, -1), LUM(-1, 2));                 // I4 C1 A0 G5
+	float4 i5 = float4(LUM(1, 2), LUM(2, -1), LUM(-1, -2), LUM(-2, 1));                 // I5 C4 A1 G0
+	float4 h5 = float4(LUM(0, 2), LUM(2, 0), LUM(0, -2), LUM(-2, 0));                   // H5 F4 B1 D0
 	float4 f4 = h5.yzwx;
 
 	// Lines below which a corner gets interpolated (45, 30 and 60 degrees).
@@ -76,10 +79,21 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
 	float4 fxUp   = Ay * fp.y + By * fp.x;
 
 	float4 lv0 = ne(e, f) * ne(e, h);
-	float4 lv1 = lv0 * saturate((1 - eq(f, b)) * (1 - eq(h, d)) + eq(e, i) * (1 - eq(f, i4)) * (1 - eq(h, i5)) +
-	                            eq(e, g) + eq(e, c));                                         // corner type B
-	float4 lv2Left = ne(e, g) * ne(d, g);
-	float4 lv2Up   = ne(e, c) * ne(b, c);
+	// Corner types (extra conditions before a corner is rounded): A none, B/C the usual detail checks, D = B plus
+	// keeping 2-texel-wide features.
+	float4 c1v = i4.yzwx, g0v = i5.wxyz;       // C1 and G0 in each rotation
+	float4 condB = saturate((1 - eq(f, b)) * (1 - eq(h, d)) + eq(e, i) * (1 - eq(f, i4)) * (1 - eq(h, i5)) +
+	                        eq(e, g) + eq(e, c));
+	float4 condC = saturate((1 - eq(f, b)) * (1 - eq(f, c)) + (1 - eq(h, d)) * (1 - eq(h, g)) +
+	                        eq(e, i) * saturate((1 - eq(f, f4)) * (1 - eq(f, i4)) + (1 - eq(h, h5)) * (1 - eq(h, i5))) +
+	                        eq(e, g) + eq(e, c));
+	float4 condD = condB * saturate(ne(f, f4) * ne(f, i) + ne(h, h5) * ne(h, i) + ne(h, g) + ne(f, c) +
+	                                eq(b, c1v) * eq(d, g0v));
+	float  corner = c1.w;
+	float4 cond = corner < 0.5 ? 1.0 : corner < 1.5 ? condB : corner < 2.5 ? condC : condD;
+	float4 lv1 = lv0 * cond;
+	float4 lv2Left = ne(e, g) * ne(d, g) * c1.z;
+	float4 lv2Up   = ne(e, c) * ne(b, c) * c1.z;
 
 	float  dl = c1.x;
 	float4 delta  = dl.xxxx;
@@ -107,5 +121,5 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0 {
 	float3 res2 = lerp(E,    lerp(F, B, px.y), m.y);
 	res2        = lerp(res2, lerp(D, H, px.w), m.w);
 	float3 res  = lerp(res1, res2, step(cdf(E, res1), cdf(E, res2)));
-	return float4(res, 1.0);
+	return float4(lerp(E, res, c1.y), 1.0);
 }
