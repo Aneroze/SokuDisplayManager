@@ -80,6 +80,14 @@ on zoomed or filtered content and may add artifacts. That's the experiment.
   Persisted like the other filters.
 - Optional knob, only if needed after seeing it: xBR's edge-strength / corner-type constant as `XbrStrength`.
 
+### Result (2026-09-28): implemented on branch `feat/xbr`, working
+`shader/xbr.hlsl` → `src/xbr.h` (fxc ps_2_a 188 slots, + ps_2_b fallback; ps_2_0 too small; ps_2_x needs no vertex
+shader). `drawSharp` generalized into `drawShaderQuad`; `Filter=xBR`, Alt+F cycles Point → Linear → Sharp → xBR,
+OSD "XBR" (B glyph added). Verified on the Copy install (x2, 2560x1440): shader created (S_OK), frames captured
+with a test-only runtime filter switch. Output looks like proper xBR (rounded sprite contours, clean HUD text);
+offline numpy reference `xbr_ref.py` (scratch) matched the synthetic pixel-art test. Pending: the user's own look
+in-game (Alt+F), then merge + release decision (with or without MSAA).
+
 ### Test
 Same dump method: one paused frame per filter (Point, Sharp, xBR) at x2 and at FitToScreen 2.25x; crop character
 outlines, text/HUD, a zoomed-out moment and a 3D stage. The user judges the look.
