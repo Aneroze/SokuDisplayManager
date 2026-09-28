@@ -112,6 +112,7 @@ static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
 static bool    g_allowWinKey = false;  // [Input] AllowWinKey: drop the game's DISCL_NOWINKEY (vanilla blocks the Win key)
+static int     g_msaaCfg   = 0;        // MultiSample: requested MSAA sample count (0 = off)
 static bool    g_log       = false;
 static FILE   *g_logFile   = nullptr;
 
@@ -151,6 +152,16 @@ static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device 
 // AddRef'd (the swapchain owns it); cached after CreateDevice/Reset and each Present, dropped before Reset.
 static IDirect3DSurface9      *g_bbSurf      = nullptr;
 static bool                    g_inPost      = false;    // inside our Present post-process (render thread)
+// MSAA (MultiSample=N, fullscreen only): the game draws into our own multisampled 640x480 target (+ depth) instead
+// of the backbuffer, and the Present grab resolves it. The backbuffer stays single-sampled, so the rest of the
+// post-process and other mods' overlays work on it unchanged. The game never calls SetRenderTarget itself, so
+// binding ours after CreateDevice/Reset and after every Present is enough.
+static IDirect3DSurface9      *g_msRT        = nullptr;
+static IDirect3DSurface9      *g_msDS        = nullptr;
+static IDirect3DSurface9      *g_autoDS      = nullptr;  // the device's own depth buffer (not AddRef'd), rebound before Reset
+static bool                    g_gameDepth   = false;    // the game asked for an auto depth-stencil
+static D3DFORMAT               g_gameDepthFmt = D3DFMT_UNKNOWN;
+static D3DMULTISAMPLE_TYPE     g_msType      = D3DMULTISAMPLE_NONE;   // what we actually got
 static float                   g_sharpness   = 1.50f;    // 1 = aligned bilinear; higher = crisper toward point
 static const float             SHARP_MIN     = 1.0f;     // clamp: 1.0 = bilinear
 static const float             SHARP_MAX     = 4.0f;     // clamp: ~4.0 is already visually point (shader
@@ -406,6 +417,8 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 	if (!g_enabled || !pp) { g_active = false; return; }
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
 	g_wantFullscreen = !pp->Windowed;                    // the game's real intent (before we override it)
+	g_gameDepth = pp->EnableAutoDepthStencil != FALSE;
+	g_gameDepthFmt = pp->AutoDepthStencilFormat;
 
 	if (pp->Windowed) {
 		g_active = false;
@@ -480,12 +493,65 @@ static HRESULT callWithFallback(const char *what, F call, const D3DPRESENT_PARAM
 
 // ---- capture render target (holds the game's rendered frame so we can rescale it) ----------------
 static void releaseCapture() {
+	if (g_msRT) {   // Reset needs our default-pool surfaces unbound and released: put the device's own back
+		IDirect3DDevice9 *dev = GAME_DEVICE;
+		if (dev) {
+			if (g_bbSurf) dev->SetRenderTarget(0, g_bbSurf);
+			dev->SetDepthStencilSurface(g_autoDS);
+		}
+	}
+	if (g_msDS)        { g_msDS->Release();        g_msDS = nullptr; }
+	if (g_msRT)        { g_msRT->Release();        g_msRT = nullptr; }
+	g_autoDS = nullptr;
+	g_msType = D3DMULTISAMPLE_NONE;
 	g_bbSurf = nullptr;
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
 	if (g_stageSurf)   { g_stageSurf->Release();   g_stageSurf = nullptr; }
 	if (g_captureSurf) { g_captureSurf->Release(); g_captureSurf = nullptr; }
 	if (g_captureTex)  { g_captureTex->Release();  g_captureTex = nullptr; }
+}
+
+// Point the game's rendering at our multisampled target (and depth). The viewport follows the 640x480 target.
+static void bindMsaa(IDirect3DDevice9 *dev) {
+	if (!g_msRT) return;
+	dev->SetRenderTarget(0, g_msRT);
+	if (g_msDS) dev->SetDepthStencilSurface(g_msDS);
+}
+
+static void createMsaa(IDirect3DDevice9 *dev) {
+	if (g_msaaCfg < 2) return;
+	D3DDEVICE_CREATION_PARAMETERS cp = {};
+	IDirect3D9 *d3d = nullptr;
+	if (FAILED(dev->GetCreationParameters(&cp)) || FAILED(dev->GetDirect3D(&d3d)) || !d3d) return;
+	BOOL windowed = g_borderlessActive ? TRUE : FALSE;
+	D3DMULTISAMPLE_TYPE type = D3DMULTISAMPLE_NONE;
+	for (int n = g_msaaCfg > 16 ? 16 : g_msaaCfg; n >= 2; n--) {   // the highest supported count <= the request
+		D3DMULTISAMPLE_TYPE t = (D3DMULTISAMPLE_TYPE)n;
+		if (FAILED(d3d->CheckDeviceMultiSampleType(cp.AdapterOrdinal, cp.DeviceType, g_bbFormat, windowed, t, nullptr)))
+			continue;
+		if (g_gameDepth && FAILED(d3d->CheckDeviceMultiSampleType(cp.AdapterOrdinal, cp.DeviceType, g_gameDepthFmt,
+		                                                         windowed, t, nullptr)))
+			continue;
+		type = t;
+		break;
+	}
+	d3d->Release();
+	if (type == D3DMULTISAMPLE_NONE) { logf("MSAA x%d: not supported - off", g_msaaCfg); return; }
+	HRESULT hrRT = dev->CreateRenderTarget((UINT)g_srcW, (UINT)g_srcH, g_bbFormat, type, 0, FALSE, &g_msRT, nullptr);
+	HRESULT hrDS = S_FALSE;
+	if (SUCCEEDED(hrRT) && g_gameDepth)
+		hrDS = dev->CreateDepthStencilSurface((UINT)g_srcW, (UINT)g_srcH, g_gameDepthFmt, type, 0, FALSE, &g_msDS, nullptr);
+	if (FAILED(hrRT) || FAILED(hrDS)) {
+		if (g_msRT) { g_msRT->Release(); g_msRT = nullptr; }
+		logf("MSAA x%d: creating the targets failed (rt=0x%08lx ds=0x%08lx) - off", (int)type, (long)hrRT, (long)hrDS);
+		return;
+	}
+	IDirect3DSurface9 *ds = nullptr;
+	if (SUCCEEDED(dev->GetDepthStencilSurface(&ds)) && ds) { g_autoDS = ds; ds->Release(); }
+	g_msType = type;
+	bindMsaa(dev);
+	logf("MSAA x%d on (requested x%d, depth %s fmt=%d)", (int)type, g_msaaCfg, g_msDS ? "yes" : "no", (int)g_gameDepthFmt);
 }
 
 static void createCapture(IDirect3DDevice9 *dev) {
@@ -506,6 +572,7 @@ static void createCapture(IDirect3DDevice9 *dev) {
 	// Sharp filter shader (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
 	dev->CreateStateBlock(D3DSBT_ALL, &g_stateBlock);
+	createMsaa(dev);
 	logf("createCapture %dx%d fmt=%d -> tex=0x%08lx stage=0x%08lx ps=0x%08lx", g_srcW, g_srcH, (int)g_bbFormat,
 	     (long)hr, (long)hrStage, (long)hrPs);
 }
@@ -725,7 +792,14 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			RECT srcRect = { 0, 0, g_srcW, g_srcH };
 			LONG x = ((LONG)g_bbW - g_scaleW) / 2, y = ((LONG)g_bbH - g_scaleH) / 2;
 			RECT dstRect = { x, y, x + g_scaleW, y + g_scaleH };
-			HRESULT a = dev->StretchRect(bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE); // 1:1 grab
+			// 1:1 grab (with MSAA: the resolve of the game's multisampled target). Our 640x480 multisampled depth
+			// can't go with the native-size backbuffer the rest of the post-process draws into, so unbind it;
+			// bindMsaa puts everything back after Present.
+			HRESULT a = dev->StretchRect(g_msRT ? g_msRT : bb, &srcRect, g_captureSurf, nullptr, D3DTEXF_NONE);
+			if (g_msRT) {
+				dev->SetRenderTarget(0, bb);
+				if (g_msDS) dev->SetDepthStencilSurface(nullptr);
+			}
 			// Every output pixel comes from this one upscale pass - never re-blit part of the frame with a
 			// different filter (that blurred the corner overlapping the grab region at non-integer scales,
 			// KNOWN-BUGS Bug 4). Without direct scene calls the upscale goes into the stage and the backbuffer
@@ -742,8 +816,11 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 				c = dev->StretchRect(g_stageSurf, &dstRect, bb, &dstRect, D3DTEXF_NONE);   // 1:1 copy
 			}
 			if (!g_presentLogged) {
-				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f scene=%s",
-				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness, g_sceneDirect ? "direct" : "vtable+stage");
+				DWORD msaaRS = 0;
+				dev->GetRenderState(D3DRS_MULTISAMPLEANTIALIAS, &msaaRS);
+				logf("first present: grab=0x%08lx fill=0x%08lx blit=0x%08lx filterCfg=%d sharp=%.2f scene=%s msaa=x%d rs=%lu",
+				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness, g_sceneDirect ? "direct" : "vtable+stage",
+				     (int)g_msType, msaaRS);
 				g_presentLogged = true;
 			}
 			runOverlays(DM_OVERLAY_DRAW, dev, bb, &dstRect);
@@ -757,6 +834,10 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 	}
 	HRESULT hr = oSCPresent(sc, src, dst, wnd, dirty, flags);
 	if (hr != D3DERR_WASSTILLDRAWING) g_composited = false;   // presented (or dropped): next call is a new frame
+	if (g_msRT && g_active) {                                  // the next frame draws into the MSAA target again
+		IDirect3DDevice9 *dev = GAME_DEVICE;
+		if (dev) bindMsaa(dev);
+	}
 	return hr;
 }
 
@@ -767,7 +848,8 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 // may hook this slot too; hookSlot chains to whatever was there.
 static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDirect3DSurface9 *rt) {
 	HRESULT hr = oSetRenderTarget(dev, index, rt);
-	if (index == 0 && g_active && !g_inPost && rt && rt == g_bbSurf && dev == GAME_DEVICE && SUCCEEDED(hr))
+	if (index == 0 && g_active && !g_inPost && rt && (rt == g_bbSurf || rt == g_msRT) && dev == GAME_DEVICE &&
+	    SUCCEEDED(hr))
 		setGameViewport(dev);
 	return hr;
 }
@@ -957,6 +1039,10 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 		return oCreateDevice(self, adapter, type, focus, behavior, pp, out);
 	logf("CreateDevice: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+	if (pp) logf("  game pp: fmt=%d count=%u ms=%d swap=%d autoDepth=%d depthFmt=%d flags=0x%lx interval=0x%x",
+	             (int)pp->BackBufferFormat, pp->BackBufferCount, (int)pp->MultiSampleType, (int)pp->SwapEffect,
+	             pp->EnableAutoDepthStencil, (int)pp->AutoDepthStencilFormat, (unsigned long)pp->Flags,
+	             pp->PresentationInterval);
 	g_adapterMon = self->GetAdapterMonitor(adapter);
 	g_d3d = self; g_adapter = adapter;
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
@@ -1171,6 +1257,7 @@ static void loadConfig() {
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
 	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
+	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
@@ -1575,9 +1662,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d",
+	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d multiSample=%d",
 	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey);
+	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey, g_msaaCfg);
 	return TRUE;
 }
 
