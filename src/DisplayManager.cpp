@@ -45,6 +45,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
+#include "DisplayManagerOverlay.h"
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
 // Build hash the loader passes to CheckVersion; only this exact build is patched.
@@ -669,6 +670,34 @@ static void fillBorders(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT
 	if (d.right  < W) { RECT r = { d.right, d.top, W, d.bottom };  dev->ColorFill(bb, &r, g_bgColor); }
 }
 
+// ---- overlays (DisplayManagerOverlay.h) -----------------------------------------------------------
+// Other mods' callbacks, run after the frame is composited. Registered from any thread, called on the render
+// thread; a slim lock keeps the table consistent (it is only held for the copy, never across a callback).
+static const int MAX_OVERLAYS = 8;
+struct Overlay { DisplayManager_OverlayProc proc; void *user; };
+static Overlay g_overlays[MAX_OVERLAYS];
+static int     g_overlayCount = 0;
+static SRWLOCK g_overlayLock = SRWLOCK_INIT;
+
+static void runOverlays(int event, IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, const RECT *gameRect) {
+	Overlay list[MAX_OVERLAYS];
+	AcquireSRWLockShared(&g_overlayLock);
+	int n = g_overlayCount;
+	memcpy(list, g_overlays, n * sizeof(Overlay));
+	ReleaseSRWLockShared(&g_overlayLock);
+	if (!n) return;
+	DisplayManager_OverlayInfo info = {};
+	info.size = sizeof info;
+	info.device = dev;
+	info.backbuffer = bb;
+	info.bbWidth = g_bbW;
+	info.bbHeight = g_bbH;
+	info.bbFormat = g_bbFormat;
+	if (gameRect) info.gameRect = *gameRect;
+	info.borderColor = g_bgColor;
+	for (int i = 0; i < n; i++) list[i].proc(event, &info, list[i].user);
+}
+
 // The swapchain/device vtables are shared by every D3D9 swapchain/device in the process (overlays, mods that
 // make their own device), so the hooks only act on the game's. Fast path: the game's swapchain global; else
 // (e.g. a wrapper stored its own object there) compare with the game device's implicit swapchain. Neither
@@ -717,6 +746,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 				     (long)a, (long)b, (long)c, g_filterCfg, g_sharpness, g_sceneDirect ? "direct" : "vtable+stage");
 				g_presentLogged = true;
 			}
+			runOverlays(DM_OVERLAY_DRAW, dev, bb, &dstRect);
 			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
 			g_inPost = false;
 			bb->Release();
@@ -747,6 +777,7 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
 	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
 	releaseCapture();               // default-pool resources must be freed before Reset
+	runOverlays(DM_OVERLAY_RESET, dev, nullptr, nullptr);   // ...theirs too
 	g_composited = false;           // Reset discards the backbuffer contents
 	if (!g_d3d) {                   // device hooked without our CreateDevice (device-watch fallback)
 		D3DDEVICE_CREATION_PARAMETERS cp; IDirect3D9 *d3d = nullptr;
@@ -1499,6 +1530,35 @@ extern "C" __declspec(dllexport) BOOL DisplayManager_GetGameRect(RECT *out) {
 	out->right  = MulDiv(x + w, c.right,  (int)bbW);
 	out->bottom = MulDiv(y + h, c.bottom, (int)bbH);
 	return TRUE;
+}
+
+// Overlay API: see DisplayManagerOverlay.h.
+extern "C" __declspec(dllexport) BOOL __cdecl DisplayManager_AddOverlay(DisplayManager_OverlayProc proc, void *user) {
+	if (!proc || !g_enabled) return FALSE;
+	BOOL ok = FALSE;
+	AcquireSRWLockExclusive(&g_overlayLock);
+	for (int i = 0; i < g_overlayCount; i++)
+		if (g_overlays[i].proc == proc && g_overlays[i].user == user) ok = TRUE;
+	if (!ok && g_overlayCount < MAX_OVERLAYS) {
+		g_overlays[g_overlayCount++] = { proc, user };
+		ok = TRUE;
+	}
+	ReleaseSRWLockExclusive(&g_overlayLock);
+	logf("overlay %p registered: %d", proc, ok);
+	return ok;
+}
+
+extern "C" __declspec(dllexport) BOOL __cdecl DisplayManager_RemoveOverlay(DisplayManager_OverlayProc proc, void *user) {
+	BOOL found = FALSE;
+	AcquireSRWLockExclusive(&g_overlayLock);
+	for (int i = 0; i < g_overlayCount; i++)
+		if (g_overlays[i].proc == proc && g_overlays[i].user == user) {
+			g_overlays[i] = g_overlays[--g_overlayCount];
+			found = TRUE;
+			break;
+		}
+	ReleaseSRWLockExclusive(&g_overlayLock);
+	return found;
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {

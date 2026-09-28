@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Added**
+- Overlay API for other mods: `DisplayManager_AddOverlay` / `DisplayManager_RemoveOverlay` (see
+  `src/DisplayManagerOverlay.h`). A registered callback draws on the composited fullscreen frame right before it
+  is presented, and is told before a device Reset.
+
 ## 1.0.5 — 2026-09-26
 
 **Fixed**

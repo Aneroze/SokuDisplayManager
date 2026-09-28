@@ -68,6 +68,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 ## For mod authors
 
 - In fullscreen, the game window's client area covers the monitor and the 640×480 image is a scaled rect inside it. `DisplayManager.dll` exports `BOOL DisplayManager_GetGameRect(RECT *out)` (cdecl), which gives that rect in client pixels (the whole client when windowed). It returns `FALSE` when DisplayManager is inactive; assume a centered 4:3 image then.
+- To draw on the final fullscreen frame (e.g. into the borders), register an overlay with `DisplayManager_AddOverlay` (see [`src/DisplayManagerOverlay.h`](src/DisplayManagerOverlay.h)). It is called after DisplayManager composites the frame, right before it is presented, whatever the mod load order. [SideNotes](https://github.com/Aneroze/SokuSideNotes) uses it.
 - With `Borderless=1`, the game's present parameters at `0x8A0F68` still say `Windowed=0` (this keeps the game's Alt+Enter working), but the device is windowed. Use `GetSwapChain(0)` → `GetPresentParameters` to check.
 
 ## How it works
