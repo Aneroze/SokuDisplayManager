@@ -46,6 +46,17 @@ also multisample a native-size (e.g. 2560x1440) surface for a 640x480 game. Inst
 - DXVK and SokuDirectXOptimizations (`use_d3d9ex`): test both (the user runs DXVK in another install).
 - Cost: 4x MSAA at 640x480 is trivial on any GPU; the resolve is one 640x480 blit.
 
+### Result (2026-09-28): works, but no visible effect → not merged
+Implemented as designed on branch `feat/msaa` (commit after this doc update). Log on the Copy install: the game's pp
+= X8R8G8B8, 1 backbuffer, DISCARD, **auto depth D24S8 (fmt 75)**, flags 0x2, interval IMMEDIATE;
+`D3DRS_MULTISAMPLEANTIALIAS` stays 1. x4/x8 targets + depth created, resolve/upscale all S_OK, rendering correct.
+Measured with a test-only runtime switch (file trigger, scratch build) and SideNotes' frame dump: 3 frames at each
+of MSAA 0/4/8 in one session; pixels identical within each level's frames (static, ~20% of the game area) that
+differ between levels = MSAA's effect. **Shrine, forest, waterfall and one more Practice stage: 0-4 changed pixels
+out of ~240k static ones; Misty Lake (story intro): 0% change in the tree branches.** The stages are layered
+textured planes whose visible edges come from texture alpha, like the sprites, so MSAA has nothing to smooth.
+Decision pending with the user; recommendation: don't ship (complexity + mod-compat risk for no gain).
+
 ### Test
 Copy install, Borderless=1, harness to a stage with 3D geometry, pause (nav `p`), DM test build that dumps its
 final backbuffer. Compare MultiSample=0/4/8 crops of the same stage region (a restart is needed per value, so
