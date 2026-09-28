@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.6 — 2026-09-28
 
 **Added**
 - Overlay API for other mods: `DisplayManager_AddOverlay` / `DisplayManager_RemoveOverlay` (see
