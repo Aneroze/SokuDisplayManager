@@ -54,6 +54,10 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `BackgroundColor` | `000000` | Border color, `RRGGBB`. |
 | `Filter` | `Sharp` | Upscale filter, see [Scaling](#scaling). |
 | `MultiSample` | `0` | Fullscreen MSAA: `0` (off), `2`, `4` or `8`. Only smooths polygon edges; the game's sprites and stages mostly aren't affected. |
+| `XbrStrength` | `0.65` | For `Filter=xBR`: `0.0` (plain pixels) to `1.0` (full xBR). |
+| `XbrCorner` | `B` | For `Filter=xBR`: `A` (roundest) to `D` (keeps more corners and small details). |
+| `XbrSlopes` | `0` | For `Filter=xBR`: `1` = also smooth 30°/60° edges, `0` = 45° diagonals only. |
+| `XbrWidth` | `2.0` | For `Filter=xBR`: width of the smoothed band at edges (`1.0` = standard xBR). |
 | `Sharpness` | `1.50` | For `Filter=Sharp`: `1.0` (bilinear) to `4.0` (about the same as point). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (kept at 4:3). |
 | `PersistState` | `1` | Save hotkey changes (mode, scales, filter, sharpness) to the ini on exit. |

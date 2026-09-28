@@ -1,14 +1,22 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-09-28
 
 **Added**
 - `Filter=xBR` (experimental): the xBR-lv2 pixel-art upscaler (Hyllian, MIT), in the Alt+F cycle after Sharp. Falls
-  back to Linear if the GPU can't run its shader. Tunable with `XbrStrength`, `XbrCorner` (A-D), `XbrSlopes` and
-  `XbrWidth`, and live with the development hotkeys Alt+S / C / E / W.
+  back to Linear if the GPU can't run its shader (needs pixel shader 2.b). Tuned with `XbrStrength` (default 0.65,
+  blended with the plain pixels), `XbrCorner` (A-D, default B), `XbrSlopes` (default 0) and `XbrWidth` (default
+  2.0). Development hotkeys to cycle them live (Alt+S / C / E / W) are in the ini, commented out.
 - `MultiSample=0/2/4/8`: MSAA for the game's rendering in fullscreen, and the `ToggleMSAA` hotkey (Alt+M) to switch
-  it on (×8 by default) and off live. It only smooths polygon edges; on the stages we measured it changes almost
-  nothing, but overlays drawn as shapes (e.g. hitbox displays) may differ.
+  it on (×8 when `MultiSample=0`) and off live. It only smooths polygon edges; on the stages we measured it changes
+  almost nothing, but overlays drawn as shapes may differ.
+
+**Changed**
+- Alt+F cycles Point → Linear → Sharp → xBR.
+
+**Note for existing installs**: DisplayManager doesn't add new keys to an existing ini. The new settings use their
+defaults when missing; to get the MSAA hotkey, add `ToggleMSAA=M` under `[Hotkeys]` (hotkeys missing from the ini
+are off).
 
 ## 1.0.6 — 2026-09-28
 
