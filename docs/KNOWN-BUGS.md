@@ -209,3 +209,33 @@ d3d9_custom.dll or Wine). `drawSharp` calls them directly, so no other mod's sce
 straight into the backbuffer; only the border rects are filled (`fillBorders`), and Point/Linear StretchRect straight
 to the backbuffer too. The stage is only created when the pointers can't be trusted (another mod hooked the slots
 first) - then the old redraw-safe stage path is used. Fractional Sharpness (1.00-4.00) is unchanged.
+
+## Under investigation: random crash / frozen rendering around Alt+Enter (external report, 2026-09-28)
+
+**Report** (a player, borderless and exclusive both): randomly on fullscreen toggles (or UAC), more often after the
+game has run a while, th123 crashes in the texture-size helper **`0x405200`**
+(`CHandleManager_GetSize`: `EnterCriticalSection(0x8A0E14)`, `tex->GetSurfaceLevel(0, &surf)` - result not
+checked, `surf` uninitialised - then `surf->GetDesc()`), with `surf == NULL`. Another time: no crash, the game keeps
+running and takes input, but nothing renders. Callers of 0x405200: 0x4065CD, 0x406C83, 0x409D1C.
+
+**What the game does on Reset** (`0x415100`, called by Alt+Enter `0x415220`): under the render lock it calls every
+registered lost-device listener (list at `0x8A0FC0`, vtable slot 0 = release D3DPOOL_DEFAULT resources), releases
+the swapchain `0x8A0E34`, calls `Reset` (`0x4151A8`), and only on success gets the swapchain again and calls the
+listeners' slot 1 (recreate). **On failure it returns right after Reset**: the listeners' textures stay released
+while the handle table still points at them. A later `GetSize` on one of them makes `GetSurfaceLevel` fail -> the
+reported NULL `GetDesc` crash; a Reset that keeps failing -> "runs but doesn't render". So the crash is the game's
+own missing error handling; the question is what makes Reset fail on that setup.
+
+**Ruled out so far** (Copy install, 2560x1440, borderless, the user's mod set, DM feat/msaa-xbr build):
+- DM leaking on Reset: 76 Alt+Enters (title, character select/loading, battle), 0 Reset failures, no memory growth
+  per toggle (private ~366 MB, virtual ~730-785 MB in battle).
+- DM code path: every DM default-pool resource (capture texture, stage, MSAA targets) and overlay resources are
+  released before the game's Reset; a failed forced Reset falls back to the game's own parameters.
+- Note: th123.exe is NOT large-address-aware (2 GB), so long sessions with many mods can still run out of address
+  space; not reproduced in short sessions.
+
+**Needed from the reporter**: DM version + `DisplayManager.log` with `Log=1` from a session where it happens (a
+failing Reset logs `Reset failed (0x...)` and the retries), mod list (SokuDirectXOptimizations / d3d9ex, DXVK,
+InfiniteDecks version - its < 1.2.0 D3DPOOL_DEFAULT render-target textures make every Reset fail), monitor resolution,
+and whether it also happens with DM disabled. Possible mitigation independent of the cause: patch 0x405200 to check
+GetSurfaceLevel's result (return the 0x100 default) - turns the crash into a missing sprite until the next good Reset.
