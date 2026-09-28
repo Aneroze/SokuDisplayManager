@@ -103,10 +103,10 @@ static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this
 enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_XBR, FILTER_COUNT };
 static int     g_filterCfg = FILTER_SHARP;
 // xBR knobs (shader/xbr.hlsl c1), live-cycled by the Xbr* hotkeys.
-static float   g_xbrStrength = 1.0f;   // 0..1 blend: plain texel .. full xBR
+static float   g_xbrStrength = 0.65f;  // 0..1 blend: plain texel .. full xBR (full xBR looked too strong)
 static int     g_xbrCorner   = 1;      // corner type 0..3 = A..D
-static bool    g_xbrSlopes   = true;   // also smooth 30/60-degree edges (xBR level 2)
-static float   g_xbrWidth    = 1.0f;   // edge anti-aliasing band, x the original
+static bool    g_xbrSlopes   = false;  // also smooth 30/60-degree edges (xBR level 2); off looked better at x3
+static float   g_xbrWidth    = 2.0f;   // edge anti-aliasing band, x the original (2 = softer; picked at x3)
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -1318,15 +1318,15 @@ static void loadConfig() {
 	g_msaaIni      = g_msaaCfg;
 	{   // xBR knobs
 		char v[32] = {0};
-		GetPrivateProfileStringA("Display", "XbrStrength", "1.0", v, sizeof(v), g_iniPath);
+		GetPrivateProfileStringA("Display", "XbrStrength", "0.65", v, sizeof(v), g_iniPath);
 		g_xbrStrength = (float)atof(v);
 		if (g_xbrStrength < 0.0f) g_xbrStrength = 0.0f;
 		if (g_xbrStrength > 1.0f) g_xbrStrength = 1.0f;
 		GetPrivateProfileStringA("Display", "XbrCorner", "B", v, sizeof(v), g_iniPath);
 		char cc = v[0] >= 'a' ? v[0] - 32 : v[0];
 		g_xbrCorner = (cc >= 'A' && cc <= 'D') ? cc - 'A' : 1;
-		g_xbrSlopes = GetPrivateProfileIntA("Display", "XbrSlopes", 1, g_iniPath) != 0;
-		GetPrivateProfileStringA("Display", "XbrWidth", "1.0", v, sizeof(v), g_iniPath);
+		g_xbrSlopes = GetPrivateProfileIntA("Display", "XbrSlopes", 0, g_iniPath) != 0;
+		GetPrivateProfileStringA("Display", "XbrWidth", "2.0", v, sizeof(v), g_iniPath);
 		g_xbrWidth = (float)atof(v);
 		if (g_xbrWidth < 0.05f) g_xbrWidth = 0.05f;
 		if (g_xbrWidth > 4.0f) g_xbrWidth = 4.0f;
@@ -1601,12 +1601,14 @@ static void doAction(int act) {
 		// Development knobs: each cycles one xBR setting and switches to xBR. Session only (not written to the ini);
 		// the log gets the resulting values so they can be copied into the ini.
 		static const float widths[] = { 0.25f, 0.5f, 1.0f, 2.0f };
+		static const float strengths[] = { 1.0f, 0.8f, 0.65f, 0.5f, 0.35f, 0.2f };
 		char msg[32], num[16];
 		g_filterCfg = FILTER_XBR;
 		if (g_active) computeOutput();
 		if (act == ACT_XBR_STRENGTH) {
-			g_xbrStrength -= 0.2f;
-			if (g_xbrStrength < 0.15f) g_xbrStrength = 1.0f;       // 1.0 -> 0.8 -> ... -> 0.2 -> 1.0
+			int k = 0;                                                // next step below the current value
+			while (k < 6 && strengths[k] > g_xbrStrength - 0.01f) k++;
+			g_xbrStrength = strengths[k < 6 ? k : 0];                 // 1.0 -> 0.8 -> 0.65 -> ... -> 0.2 -> 1.0
 			formatHundredths(g_xbrStrength, num);
 			wsprintfA(msg, "XBR STR %s", num);
 		} else if (act == ACT_XBR_CORNER) {
