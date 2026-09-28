@@ -26,7 +26,7 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | Alt+F | `CycleFilter` | Cycle the filter. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
 | Alt+S / C / E / W | `XbrStrength` / `XbrCorner` / `XbrSlopes` / `XbrWidth` | Development, commented out in the ini by default: cycle an xBR setting (switches to xBR). Not saved. |
-| Alt+M | `ToggleMSAA` | Fullscreen: turn MSAA on (`MultiSample`, or ×8 if that is 0) / off. Not saved. |
+| (none) | `ToggleMSAA` | Not in the default ini (add e.g. `ToggleMSAA=M` under `[Hotkeys]`). Fullscreen: turn MSAA on (`MultiSample`, or ×8 if that is 0) / off. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
 In fullscreen, scale and filter changes are shown briefly on screen.
@@ -53,7 +53,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Size for `Mode=CustomResolution`. |
 | `BackgroundColor` | `000000` | Border color, `RRGGBB`. |
 | `Filter` | `Sharp` | Upscale filter, see [Scaling](#scaling). |
-| `MultiSample` | `0` | Fullscreen MSAA: `0` (off), `2`, `4` or `8`. Only smooths polygon edges; the game's sprites and stages mostly aren't affected. |
+| `MultiSample` | `0` | Not in the default ini (add it under `[Display]`). Fullscreen MSAA: `0` (off), `2`, `4` or `8`. Only smooths polygon edges; the game's sprites and stages aren't noticeably affected. |
 | `XbrStrength` | `0.65` | For `Filter=xBR`: `0.0` (plain pixels) to `1.0` (full xBR). |
 | `XbrCorner` | `B` | For `Filter=xBR`: `A` (roundest) to `D` (keeps more corners and small details). |
 | `XbrSlopes` | `0` | For `Filter=xBR`: `1` = also smooth 30°/60° edges, `0` = 45° diagonals only. |

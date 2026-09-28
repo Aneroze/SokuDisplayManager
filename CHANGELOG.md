@@ -7,16 +7,15 @@
   back to Linear if the GPU can't run its shader (needs pixel shader 2.b). Tuned with `XbrStrength` (default 0.65,
   blended with the plain pixels), `XbrCorner` (A-D, default B), `XbrSlopes` (default 0) and `XbrWidth` (default
   2.0). Development hotkeys to cycle them live (Alt+S / C / E / W) are in the ini, commented out.
-- `MultiSample=0/2/4/8`: MSAA for the game's rendering in fullscreen, and the `ToggleMSAA` hotkey (Alt+M) to switch
-  it on (×8 when `MultiSample=0`) and off live. It only smooths polygon edges; on the stages we measured it changes
-  almost nothing, but overlays drawn as shapes may differ.
+- `MultiSample=0/2/4/8`: MSAA for the game's rendering in fullscreen, and a `ToggleMSAA` hotkey to switch it on (×8
+  when `MultiSample=0`) and off live. It only smooths polygon edges and made no visible difference in testing, so
+  both are left out of the default ini; add them by hand to try them (see the README).
 
 **Changed**
 - Alt+F cycles Point → Linear → Sharp → xBR.
 
-**Note for existing installs**: DisplayManager doesn't add new keys to an existing ini. The new settings use their
-defaults when missing; to get the MSAA hotkey, add `ToggleMSAA=M` under `[Hotkeys]` (hotkeys missing from the ini
-are off).
+**Note for existing installs**: DisplayManager doesn't add new keys to an existing ini; the new settings use their
+defaults when missing.
 
 ## 1.0.6 — 2026-09-28
 
