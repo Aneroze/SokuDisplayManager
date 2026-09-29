@@ -9,7 +9,7 @@
 // sharp-bilinear, default), Point or Linear filter. True exclusive fullscreen keeps the low-latency
 // "Independent Flip" present path, which a legacy D3D9 / DISCARD game can't get in a borderless window
 // (an optional borderless mode exists anyway). Windowed, it sizes the game window (4:3 drag-resize,
-// Alt+1..6 scale, spawn position, always-on-top).
+// Alt+1..6 scale, spawn position, always-on-top) and, with WindowedFilter=1, upscales with the same filters.
 //
 // How it works
 // ------------
@@ -30,8 +30,12 @@
 //      render-target texture, fill the borders and upscale it centered into the backbuffer (Sharp =
 //      sharp-bilinear pixel shader quad, falling back to StretchRect; Point/Linear = StretchRect). The
 //      viewport is pinned to 640x480 (the game relies on the default one).
-// Windowed, the device is left exactly as the game made it (DM only sizes/positions the window), so
-// Alt+Enter still toggles windowed <-> crisp fullscreen.
+// Windowed (WindowedFilter=1), the copy gets a backbuffer the size of the window's client area and the same
+// Present post-process runs, so the filters apply there too (WindowedFilter=0: the device is left exactly as
+// the game made it and D3D9's windowed present stretches the 640x480 backbuffer bilinearly). A backbuffer
+// can only change size in a Reset, so a window resize ends in one Reset through the game's own wrapper
+// (0x415100, what Alt+Enter uses): after a drag (WM_EXITSIZEMOVE) or any other resize, never during a drag.
+// Either way Alt+Enter still toggles windowed <-> crisp fullscreen.
 //
 // If WindowResizer, IntegerFullscreen or ExclusiveFullscreen is loaded, DM detects it at device creation
 // and passes everything through.
@@ -72,6 +76,13 @@ static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 static const DWORD ADDR_KB_COOPLEVEL_PUSH = 0x0040D8B3;
 static const DWORD ADDR_KB_DEVICE         = 0x008A01A0;
 static const BYTE  DI_NONEXCLUSIVE = 0x02, DI_FOREGROUND = 0x04, DI_NOWINKEY = 0x10;   // dinput.h DISCL_*
+// The game's Reset wrapper: bool __cdecl (void), Reset with its global present params (0x8A0F68). Under the render
+// lock (0x8A0E14) it releases every registered D3DPOOL_DEFAULT owner (list 0x8A0FC0) and the swapchain 0x8A0E34,
+// calls Reset (0x4151A8), and on success gets the swapchain again and recreates them. Returns false without doing
+// anything while the device is lost (0x8A0FB4 == D3DERR_DEVICELOST). Called by Alt+Enter (0x415220, from the window
+// procedure) and device-lost recovery (0x407D82). On a FAILED Reset it returns without recreating (KNOWN-BUGS).
+static const DWORD ADDR_GAME_RESET = 0x00415100;
+typedef bool (__cdecl *GameReset_t)();
 
 // ---- vtable indices (verified against d3d9.h) ----------------------------------------------------
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
@@ -113,6 +124,7 @@ static bool    g_persist   = true;     // save the current scaling settings to t
 static int     g_posX      = -1;       // spawn position (-1 = don't move the window)
 static int     g_posY      = -1;
 static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
+static bool    g_winFilter = true;     // WindowedFilter: windowed, a window-sized backbuffer + our upscale
 static int     g_fsW       = 0;        // manual fullscreen display-mode override (0 = auto / native)
 static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
@@ -136,8 +148,11 @@ static int g_modifier = MODK_ALT;
 // ---- runtime state -------------------------------------------------------------------------------
 static volatile bool g_createDeviceHooked = false;   // (volatile: polled by the device-watch thread)
 static volatile bool g_deviceHooked       = false;
-static bool      g_active             = false;  // currently forcing exclusive fullscreen?
-static UINT      g_bbW = 0, g_bbH = 0;          // forced backbuffer size (= native desktop)
+static bool      g_active             = false;  // forcing our backbuffer + post-process (fullscreen or WindowedFilter)?
+static bool      g_winActive          = false;  // ...on a real windowed device (WindowedFilter, not borderless)
+static bool      g_devWindowed        = false;  // the device we forced is windowed (borderless or WindowedFilter)
+static bool      g_winFilterFailed    = false;  // a forced windowed Reset failed: WindowedFilter off for this session
+static UINT      g_bbW = 0, g_bbH = 0;          // forced backbuffer size (native desktop; windowed: the client area)
 static D3DFORMAT g_bbFormat = D3DFMT_X8R8G8B8;  // backbuffer format (for the capture RT)
 // Grabbed game frame: a render-target TEXTURE (so the Sharp shader can sample it) plus its level-0
 // surface (the StretchRect grab target, and the source for Point/Linear StretchRect upscales).
@@ -162,10 +177,11 @@ static IDirect3DStateBlock9   *g_stateBlock  = nullptr;  // save/restore device 
 // AddRef'd (the swapchain owns it); cached after CreateDevice/Reset and each Present, dropped before Reset.
 static IDirect3DSurface9      *g_bbSurf      = nullptr;
 static bool                    g_inPost      = false;    // inside our Present post-process (render thread)
-// MSAA (MultiSample=N, fullscreen only): the game draws into our own multisampled 640x480 target (+ depth) instead
-// of the backbuffer, and the Present grab resolves it. The backbuffer stays single-sampled, so the rest of the
-// post-process and other mods' overlays work on it unchanged. The game never calls SetRenderTarget itself, so
-// binding ours after CreateDevice/Reset and after every Present is enough.
+// MSAA (MultiSample=N, whenever DM composites - fullscreen, or windowed with WindowedFilter): the game draws into
+// our own multisampled 640x480 target (+ depth) instead of the backbuffer, and the Present grab resolves it. The
+// backbuffer stays single-sampled, so the rest of the post-process and other mods' overlays work on it unchanged.
+// The game never calls SetRenderTarget itself, so binding ours after CreateDevice/Reset and after every Present is
+// enough.
 static IDirect3DSurface9      *g_msRT        = nullptr;
 static IDirect3DSurface9      *g_msDS        = nullptr;
 static IDirect3DSurface9      *g_autoDS      = nullptr;  // the device's own depth buffer (not AddRef'd), rebound before Reset
@@ -206,6 +222,9 @@ static POINT    g_winPos     = { 0, 0 };
 static HMONITOR g_fsMon      = nullptr;
 static UINT     g_applyMsg   = 0;       // private registered message: apply the window state (wndProc)
 static bool     g_spawnPending = false; // first-spawn window setup posted but not applied yet
+static volatile bool g_applyPending = false; // a posted window-state apply hasn't run yet
+static UINT     g_resizeMsg  = 0;       // private registered message: resize the windowed backbuffer (wndProc)
+static bool     g_inSizeMove = false;   // inside a drag-resize / move loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE)
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -258,6 +277,7 @@ static void enterBorderlessFullscreen();
 static void postWindowApply(bool firstTime);
 static void applyWindowState();
 static void applyTopmost();
+static void windowedBackbufferSize(bool entering, bool firstTime, UINT *w, UINT *h);
 
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
@@ -293,10 +313,11 @@ static void hookSlot(void **vtable, int index, void *hook, void **orig) {
 
 // Resolve the centered output size (g_scaleW/H) and upscale filter from the current mode and the native
 // backbuffer size (g_bbW/g_bbH). Safe to call any time the native size is known (e.g. from a hotkey).
+// Windowed, the backbuffer is the (4:3) client area, so the image just fills it: the fullscreen Mode is ignored.
 static void computeOutput() {
 	if (g_bbW == 0 || g_bbH == 0) return;
 	int outW, outH;
-	switch (g_mode) {
+	switch (g_winActive ? MODE_FIT : g_mode) {
 	case MODE_INTEGER: {
 		int n = g_intScale < 1 ? 1 : g_intScale;
 		int maxFit = (int)min(g_bbW / (UINT)g_srcW, g_bbH / (UINT)g_srcH);
@@ -425,25 +446,44 @@ static void validateExclusiveMode(UINT *w, UINT *h, UINT *refresh, D3DFORMAT fmt
 }
 
 // Shape the present parameters for this (Create)Device/Reset: fullscreen requests are forced to the native
-// desktop mode so the monitor is never rescaled; windowed requests pass through untouched. `pp` is always
-// OUR COPY of the game's struct: the global (0x8A0F68) must keep its real values - Alt+Enter just flips its
-// Windowed, the post-toggle window code, device-lost recovery and other mods read it back. Writing
-// Windowed=TRUE (borderless) or the native size into it made Alt+Enter unable to leave borderless.
-static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
+// desktop mode so the monitor is never rescaled; windowed requests get a backbuffer the size of the window's
+// client area (WindowedFilter=1) or pass through untouched. `pp` is always OUR COPY of the game's struct: the
+// global (0x8A0F68) must keep its real values - Alt+Enter just flips its Windowed, the post-toggle window code,
+// device-lost recovery and other mods read it back. Writing Windowed=TRUE (borderless) or the native size into
+// it made Alt+Enter unable to leave borderless.
+// `entering`: the window is about to be set up for windowed (first CreateDevice, or coming back from
+// fullscreen), so the windowed size is predicted from the saved WindowScale; otherwise it is the current client
+// area. `firstTime`: that setup is the first spawn (spawn position instead of the pre-fullscreen one).
+static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp, bool entering, bool firstTime) {
+	g_winActive = false;
 	if (!g_enabled || !pp) { g_active = false; return; }
 	if (pp->hDeviceWindow) g_hwnd = pp->hDeviceWindow;   // remember the game window for windowed resizing
 	g_wantFullscreen = !pp->Windowed;                    // the game's real intent (before we override it)
 	g_gameDepth = pp->EnableAutoDepthStencil != FALSE;
 	g_gameDepthFmt = pp->AutoDepthStencilFormat;
+	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
 
 	if (pp->Windowed) {
-		g_active = false;
+		if (!g_winFilter || g_winFilterFailed) {
+			g_active = false;
+			return;
+		}
+		// The game keeps drawing its 640x480 frame into the top-left (at least 640x480, see windowedBackbufferSize);
+		// the post-process upscales it over the whole backbuffer, which Present then copies 1:1 to the client.
+		UINT w = 0, h = 0;
+		windowedBackbufferSize(entering, firstTime, &w, &h);
+		pp->BackBufferWidth  = w;
+		pp->BackBufferHeight = h;
+		g_bbW = w; g_bbH = h; g_bbFormat = fmt;
+		g_active = g_winActive = g_devWindowed = true;
+		logf("windowed -> backbuffer %ux%u (%s)", w, h, entering ? "WindowScale" : "client area");
+		computeOutput();
 		return;
 	}
 
 	UINT w = 0, h = 0, refresh = 0;
 	nativeMode(&w, &h, &refresh);
-	D3DFORMAT fmt = (pp->BackBufferFormat != D3DFMT_UNKNOWN) ? pp->BackBufferFormat : D3DFMT_X8R8G8B8;
+	g_devWindowed = g_borderless;
 
 	if (g_borderless) {
 		// Borderless: a windowed device with a native-sized backbuffer; enterBorderlessFullscreen covers
@@ -470,9 +510,10 @@ static void applyFullscreenParams(D3DPRESENT_PARAMETERS *pp) {
 }
 
 // After a (Create)Device/Reset made with our copy `used` of the game's struct `game`, hand back only what
-// the runtime itself fills in. An untouched (windowed) copy goes back whole, exactly as if the game had
-// passed its own struct; for a fullscreen copy we never write back our size / Windowed overrides - only
-// the defaults the runtime resolves (th123 passes explicit values for both, so this is normally a no-op).
+// the runtime itself fills in. An untouched copy (DM inactive) goes back whole, exactly as if the game had
+// passed its own struct; for a forced copy (fullscreen, or windowed with our window-sized backbuffer) we never
+// write back our size / Windowed overrides - only the defaults the runtime resolves (th123 passes explicit
+// values for both, so this is normally a no-op).
 static void syncPresentParams(D3DPRESENT_PARAMETERS *game, const D3DPRESENT_PARAMETERS *used) {
 	if (!g_active) { *game = *used; return; }
 	if (game->BackBufferCount == 0) game->BackBufferCount = used->BackBufferCount;
@@ -499,7 +540,12 @@ static HRESULT callWithFallback(const char *what, F call, const D3DPRESENT_PARAM
 		if (SUCCEEDED(hr) || hr == D3DERR_DEVICELOST) return hr;
 	}
 	*local = *orig;
+	if (g_winActive) {   // don't retry on every resize: windowed stays the plain stretched 640x480 from now on
+		g_winFilterFailed = true;
+		logf("%s: WindowedFilter turned off for this session", what);
+	}
 	g_active = false;
+	g_winActive = false;
 	g_borderlessActive = false;
 	hr = call(local);
 	logf("%s retry with the game's own params (DisplayManager inactive until the next Reset) -> 0x%08lx",
@@ -547,7 +593,7 @@ static void createMsaa(IDirect3DDevice9 *dev) {
 	D3DDEVICE_CREATION_PARAMETERS cp = {};
 	IDirect3D9 *d3d = nullptr;
 	if (FAILED(dev->GetCreationParameters(&cp)) || FAILED(dev->GetDirect3D(&d3d)) || !d3d) return;
-	BOOL windowed = g_borderlessActive ? TRUE : FALSE;
+	BOOL windowed = g_devWindowed ? TRUE : FALSE;
 	D3DMULTISAMPLE_TYPE type = D3DMULTISAMPLE_NONE;
 	for (int n = g_msaaCfg > 16 ? 16 : g_msaaCfg; n >= 2; n--) {   // the highest supported count <= the request
 		D3DMULTISAMPLE_TYPE t = (D3DMULTISAMPLE_TYPE)n;
@@ -736,7 +782,7 @@ static int osdGlyph(char c) {
 	return 11;   // space
 }
 
-// Post a message to the on-screen readout for ~1.5s (drawn by drawOsd in the fullscreen present hook).
+// Post a message to the on-screen readout for ~1.5s (drawn by drawOsd in the Present post-process).
 // Message text must use only OSD_CHARS characters (uppercase). Called from the hotkey thread.
 static void showOsd(const char *msg) {
 	lstrcpynA(g_osdText, msg, sizeof(g_osdText));
@@ -900,7 +946,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 // Keep the 640x480 viewport pinned across a mid-frame SetRenderTarget: D3D9 resets the viewport to the
 // whole new render target, so binding the (native-sized) backbuffer again after drawing into a texture would
 // bring back the giant-Okuu scaling (see setGameViewport) for the rest of that frame. Only for the game
-// device's backbuffer at index 0 while we force fullscreen, and not during our own post-process. Other mods
+// device's backbuffer at index 0 while we force our backbuffer, and not during our own post-process. Other mods
 // may hook this slot too; hookSlot chains to whatever was there.
 static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDirect3DSurface9 *rt) {
 	HRESULT hr = oSetRenderTarget(dev, index, rt);
@@ -936,7 +982,10 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	}
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
-	applyFullscreenParams(use);
+	// g_windowFs still says what the window was last set up for: fullscreen -> windowed predicts the window size
+	// the post-Reset setup will give it; windowed -> windowed (our resize Reset, device-lost recovery) takes the
+	// client area as it is.
+	applyFullscreenParams(use, g_windowFs, g_spawnPending);
 	HRESULT hr = callWithFallback("Reset", [dev](D3DPRESENT_PARAMETERS *p) { return oReset(dev, p); }, pp, use);
 	if (pp) syncPresentParams(pp, &local);
 	if (SUCCEEDED(hr)) {
@@ -1103,7 +1152,8 @@ static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE 
 	g_d3d = self; g_adapter = adapter;
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
-	applyFullscreenParams(use);         // sets g_hwnd from pp->hDeviceWindow
+	if (pp && !g_hwnd) g_hwnd = pp->hDeviceWindow ? pp->hDeviceWindow : focus;   // for the window-size prediction
+	applyFullscreenParams(use, true, true);   // sets g_hwnd from pp->hDeviceWindow; first spawn = the saved size
 	if (!g_hwnd && focus) g_hwnd = focus;
 	installKeyboardHook();              // hooks the WINDOW's thread (not necessarily this one)
 	HRESULT hr = callWithFallback("CreateDevice", [=](D3DPRESENT_PARAMETERS *p) {
@@ -1309,6 +1359,7 @@ static void loadConfig() {
 	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
 	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
 	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
+	g_winFilter    = GetPrivateProfileIntA("Display", "WindowedFilter", 1, g_iniPath) != 0;
 	g_fsW          = GetPrivateProfileIntA("Display", "FullscreenWidth", 0, g_iniPath);
 	g_fsH          = GetPrivateProfileIntA("Display", "FullscreenHeight", 0, g_iniPath);
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
@@ -1383,30 +1434,33 @@ static void persistState() {
 // ---- hotkeys (WindowResizer-style): Alt+0 = FitToScreen, Alt+1..6 = x1..x6, Alt+P/F/K/L ------------
 // A WH_KEYBOARD hook on the game's UI thread (as WindowResizer does): it sees the game's own key messages,
 // so it works in exclusive fullscreen, where a GetAsyncKeyState poll did not. Changes apply live (they only
-// affect the post-process), no device reset.
+// affect the post-process), no device reset - except a windowed Scale key with WindowedFilter, whose window
+// resize ends in one (onWindowResized).
 static HHOOK g_kbHook = nullptr;
 
 // lParam bit 30 = previous key state, bit 31 = transition. Both 0 means a fresh key-down (not a repeat
 // or a release).
 #define IS_FRESH_KEYDOWN(lp) (((lp) & (1 << 30)) == 0 && ((lp) & (1 << 31)) == 0)
 
-// Total non-client border size (width, height) for the game window's current style.
+// Total non-client border size (width, height) of the game window while windowed. Its style is taken as it
+// will be then, so the window-size prediction for a new backbuffer (windowedBackbufferSize) can run before the
+// window is set up: the saved normal style while borderless, and our drag-resize border before installWndProc.
 static void windowBorders(int *bx, int *by) {
+	LONG style = g_styleSaved ? g_savedStyle : GetWindowLongA(g_hwnd, GWL_STYLE);
+	LONG ex = g_styleSaved ? g_savedExStyle : GetWindowLongA(g_hwnd, GWL_EXSTYLE);
+	if (g_resizable) style |= WS_THICKFRAME;
 	RECT r = { 0, 0, 0, 0 };
-	AdjustWindowRectEx(&r, GetWindowLongA(g_hwnd, GWL_STYLE), GetMenu(g_hwnd) != nullptr,
-	                   GetWindowLongA(g_hwnd, GWL_EXSTYLE));
+	AdjustWindowRectEx(&r, style, GetMenu(g_hwnd) != nullptr, ex);
 	*bx = r.right - r.left; *by = r.bottom - r.top;
 }
 
-// Resize the game's window to a (srcW*n) x (srcH*n) client, optionally moving its top-left to `pos`. Only the
-// window changes: D3D9's windowed present stretches the existing backbuffer, so no (unsafe, external) device
-// reset is needed. Mirrors WindowResizer. Clamped to the work area of the monitor it lands on (largest
-// integer scale that fits, moved back on-screen); the slack allows for Windows 10's invisible resize borders.
-static void setWindowScaled(int n, const POINT *pos) {
-	if (!g_hwnd || n < 1) return;
+// Where setWindowScaled(n, pos) puts the window: returns the scale it can use (n, or the largest one that fits
+// the work area of the monitor it lands on) and the window's top-left in *px/*py (pos, or where the window is,
+// moved back on-screen). The slack allows for Windows 10's invisible resize borders.
+static int placeWindowScaled(int n, const POINT *pos, int *px, int *py) {
 	int bx, by; windowBorders(&bx, &by);
 	RECT wr;
-	if (!GetWindowRect(g_hwnd, &wr)) return;
+	if (!GetWindowRect(g_hwnd, &wr)) return 0;
 	int x = pos ? pos->x : wr.left, y = pos ? pos->y : wr.top, use = n;
 	POINT at = { x, y };
 	HMONITOR mon = pos ? MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST)
@@ -1424,6 +1478,21 @@ static void setWindowScaled(int n, const POINT *pos) {
 		if (x < wa.left - slack)        x = wa.left - slack;
 		if (y < wa.top)                 y = wa.top;
 	}
+	*px = x; *py = y;
+	return use;
+}
+
+// Resize the game's window to a (srcW*n) x (srcH*n) client, optionally moving its top-left to `pos`. Mirrors
+// WindowResizer. Clamped to the work area of the monitor it lands on (placeWindowScaled). Windowed without our
+// backbuffer, D3D9's present stretches the 640x480 one over the new size; with WindowedFilter the resulting
+// WM_SIZE resizes the backbuffer to match (onWindowResized).
+static void setWindowScaled(int n, const POINT *pos) {
+	if (!g_hwnd || n < 1) return;
+	int bx, by; windowBorders(&bx, &by);
+	RECT wr;
+	if (!GetWindowRect(g_hwnd, &wr)) return;
+	int x, y, use = placeWindowScaled(n, pos, &x, &y);
+	if (use < 1) return;
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
 	if (x == wr.left && y == wr.top) flags |= SWP_NOMOVE;
 	SetWindowPos(g_hwnd, nullptr, x, y, g_srcW * use + bx, g_srcH * use + by, flags);
@@ -1441,6 +1510,17 @@ static void applyTopmost() {
 // configured spawn position (if any); when coming back from fullscreen, to where the window was before
 // (the game's post-toggle SetWindowPos re-centers it on the primary monitor). If we were in borderless
 // fullscreen, restore the normal window frame first.
+// Where onWindowedEntry moves the window: the configured spawn position on the first spawn, else where it was
+// before fullscreen (nullptr = leave it where it is).
+static const POINT *windowedEntryPos(bool firstTime, POINT *buf) {
+	if (firstTime) {
+		if (g_posX < 0 || g_posY < 0) return nullptr;
+		buf->x = g_posX; buf->y = g_posY;
+		return buf;
+	}
+	return g_haveWinPos ? &g_winPos : nullptr;
+}
+
 static void onWindowedEntry(bool firstTime) {
 	if (g_styleSaved && g_hwnd) {
 		SetWindowLongA(g_hwnd, GWL_STYLE, g_savedStyle);
@@ -1450,11 +1530,52 @@ static void onWindowedEntry(bool firstTime) {
 		g_styleSaved = false;
 	}
 	g_borderlessActive = false;
-	POINT spawn = { g_posX, g_posY };
-	const POINT *pos = firstTime ? ((g_posX >= 0 && g_posY >= 0) ? &spawn : nullptr)
-	                             : (g_haveWinPos ? &g_winPos : nullptr);
-	setWindowScaled(g_winScale, pos);
+	POINT buf;
+	setWindowScaled(g_winScale, windowedEntryPos(firstTime, &buf));
 	applyTopmost();
+}
+
+// The windowed backbuffer size for WindowedFilter: the window's client area - the one onWindowedEntry is about to
+// give it when `entering` (so the first spawn and a return from fullscreen need no second Reset), else the current
+// one. At least 640x480 in each direction, since the game always draws its frame 1:1 into the top-left; a smaller
+// client (only possible outside our 4:3 drag lock, e.g. snapping) gets a 640x480 backbuffer that D3D9 shrinks.
+// Minimized: the last size. Any wrong guess is fixed by the next WM_SIZE (onWindowResized).
+static void windowedBackbufferSize(bool entering, bool firstTime, UINT *w, UINT *h) {
+	int cw = 0, ch = 0;
+	RECT c;
+	if (g_hwnd && entering) {
+		POINT buf; int x, y;
+		int use = placeWindowScaled(g_winScale, windowedEntryPos(firstTime, &buf), &x, &y);
+		if (use < 1) use = g_winScale;
+		cw = g_srcW * use; ch = g_srcH * use;
+	} else if (g_hwnd && IsIconic(g_hwnd) && g_bbW && g_bbH) {
+		cw = (int)g_bbW; ch = (int)g_bbH;
+	} else if (g_hwnd && GetClientRect(g_hwnd, &c)) {
+		cw = c.right; ch = c.bottom;
+	}
+	*w = (UINT)(cw > g_srcW ? cw : g_srcW);
+	*h = (UINT)(ch > g_srcH ? ch : g_srcH);
+}
+
+// WindowedFilter: after the window's client area changed (posted from wndProc, so it runs from the game's message
+// loop, between frames, like Alt+Enter), Reset to a backbuffer of the new size if it differs. The Reset goes through
+// the game's own wrapper, which releases and recreates its D3DPOOL_DEFAULT resources around it; myReset sizes it.
+// Not during a drag (the old backbuffer is stretched until WM_EXITSIZEMOVE) or while a window setup is still queued
+// (that sets the final size and posts again).
+static void onWindowResized() {
+	if (!g_enabled || !g_winFilter || g_winFilterFailed || g_wantFullscreen || !g_deviceHooked || !g_hwnd ||
+	    g_inSizeMove || g_applyPending || IsIconic(g_hwnd) || !GAME_DEVICE)
+		return;
+	UINT w, h;
+	windowedBackbufferSize(false, false, &w, &h);
+	if (g_active && w == g_bbW && h == g_bbH) return;
+	logf("window resized: backbuffer %ux%u -> %ux%u, resetting", g_active ? g_bbW : 0, g_active ? g_bbH : 0, w, h);
+	bool ok = reinterpret_cast<GameReset_t>(ADDR_GAME_RESET)();
+	if (!ok) logf("window resized: the game's Reset returned false (device lost, or Reset failed)");
+}
+
+static void postWindowResized() {
+	if (g_resizeMsg && g_hwnd) PostMessageA(g_hwnd, g_resizeMsg, 0, 0);
 }
 
 // Set the window up for the current state: windowed (onWindowedEntry; the first time with the spawn
@@ -1463,20 +1584,40 @@ static void onWindowedEntry(bool firstTime) {
 static void applyWindowState() {
 	bool firstTime = g_spawnPending;
 	g_spawnPending = false;
+	g_applyPending = false;
 	if (!g_wantFullscreen)             onWindowedEntry(firstTime);
 	else if (g_borderless && g_active) enterBorderlessFullscreen();
+	if (!g_wantFullscreen) postWindowResized();   // check the backbuffer against the final size (no-op if it matches)
 }
 
 static WNDPROC g_origWndProc = nullptr;
 
-// Subclassed window procedure: runs the deferred apply posted by postWindowApply, and while windowed and
-// resizable locks a drag-resize to 4:3 (at least 640x480) so the stretched image never gets squashed.
+// Subclassed window procedure: runs the deferred apply posted by postWindowApply, while windowed and resizable
+// locks a drag-resize to 4:3 (at least 640x480) so the stretched image never gets squashed, and with
+// WindowedFilter queues a backbuffer resize once a resize is over (onWindowResized): at the end of a drag, or
+// right away for one that isn't a drag (Scale hotkeys, snapping, the game's own SetWindowPos).
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	if (g_applyMsg && msg == g_applyMsg) {
 		applyWindowState();
 		return 0;
 	}
-	if (msg == WM_SIZING && g_resizable && !g_active) {
+	if (g_resizeMsg && msg == g_resizeMsg) {
+		onWindowResized();
+		return 0;
+	}
+	switch (msg) {
+	case WM_ENTERSIZEMOVE:
+		g_inSizeMove = true;
+		break;
+	case WM_EXITSIZEMOVE:
+		g_inSizeMove = false;
+		postWindowResized();
+		break;
+	case WM_SIZE:
+		if (wp != SIZE_MINIMIZED && !g_inSizeMove) postWindowResized();
+		break;
+	}
+	if (msg == WM_SIZING && g_resizable && !g_wantFullscreen) {
 		RECT *wr = (RECT *)lp;
 		int bx, by; windowBorders(&bx, &by);
 		int cw = (wr->right - wr->left) - bx;
@@ -1503,6 +1644,8 @@ static void installWndProc() {
 		SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
 		             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 	}
+	if (!g_applyMsg)  g_applyMsg  = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
+	if (!g_resizeMsg) g_resizeMsg = RegisterWindowMessageA("DisplayManager.WindowResized");
 	// Record the original before swapping, so a message dispatched in between (the install can run off the
 	// window thread, from the device watch) never finds it null.
 	g_origWndProc = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
@@ -1521,6 +1664,7 @@ static void installWndProc() {
 static void postWindowApply(bool firstTime) {
 	if (firstTime) g_spawnPending = true;
 	if (!g_applyMsg) g_applyMsg = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
+	g_applyPending = true;   // before posting: myReset can run off the window thread, which may handle it at once
 	if (g_hwnd && g_origWndProc && g_applyMsg && PostMessageA(g_hwnd, g_applyMsg, 0, 0))
 		return;
 	applyWindowState();
@@ -1633,7 +1777,7 @@ static void doAction(int act) {
 	}
 	case ACT_MSAA: {
 		// Off <-> MultiSample from the ini (x8 when that is 0). Session only: not written to the ini. Applied on the
-		// render thread after the next Present; windowed, it takes effect when going fullscreen.
+		// render thread after the next Present; windowed without WindowedFilter, it takes effect when going fullscreen.
 		int on = g_msaaIni >= 2 ? g_msaaIni : 8;
 		g_msaaCfg = g_msaaCfg >= 2 ? 0 : on;
 		g_msaaApply = true;
@@ -1718,7 +1862,7 @@ static void applyAllowWinKey() {
 
 // For other mods (e.g. an overlay that maps mouse positions onto the game): where the game's 640x480 image is
 // inside the game window's CLIENT area, in client pixels (the space of WM_MOUSEMOVE / ScreenToClient). Windowed,
-// that is the whole client (D3D9 stretches the 640x480 backbuffer over it). In fullscreen (exclusive or
+// that is the whole client (our upscale or D3D9's stretch fills it). In fullscreen (exclusive or
 // borderless) the client covers the monitor and the image is the centered, scaled rect DM draws (pillar/
 // letterboxed; smaller with IntegerScaling/CustomResolution). Returns FALSE when DM is off or standing down, or
 // the window isn't known yet - the caller should then assume a 4:3 image centered in the client.
@@ -1782,9 +1926,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d multiSample=%d",
+	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d multiSample=%d windowedFilter=%d",
 	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey, g_msaaCfg);
+	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey, g_msaaCfg, g_winFilter);
 	return TRUE;
 }
 

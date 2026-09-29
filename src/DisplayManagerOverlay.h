@@ -14,10 +14,11 @@
 //   if (add) add(myOverlay, myUserData);
 //
 // The callback runs on the game's render thread, only while DisplayManager is compositing (fullscreen, exclusive
-// or borderless; never windowed). No scene is open: draw with ColorFill / StretchRect / UpdateSurface. If you
-// need BeginScene/EndScene, restore every device state you touch, and keep in mind that other mods hook
-// BeginScene/EndScene (calling them re-runs their per-scene code). Release your D3DPOOL_DEFAULT resources on
-// DM_OVERLAY_RESET: the device is about to be Reset (e.g. Alt+Enter).
+// or borderless, and windowed with WindowedFilter=1, where the backbuffer is the window's client area). No scene
+// is open: draw with ColorFill / StretchRect / UpdateSurface. If you need BeginScene/EndScene, restore every
+// device state you touch, and keep in mind that other mods hook BeginScene/EndScene (calling them re-runs their
+// per-scene code). Release your D3DPOOL_DEFAULT resources on DM_OVERLAY_RESET: the device is about to be Reset
+// (e.g. Alt+Enter, or a windowed resize).
 #pragma once
 #include <windows.h>
 #include <d3d9.h>

@@ -1,13 +1,19 @@
 # Changelog
 
-## 1.1.0 — 2026-09-28
+## 1.1.0 — 2026-09-29
 
 **Added**
+- `WindowedFilter=1` (default): the filters (Sharp, Point, Linear, xBR), MSAA, the on-screen readout and the overlay
+  API now work in windowed mode too. The backbuffer is made the size of the window instead of the game's 640x480,
+  so a window resize resets the device once: after a drag-resize ends (the image is stretched during the drag), or
+  right away for a Scale hotkey. No change to display latency. `WindowedFilter=0` = the old behaviour (D3D9
+  stretches the 640x480 image bilinearly). If a windowed Reset ever fails, DisplayManager falls back to the old
+  behaviour for the rest of the session.
 - `Filter=xBR` (experimental): the xBR-lv2 pixel-art upscaler (Hyllian, MIT), in the Alt+F cycle after Sharp. Falls
   back to Linear if the GPU can't run its shader (needs pixel shader 2.b). Tuned with `XbrStrength` (default 0.65,
   blended with the plain pixels), `XbrCorner` (A-D, default B), `XbrSlopes` (default 0) and `XbrWidth` (default
   2.0). Development hotkeys to cycle them live (Alt+S / C / E / W) are in the ini, commented out.
-- `MultiSample=0/2/4/8`: MSAA for the game's rendering in fullscreen, and a `ToggleMSAA` hotkey to switch it on (×8
+- `MultiSample=0/2/4/8`: MSAA for the game's rendering (fullscreen, and windowed with `WindowedFilter`), and a `ToggleMSAA` hotkey to switch it on (×8
   when `MultiSample=0`) and off live. It only smooths polygon edges and made no visible difference in testing, so
   both are left out of the default ini; add them by hand to try them (see the README).
 
