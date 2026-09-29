@@ -13,7 +13,7 @@ Upscale filter (`Filter`), in fullscreen and, with `WindowedFilter=1` (default),
 - `Sharp` (default): sharp-bilinear with adjustable `Sharpness`. At the default 1.5 it closely matches WindowResizer's look.
 - `Point`: hard pixels. Pixels are only even at integer scales.
 - `Linear`: bilinear.
-- `xBR` (experimental): the xBR-lv2 pixel-art upscaler. It smooths diagonal and curved sprite edges and keeps flat areas crisp. The stages and zoomed sprites are already smooth in the game's own frame, so it mostly changes character outlines and text.
+- `xBR`: the xBR-lv2 pixel-art upscaler. It smooths diagonal and curved sprite edges and keeps flat areas crisp.
 
 The same frame at ×3 with each filter (a crop at 100%; open the image for full size):
 
