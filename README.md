@@ -15,6 +15,10 @@ Upscale filter (`Filter`), in fullscreen and, with `WindowedFilter=1` (default),
 - `Linear`: bilinear.
 - `xBR` (experimental): the xBR-lv2 pixel-art upscaler. It smooths diagonal and curved sprite edges and keeps flat areas crisp. The stages and zoomed sprites are already smooth in the game's own frame, so it mostly changes character outlines and text.
 
+The same frame at ×3 with each filter (a crop at 100%; open the image for full size):
+
+![Point, Linear, Sharp 1.25 / 1.50 / 1.75 and xBR at ×3](docs/images/filters-x3.png)
+
 ## Hotkeys
 
 The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkeys]` section; a blank or commented-out line disables that hotkey.
@@ -96,6 +100,11 @@ It only loads into the th123 1.10a executable (checked by hash) and needs nothin
 
 - **Windows (MSVC):** run `build.bat`. It finds Visual Studio with `vswhere`. Output: `build\DisplayManager.dll`.
 - **mingw-w64:** run `./build.sh` with `g++-mingw-w64-i686` installed.
+
+## Credits
+
+- Testing: Quosu, Tstar_CN, Fishuwako.
+- The xBR filter is Hyllian's xBR-lv2 shader (MIT).
 
 ## License
 
