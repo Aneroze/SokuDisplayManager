@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 # meta
-set(DM_VERSION "1.1.0" CACHE STRING "DisplayManager version (major.minor.patch [.build])")
+set(DM_VERSION "1.1.1" CACHE STRING "DisplayManager version (major.minor.patch [.build])")
 set(MY_DESCRIPTION "An alternative to WindowResizer, handles fullscreen scaling and window sizing." CACHE STRINGS "description")
 project(DisplayManager 
   VERSION ${DM_VERSION}

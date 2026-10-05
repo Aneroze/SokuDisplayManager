@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 — 2026-10-05
+
+**Fixed**
+- Freeze or crash on Alt+Enter, window resize or alt-tab when another mod (e.g. SokuShaderPro) made Direct3D drop
+  DisplayManager's device hooks.
+
 ## 1.1.0 — 2026-09-29
 
 **Added**
