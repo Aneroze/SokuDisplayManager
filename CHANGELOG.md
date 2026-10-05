@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2 — 2026-10-05
+
+**Fixed**
+- PracticeEx's menu showing a second, small copy in the top-left with the Sharp and xBR filters.
+
 ## 1.1.1 — 2026-10-05
 
 **Fixed**
