@@ -23,9 +23,12 @@
 //   1. Intercept Direct3DCreate9 (IAT thunk at 0x8572A0) -> hook IDirect3D9::CreateDevice.
 //   2. In CreateDevice/Reset, when the game asks for fullscreen (Windowed == FALSE), force the
 //      backbuffer to the *native* desktop mode so the monitor never rescales (borderless: a windowed
-//      device at native size instead). These changes go into a COPY of the game's struct, which is
-//      never modified, so the game (and other mods) always see its real windowed/fullscreen state.
-//      Windowed requests pass through untouched.
+//      device at native size instead). These changes go into a COPY of the game's struct (for Reset: put
+//      into the struct only while the game's Reset wrapper runs, then the game's values go back), so the
+//      game (and other mods) always see its real windowed/fullscreen state. Windowed requests pass
+//      through untouched. Resets are intercepted at the wrapper's entry, and DM's own D3DPOOL_DEFAULT
+//      targets are released/recreated by the wrapper as one of the game's resource owners - see
+//      "device Reset" for why a Reset vtable hook alone is not enough.
 //   3. Hook the swapchain's Present: grab the 640x480 frame from the backbuffer's top-left into a
 //      render-target texture, fill the borders and upscale it centered into the backbuffer (Sharp =
 //      sharp-bilinear pixel shader quad, falling back to StretchRect; Point/Linear = StretchRect). The
@@ -76,13 +79,28 @@ static const DWORD ADDR_DESKTOP_MODE = 0x008A0FA0;
 static const DWORD ADDR_KB_COOPLEVEL_PUSH = 0x0040D8B3;
 static const DWORD ADDR_KB_DEVICE         = 0x008A01A0;
 static const BYTE  DI_NONEXCLUSIVE = 0x02, DI_FOREGROUND = 0x04, DI_NOWINKEY = 0x10;   // dinput.h DISCL_*
-// The game's Reset wrapper: bool __cdecl (void), Reset with its global present params (0x8A0F68). Under the render
-// lock (0x8A0E14) it releases every registered D3DPOOL_DEFAULT owner (list 0x8A0FC0) and the swapchain 0x8A0E34,
-// calls Reset (0x4151A8), and on success gets the swapchain again and recreates them. Returns false without doing
-// anything while the device is lost (0x8A0FB4 == D3DERR_DEVICELOST). Called by Alt+Enter (0x415220, from the window
+// The game's Reset wrapper: bool __cdecl (void), Reset with its global present params (0x8A0F68). It first sets
+// the struct's BackBufferFormat from its Windowed (0x415132: windowed = the desktop format, fullscreen =
+// X8R8G8B8). Under the render lock (0x8A0E14) it calls every registered D3DPOOL_DEFAULT owner's "lost" slot
+// (list 0x8A0FC0), releases the swapchain 0x8A0E34, calls Reset (0x4151A8), and on success gets the swapchain
+// again and calls the owners' "reset" slot. Returns false without doing anything while the device is lost
+// (0x8A0FB4 == D3DERR_DEVICELOST) or before the device exists. Called by Alt+Enter (0x415220, from the window
 // procedure) and device-lost recovery (0x407D82). On a FAILED Reset it returns without recreating (KNOWN-BUGS).
+// Every Reset the game does goes through here, so DM hooks its entry (see installGameResetHook).
 static const DWORD ADDR_GAME_RESET = 0x00415100;
 typedef bool (__cdecl *GameReset_t)();
+// Its first 6 bytes (push ebp / mov ebp,esp / and esp,-8): position-independent, so they can run from a trampoline.
+static const BYTE  GAME_RESET_PROLOGUE[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8 };
+#define GAME_PP (reinterpret_cast<D3DPRESENT_PARAMETERS *>(0x008A0F68))   // the game's present params
+// The game's render lock: the Reset wrapper, BeginScene..EndScene (0x401000 / 0x401040) and Present (0x401060) take it.
+#define GAME_RENDER_LOCK (reinterpret_cast<CRITICAL_SECTION *>(0x008A0E14))
+static const DWORD ADDR_GAME_D3D = 0x008A0E2C;   // the game's IDirect3D9* (the wrapper's first early-out)
+static const DWORD ADDR_GAME_TCL = 0x008A0FB4;   // last TestCooperativeLevel result (its second early-out)
+// Register a D3DPOOL_DEFAULT owner in the list the wrapper walks: EAX = 0x8A0E10 (the game's D3D context),
+// one stack argument (the owner, ret 4); takes the render lock, ignores duplicates. The owner is a C++ object
+// whose vtable slot 0 is "device lost" and slot 1 "device reset" (thiscall, no arguments). The game's own
+// effects (CBaseEffect, vtable 0x871334) register the same way (0x418190).
+static const DWORD ADDR_ADD_DEVICE_LISTENER = 0x004153A0;
 
 // ---- vtable indices (verified against d3d9.h) ----------------------------------------------------
 static const int VT_D3D9_CREATEDEVICE = 16;   // IDirect3D9::CreateDevice        (+0x40)
@@ -278,6 +296,7 @@ static void postWindowApply(bool firstTime);
 static void applyWindowState();
 static void applyTopmost();
 static void windowedBackbufferSize(bool entering, bool firstTime, UINT *w, UINT *h);
+static void healSlots(IDirect3DDevice9 *dev);
 
 // ---- original function pointers ------------------------------------------------------------------
 typedef IDirect3D9 * (WINAPI *Direct3DCreate9_t)(UINT);
@@ -301,11 +320,12 @@ static SetRenderTarget_t oSetRenderTarget = nullptr;
 // Overwrite one vtable slot, storing the previous entry in *orig first (so a call that goes through the
 // new slot immediately already finds the original). A single aligned pointer store, safe while the render
 // thread may be calling through the table. No-op if the slot already holds our hook: recording our own
-// hook as the "original" would make it call itself forever.
+// hook as the "original" would make it call itself forever. Made writable keeping it executable: the table may
+// share a page with code (DXVK, Wine), and healSlots re-hooks at run time while other threads run.
 static void hookSlot(void **vtable, int index, void *hook, void **orig) {
 	if (vtable[index] == hook) return;
 	DWORD old;
-	VirtualProtect(&vtable[index], sizeof(void *), PAGE_READWRITE, &old);
+	VirtualProtect(&vtable[index], sizeof(void *), PAGE_EXECUTE_READWRITE, &old);
 	*orig = vtable[index];
 	vtable[index] = hook;
 	VirtualProtect(&vtable[index], sizeof(void *), old, &old);
@@ -871,6 +891,7 @@ static bool isGameSwapChain(IDirect3DSwapChain9 *sc) {
 static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, const RECT *dst,
                                   HWND wnd, const RGNDATA *dirty, DWORD flags) {
 	if (!isGameSwapChain(sc)) return oSCPresent(sc, src, dst, wnd, dirty, flags);
+	if (g_deviceHooked && GAME_DEVICE) healSlots(GAME_DEVICE);
 	// Post-process: grab the game's g_srcW x g_srcH frame from the backbuffer's top-left, fill the borders
 	// and upscale it centered into the backbuffer.
 	if (g_active && g_captureSurf && !g_composited) {
@@ -956,13 +977,41 @@ static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDir
 	return hr;
 }
 
-static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
-	if (dev != GAME_DEVICE) return oReset(dev, pp);   // someone else's device (the vtable is shared)
-	logf("Reset: Windowed=%d %ux%u", pp ? pp->Windowed : -1,
-	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
-	releaseCapture();               // default-pool resources must be freed before Reset
-	runOverlays(DM_OVERLAY_RESET, dev, nullptr, nullptr);   // ...theirs too
-	g_composited = false;           // Reset discards the backbuffer contents
+// ---- device Reset ---------------------------------------------------------------------------------
+// Why DM doesn't rely on a Reset vtable hook alone: whenever anything records a state block (Begin/EndStateBlock -
+// D3DX does it in ValidateTechnique, FindNextValidTechnique and Effect::Begin without D3DXFX_DONOTSAVESTATE),
+// Windows' d3d9 rewrites the device vtable with its own entries, silently dropping every in-place slot hook.
+// Mods that patch the game's Reset call site (0x4151AC: InGameHostlist, ReplayHudExtras - the "ImGuiMan"
+// pattern) save the slot's value once, so if they do it after such a reset they call the runtime's Reset
+// directly. DM's Reset hook was then skipped: its D3DPOOL_DEFAULT targets were never released, Reset failed with
+// D3DERR_INVALIDCALL, and the game (which doesn't recreate its textures after a failed Reset) froze or crashed.
+// Seen with SokuShaderPro (FindNextValidTechnique at startup). So:
+//   - DM's targets are released/recreated by the game itself: DM registers as one of its D3DPOOL_DEFAULT owners
+//     (g_deviceListener), which the Reset wrapper calls around every Reset, whoever hooks what.
+//   - The present-params override hooks the wrapper's ENTRY (myGameReset), which every game Reset goes through.
+//     Other mods' patches inside the wrapper keep working (the original body runs). The vtable hook (myReset)
+//     is only the fallback when the entry can't be hooked.
+//   - The SetRenderTarget slot is re-hooked when found reset (healSlots). A Reset that skipped DM's params is
+//     detected by the listener: in fallback mode DM then stands down (passthrough) for the session instead of
+//     breaking; with the entry hook it can only be a race with a late attach, so just that one passes through.
+static bool g_listenerOn    = false;   // DM is registered in the game's D3DPOOL_DEFAULT owner list
+static bool g_gameResetHook = false;   // the wrapper entry is hooked (myGameReset); no Reset vtable hook then
+static bool g_resetSeen     = false;   // DM applied its params to the Reset in progress (cleared by the listener)
+static bool g_resetBypassed = false;   // fallback mode only: a Reset skipped DM's hook - passthrough from then on
+
+// What the wrapper writes into BackBufferFormat before resetting (0x415132), from the struct's Windowed.
+static D3DFORMAT wrapperFormat(BOOL windowed) {
+	return windowed ? reinterpret_cast<const D3DDISPLAYMODE *>(ADDR_DESKTOP_MODE)->Format : D3DFMT_X8R8G8B8;
+}
+
+// Bookkeeping before a Reset with the game's own params `pp` (both paths).
+static void beforeReset(IDirect3DDevice9 *dev, const D3DPRESENT_PARAMETERS *pp) {
+	g_resetSeen = true;
+	if (!g_listenerOn) {            // (registered: the owner "lost" call does all this, under the render lock)
+		releaseCapture();           // default-pool resources must be freed before Reset
+		runOverlays(DM_OVERLAY_RESET, dev, nullptr, nullptr);   // ...theirs too
+		g_composited = false;       // Reset discards the backbuffer contents
+	}
 	if (!g_d3d) {                   // device hooked without our CreateDevice (device-watch fallback)
 		D3DDEVICE_CREATION_PARAMETERS cp; IDirect3D9 *d3d = nullptr;
 		if (SUCCEEDED(dev->GetCreationParameters(&cp)) && SUCCEEDED(dev->GetDirect3D(&d3d)) && d3d) {
@@ -980,6 +1029,89 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 		if (GetWindowRect(g_hwnd, &r)) { g_winPos.x = r.left; g_winPos.y = r.top; g_haveWinPos = true; }
 		g_fsMon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
 	}
+}
+
+// After the Reset: recreate our targets if nothing else does (not registered as an owner yet), and set the window up
+// for a real switch. `ownersDone`: the wrapper has returned (myGameReset; it handles the not-yet-registered case
+// itself, under the lock). From myReset, inside the wrapper, the owner "reset" call is still to come, so g_resetSeen
+// stays set for it - unless the Reset failed, which gets no owner call at all.
+static void afterReset(IDirect3DDevice9 *dev, bool ok, bool ownersDone) {
+	if (ok && g_active && !ownersDone && !g_listenerOn) {
+		createCapture(dev);
+		setGameViewport(dev);
+	}
+	if (!ok || ownersDone) g_resetSeen = false;   // the next Reset must set it again
+	if (ok) {
+		// A real windowed <-> fullscreen switch: set the window up for the new state (borderless popup, or
+		// the restored frame + remembered scale/position + topmost). Deferred via postWindowApply, because
+		// the game's own SetWindowPos runs after the Reset returns and would undo it.
+		if (g_wantFullscreen != g_windowFs) {
+			g_windowFs = g_wantFullscreen;
+			postWindowApply(false);
+		}
+	}
+	g_presentLogged = false;
+}
+
+// The game's D3DPOOL_DEFAULT owner (see "device Reset" above). Called by the Reset wrapper on the thread doing the
+// Reset, under the render lock, so the render thread is never inside our Present meanwhile.
+struct DeviceListener {
+	virtual void onLost() {         // slot 0: before Reset (also on every retry of a failed one)
+		releaseCapture();
+		runOverlays(DM_OVERLAY_RESET, GAME_DEVICE, nullptr, nullptr);
+		g_composited = false;
+	}
+	virtual void onReset() {        // slot 1: after a successful Reset, the swapchain fetched again
+		IDirect3DDevice9 *dev = GAME_DEVICE;
+		if (!g_resetSeen && !g_gameResetHook) {
+			// The device was reset without DM's params, in fallback mode: the vtable hook was bypassed - and a mod
+			// that saved the runtime's Reset keeps bypassing it, so DM stands down for the session: the backbuffer
+			// is whatever the game asked for (no compositing into it at the wrong size), no WindowedFilter resize
+			// Resets, and the window state follows the game's own.
+			if (!g_resetBypassed)
+				logf("Reset happened without DisplayManager's params (Reset hook bypassed by another mod) - "
+				     "passing everything through for this session");
+			g_resetBypassed = true;
+			g_active = g_winActive = g_borderlessActive = false;
+			g_winFilterFailed = true;
+			g_wantFullscreen = g_windowFs = !GAME_PP->Windowed;
+		} else if (!g_resetSeen) {
+			// With the entry hook every game Reset goes through myGameReset, so this is only one that started before
+			// DM finished attaching (device-watch race): pass this one through, the next Reset is DM's again.
+			static bool logged = false;
+			if (!logged) { logged = true; logf("a Reset ran before DisplayManager was attached - passed through"); }
+			g_active = g_winActive = g_borderlessActive = false;
+		}
+		g_resetSeen = false;
+		if (dev && g_active) {
+			createCapture(dev);
+			setGameViewport(dev);
+		}
+	}
+};
+static DeviceListener g_deviceListener;
+
+// Add g_deviceListener to the game's owner list (ADDR_ADD_DEVICE_LISTENER: EAX = context, stdcall-style 1 arg).
+static void registerDeviceListener() {
+	if (g_listenerOn) return;
+	void *owner = &g_deviceListener;
+	DWORD fn = ADDR_ADD_DEVICE_LISTENER;
+	__asm {
+		mov  eax, 0x008A0E10
+		push owner
+		call fn
+	}
+	g_listenerOn = true;
+	logf("registered as a D3DPOOL_DEFAULT owner (released/recreated by the game's Reset wrapper)");
+}
+
+// Fallback (wrapper entry not hooked): the Reset vtable slot.
+static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
+	// Someone else's device (the vtable is shared), or DM stood down after a bypassed Reset.
+	if (dev != GAME_DEVICE || g_resetBypassed) return oReset(dev, pp);   // (the listener keeps the state in sync)
+	logf("Reset (vtable): Windowed=%d %ux%u", pp ? pp->Windowed : -1,
+	     pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+	beforeReset(dev, pp);
 	D3DPRESENT_PARAMETERS local, *use = pp;   // our changes go into a copy, never the game's struct
 	if (pp) { local = *pp; use = &local; }
 	// g_windowFs still says what the window was last set up for: fullscreen -> windowed predicts the window size
@@ -988,21 +1120,107 @@ static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) 
 	applyFullscreenParams(use, g_windowFs, g_spawnPending);
 	HRESULT hr = callWithFallback("Reset", [dev](D3DPRESENT_PARAMETERS *p) { return oReset(dev, p); }, pp, use);
 	if (pp) syncPresentParams(pp, &local);
-	if (SUCCEEDED(hr)) {
-		if (g_active) {
-			createCapture(dev);
-			setGameViewport(dev);
-		}
-		// A real windowed <-> fullscreen switch: set the window up for the new state (borderless popup, or
-		// the restored frame + remembered scale/position + topmost). Deferred via postWindowApply, because
-		// the game's own SetWindowPos runs after this Reset returns and would undo it.
-		if (g_wantFullscreen != g_windowFs) {
-			g_windowFs = g_wantFullscreen;
-			postWindowApply(false);
-		}
-	}
-	g_presentLogged = false;
+	afterReset(dev, SUCCEEDED(hr), false);
 	return hr;
+}
+
+// The wrapper's entry. The wrapper always resets with the global struct (its `push 0x8A0F68`, which call-site
+// hooks keep), so DM's params go into that struct for the duration of the call only: the game's values are put
+// back right after (plus whatever the runtime resolved), so the game and other mods never see DM's override
+// outside the Reset - writing it permanently once broke leaving borderless with Alt+Enter. A failed Reset is
+// retried through the wrapper (callWithFallback), as the game's own device-lost loop would.
+static GameReset_t oGameReset = nullptr;   // trampoline: the wrapper's original prologue, then the rest of it
+
+// Enter/leave the game's render lock (its CRITICAL_SECTION, recursive: the wrapper's own enter/leave nest) with
+// kernel32 directly - NOT the way the wrapper calls it. SokuDirectXOptimizations redirects the wrapper's lock calls
+// (0x415156 / 0x4151BC / 0x41520C) to functions that, with use_original_lock=0, also lock a std::mutex
+// (_Mtx_try, not recursive: a second lock by the same thread returns busy and it throws - verified in-game, it
+// crashed the Reset). Its present thread then waits on that mutex instead of this lock, so in that mode (default 1)
+// it isn't held off between a failed attempt and the retry - the same exposure as the game's own device-lost retry
+// loop has with it, so nothing DM can or need fix here.
+static void renderLock(bool enter) {
+	if (enter) EnterCriticalSection(GAME_RENDER_LOCK);
+	else       LeaveCriticalSection(GAME_RENDER_LOCK);
+}
+
+static bool __cdecl myGameReset() {
+	IDirect3DDevice9 *dev = GAME_DEVICE;
+	// DM not attached (yet), standing down, or one of the wrapper's own early-outs: nothing to override.
+	if (!g_enabled || !g_deviceHooked || !dev || !*reinterpret_cast<void **>(ADDR_GAME_D3D) ||
+	    *reinterpret_cast<HRESULT *>(ADDR_GAME_TCL) == D3DERR_DEVICELOST)
+		return oGameReset();
+	D3DPRESENT_PARAMETERS *gp = GAME_PP;
+	logf("Reset: Windowed=%d %ux%u", gp->Windowed, gp->BackBufferWidth, gp->BackBufferHeight);
+	D3DPRESENT_PARAMETERS game = *gp;             // the game's values, as the wrapper would pass them
+	game.BackBufferFormat = wrapperFormat(game.Windowed);
+	beforeReset(dev, &game);        // (window bookkeeping, may SetWindowPos: outside the lock)
+	// Hold the render lock from here to the end: the render thread must not composite a frame with the new output
+	// geometry (computeOutput) into the old backbuffer, nor run one between a failed attempt and its retry - a
+	// failed wrapper call returns with the lock released, the swapchain global (0x8A0E34) NULL and the game's
+	// textures released, and Present reads that global unchecked (0x401078 / 0x4081CD). It also keeps DM's params in
+	// the global invisible to anything that takes the lock. See renderLock for SokuDirectXOptimizations. Every attempt re-runs
+	// the whole wrapper body: each owner's "lost" slot (ours: release + the overlays' reset) and ReplayInputView+'s
+	// trampolines (0x415186 / 0x4151DD) - all safe to repeat, as the game's own device-lost loop does that too.
+	renderLock(true);
+	D3DPRESENT_PARAMETERS local = game;
+	applyFullscreenParams(&local, g_windowFs, g_spawnPending);
+	local.BackBufferFormat = wrapperFormat(local.Windowed);   // the wrapper re-derives it from OUR Windowed
+	if (g_active) g_bbFormat = local.BackBufferFormat;
+	D3DPRESENT_PARAMETERS used = local;
+	HRESULT hr = callWithFallback("Reset", [&](D3DPRESENT_PARAMETERS *p) -> HRESULT {
+		*gp = *p;
+		bool ok = oGameReset();
+		used = *gp;                               // what the runtime resolved / filled in
+		*gp = game;
+		if (ok) return S_OK;
+		// The wrapper returns only a bool: tell a lost device (no fallback, the game retries) from a rejected mode.
+		HRESULT tcl = dev->TestCooperativeLevel();
+		return tcl == D3DERR_DEVICELOST ? D3DERR_DEVICELOST : FAILED(tcl) ? tcl : E_FAIL;
+	}, &game, &local);
+	syncPresentParams(&game, &used);
+	*gp = game;
+	// Our owner "reset" call didn't run (still g_resetSeen): DM got registered only while this Reset was under way
+	// (device-watch attach), after the wrapper had walked the owner list. Recreate here, still under the lock.
+	if (SUCCEEDED(hr) && g_resetSeen && g_active) {
+		createCapture(dev);
+		setGameViewport(dev);
+	}
+	renderLock(false);
+	afterReset(dev, SUCCEEDED(hr), true);
+	if (FAILED(hr)) logf("Reset failed (0x%08lx)", (long)hr);
+	return SUCCEEDED(hr);
+}
+
+// Jump from the wrapper's entry to myGameReset. Only over the exact original bytes: if another mod already patched
+// the entry, DM keeps to the vtable hook instead. Installed at startup, before the first Reset.
+static void installGameResetHook() {
+	BYTE *p = reinterpret_cast<BYTE *>(ADDR_GAME_RESET);
+	if (memcmp(p, GAME_RESET_PROLOGUE, sizeof GAME_RESET_PROLOGUE) != 0) {
+		logf("Reset wrapper entry 0x%08lx already patched (%02x %02x %02x %02x %02x %02x) - using the Reset vtable "
+		     "hook", ADDR_GAME_RESET, p[0], p[1], p[2], p[3], p[4], p[5]);
+		return;
+	}
+	BYTE *t = static_cast<BYTE *>(VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+	if (!t) return;
+	memcpy(t, p, sizeof GAME_RESET_PROLOGUE);
+	t[6] = 0xE9;   // jmp back to the instruction after the copied prologue
+	*reinterpret_cast<DWORD *>(t + 7) = (ADDR_GAME_RESET + 6) - reinterpret_cast<DWORD>(t + 11);
+	FlushInstructionCache(GetCurrentProcess(), t, 16);
+	DWORD old;
+	if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) {
+		logf("Reset wrapper entry not writable (VirtualProtect error %lu) - using the Reset vtable hook",
+		     GetLastError());
+		VirtualFree(t, 0, MEM_RELEASE);
+		return;
+	}
+	oGameReset = reinterpret_cast<GameReset_t>(t);
+	p[0] = 0xE9;
+	*reinterpret_cast<DWORD *>(p + 1) = reinterpret_cast<DWORD>(&myGameReset) - (ADDR_GAME_RESET + 5);
+	p[5] = 0x90;
+	VirtualProtect(p, 6, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), p, 6);
+	g_gameResetHook = true;
+	logf("Reset wrapper entry hooked");
 }
 
 // Hook the swapchain's Present. The swapchain vtable lives in d3d9.dll and is shared by every swapchain
@@ -1029,8 +1247,10 @@ static HMODULE moduleOf(void *p) {
 	                          (LPCSTR)p, &m);
 	return m;
 }
+static HMODULE g_runtime = nullptr;   // the D3D runtime's module (where the device's QueryInterface lives)
 static void captureSceneFns(void **vt) {
 	HMODULE rt = moduleOf(vt[VT_UNK_QUERYINTERFACE]);
+	g_runtime = rt;
 	HMODULE mb = moduleOf(vt[VT_DEV_BEGINSCENE]), me = moduleOf(vt[VT_DEV_ENDSCENE]);
 	g_sceneDirect = rt && mb == rt && me == rt;
 	if (g_sceneDirect) {
@@ -1051,12 +1271,34 @@ static bool hookDevice(IDirect3DDevice9 *dev) {
 	if (!dev || InterlockedCompareExchange(&g_deviceHookClaim, 1, 0) != 0) return false;
 	void **vt = *(void ***)dev;
 	captureSceneFns(vt);
-	hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
+	if (!g_gameResetHook) hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
 	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
 	hookSwapChain(dev);
-	g_deviceHooked = true;
-	logf("device vtable hooked (Reset, SetRenderTarget) + swapchain Present");
+	g_deviceHooked = true;     // before registering: a Reset that calls our owner must also find DM attached
+	registerDeviceListener();
+	logf("device vtable hooked (%sSetRenderTarget) + swapchain Present", g_gameResetHook ? "" : "Reset, ");
 	return true;
+}
+
+// Re-hook SetRenderTarget (the mid-frame viewport pin) when a vtable reset (see "device Reset") put the slot back to
+// the runtime's own function. Only then: if another mod's hook sits there, it is left alone - two mods that each
+// re-hook over the other would end up calling each other forever. Render thread, every Present; `seen` caches the
+// last foreign value checked, so moduleOf only runs when the slot changes.
+// The Reset slot is deliberately NOT re-hooked in fallback mode: in-game, every Reset after such a re-hook failed
+// (D3DERR_INVALIDCALL, even straight into the runtime with DM's targets released; not reproducible outside th123),
+// while without it the bypass is detected and DM stands down cleanly.
+static void healSlots(IDirect3DDevice9 *dev) {
+	static void *seen = nullptr;
+	void **vt = *(void ***)dev;
+	void *cur = vt[VT_DEV_SETRT];
+	if (cur == (void *)mySetRenderTarget || cur == seen) return;
+	if (!g_runtime || moduleOf(cur) != g_runtime) { seen = cur; return; }
+	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
+	seen = nullptr;
+	static unsigned count = 0;
+	count++;
+	if (count <= 3 || count % 100 == 0)   // the count shows whether it happens every frame; can't flood the log
+		logf("SetRenderTarget hook was dropped (device vtable reset by the runtime) - hooked again (%u so far)", count);
 }
 
 // WindowResizer and the older IntegerFullscreen / ExclusiveFullscreen do the same job; together with them DM
@@ -1091,9 +1333,8 @@ static bool isExecutableImage(void *fn) {
 // Fallback path when our Direct3DCreate9 hook never fires - e.g. SokuDirectXOptimizations creates a
 // Direct3D9Ex device (via Direct3DCreate9Ex, a different export) or otherwise intercepts creation. We
 // poll the game's device global (0x8A0E30) and hook the device once it exists, regardless of who made it.
-// Best-effort only: it stands down as soon as the normal CreateDevice hook is in place, and a late attach
-// can still miss Resets if another mod has already redirected the game's Reset call site (0x4151AC) to a
-// saved copy of the original Reset.
+// Best-effort only: it stands down as soon as the normal CreateDevice hook is in place. Resets are caught at
+// the wrapper's entry (hooked at startup), so a late attach no longer misses them.
 static DWORD WINAPI deviceWatchThread(LPVOID) {
 	for (int i = 0; i < 1200 && !g_deviceHooked && !g_createDeviceHooked; i++) {   // ~60s
 		IDirect3DDevice9 *dev = GAME_DEVICE;
@@ -1559,7 +1800,7 @@ static void windowedBackbufferSize(bool entering, bool firstTime, UINT *w, UINT 
 
 // WindowedFilter: after the window's client area changed (posted from wndProc, so it runs from the game's message
 // loop, between frames, like Alt+Enter), Reset to a backbuffer of the new size if it differs. The Reset goes through
-// the game's own wrapper, which releases and recreates its D3DPOOL_DEFAULT resources around it; myReset sizes it.
+// the game's own wrapper, which releases and recreates its D3DPOOL_DEFAULT resources around it; myGameReset sizes it.
 // Not during a drag (the old backbuffer is stretched until WM_EXITSIZEMOVE) or while a window setup is still queued
 // (that sets the final size and posts again).
 static void onWindowResized() {
@@ -1658,13 +1899,13 @@ static void installWndProc() {
 // On Alt+Enter th123 calls Reset from its window procedure (0x4082DE -> 0x415220) and, AFTER Reset
 // returns, does its own SetWindowPos: windowed = HWND_NOTOPMOST, re-centered on the primary monitor, sized
 // with fixed-frame metrics (wrong for our WS_THICKFRAME, giving a non-4:3 client); fullscreen = move the
-// client to the primary's origin. Anything done inside myReset is undone by that, so we post a private
+// client to the primary's origin. Anything done inside the Reset is undone by that, so we post a private
 // message to the game window and do the work in wndProc, after the game's own window code has run.
 // Falls back to applying immediately if the window isn't subclassed.
 static void postWindowApply(bool firstTime) {
 	if (firstTime) g_spawnPending = true;
 	if (!g_applyMsg) g_applyMsg = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
-	g_applyPending = true;   // before posting: myReset can run off the window thread, which may handle it at once
+	g_applyPending = true;   // before posting: a Reset can run off the window thread, which may handle it at once
 	if (g_hwnd && g_origWndProc && g_applyMsg && PostMessageA(g_hwnd, g_applyMsg, 0, 0))
 		return;
 	applyWindowState();
@@ -1921,6 +2162,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	loadConfig();
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
+		installGameResetHook();
 		if (g_allowWinKey) applyAllowWinKey();   // input-only; independent of the display handling
 		atexit(persistState);
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));

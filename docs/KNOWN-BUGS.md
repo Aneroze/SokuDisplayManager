@@ -210,7 +210,67 @@ straight into the backbuffer; only the border rects are filled (`fillBorders`), 
 to the backbuffer too. The stage is only created when the pointers can't be trusted (another mod hooked the slots
 first) - then the old redraw-safe stage path is used. Fractional Sharpness (1.00-4.00) is unchanged.
 
+## Bug 10 — Reset failed (freeze/crash) once another mod made d3d9 reset the device vtable — ✅ FIXED in 1.1.1 (2026-10-05)
+**Report**: SokuShaderPro (jyanf) + DM: D3DERR_INVALIDCALL on device Reset, then the game freezes; fine without DM.
+Reproduced on the Copy install (window resize with WindowedFilter, Alt+Enter): Reset fails, then the AV at
+`0x40527C` (the texture-size helper, see the report below) or a hang.
+
+**Cause**: whenever anything records a state block (`BeginStateBlock`/`EndStateBlock`), Windows' d3d9 rewrites the
+device vtable with its own entries, dropping every in-place slot hook (DM's Reset + SetRenderTarget, SokuHarness's
+EndScene...). D3DX does that in `FindNextValidTechnique`, `ValidateTechnique` and `Effect::Begin` without
+`D3DXFX_DONOTSAVESTATE`; ShaderPro calls `FindNextValidTechnique` at startup (~250 ms in). ReplayHudExtras and
+InGameHostlist ("ImGuiMan" pattern) then patch the Reset call site `0x4151AC` and save the slot's value once - now the
+runtime's own Reset. From then on every Reset skipped DM: its D3DPOOL_DEFAULT targets were never released ->
+INVALIDCALL -> the game's wrapper leaves its textures released (the crash / no-render described below). Verified
+standalone (`Begin/EndStateBlock` and the D3DX calls drop a slot hook; `CreateStateBlock`, effect creation and
+`Begin(DONOTSAVESTATE)` don't) and in-game (vtable watched from launch).
+
+**Fix**:
+- DM registers as one of the game's D3DPOOL_DEFAULT owners (`0x4153A0`): the Reset wrapper itself releases and
+  recreates DM's targets around every Reset, whoever hooks what.
+- The present-params override hooks the wrapper's entry `0x415100` (all game Resets go through it). The original body
+  still runs, so other mods' patches inside it keep working (audit of both installs: IGH / ReplayHudExtras / SokuCC
+  at the call site `0x4151A6-B1`, ReplayInputView+ trampolines at `0x415186` / `0x4151DD`, SokuDirectXOptimizations
+  on the lock calls `0x415158` / `0x4151BE` / `0x41520E`; nobody at the entry). DM's params go into the global struct
+  only during the call; the game's values are restored right after (Bug 5 stays fixed).
+- The Reset vtable hook is only a fallback (entry bytes not the expected ones). There, a bypassed Reset is detected by
+  the owner callback and DM stands down for the session (passthrough) instead of breaking.
+- SetRenderTarget is re-hooked when found back at the runtime's function (never over another mod's hook). The Reset
+  slot is deliberately not re-hooked: in-game, every Reset after such a re-hook failed (unexplained; not
+  reproducible standalone).
+
+**Tested** (Copy install, mods as usual + ShaderPro, its BattleEx forced on): resize + Alt+Enter both ways with and
+without ShaderPro, borderless, MSAA x4, WindowedFilter=0, fallback mode (entry hook disabled in a test build), the
+SetRenderTarget re-hook (SokuHarness off). No failed Reset, no crash; the composited frame is correct afterwards.
+Not tested: DXVK/Wine, alt-tab device loss in exclusive (only incidentally).
+
+**Review follow-ups** (independent review, 2026-10-05):
+- A failed attempt returns with the render lock released and the swapchain global NULL, which the game's Present
+  reads unchecked: the retries could crash. `myGameReset` now holds the game's render lock across all attempts and
+  the global's restore. Verified with a test build forcing every first attempt to fail (+300 ms before the retry):
+  retries succeed and DM composites after them; the same build without the lock crashed.
+- Second review claimed SokuDirectXOptimizations' mutex is re-entrant and that the lock should go through the
+  wrapper's (redirected) lock calls, because with `use_original_lock=0` (default 1) its present thread waits on that
+  mutex instead of the critical section. Tried and REVERTED: the mutex is a `std::mutex` (type `_Mtx_try` = 2 read
+  from the live process, not `_Mtx_plain`), so the wrapper's nested lock returned busy and SokuDirectXOptimizations
+  threw - the game crashed into SaveRep's exception handler on the first retry. DM takes the critical section with
+  kernel32 directly again. In that non-default mode its present thread isn't held off between a failed attempt and
+  the retry - the same exposure the game's own device-lost retry loop has with it. The lock is now taken before DM's
+  output geometry changes (after the window bookkeeping), so the render thread can't composite one frame with the new
+  geometry into the old backbuffer.
+- A device-watch attach racing a Reset (registered after the wrapper walked the owner list) now gets its targets
+  recreated by `myGameReset`, under the lock, instead of compositing nothing until the next Reset.
+- The session-wide stand-down only happens in fallback mode; with the entry hook an unexpected Reset (a late attach
+  racing a Reset) is just passed through. `g_deviceHooked` is set before the owner is registered.
+- `g_resetSeen` is cleared after a failed Reset, so a later bypass isn't mistaken for DM's own.
+- SetRenderTarget re-hooks are counted (log: first 3, then every 100th). Watching the device vtable during an Okuu
+  practice match with ShaderPro's per-draw `Begin(…, 0)` forced on: no vtable reset after startup (D3DX records a
+  pass's state block once), so re-hooking at Present is enough.
+- `hookSlot` keeps the page executable; the entry-hook install checks `VirtualProtect`.
+
 ## Under investigation: random crash / frozen rendering around Alt+Enter (external report, 2026-09-28)
+> **Possibly explained by Bug 10** (2026-10-05, unconfirmed): any mod that records a state block after DM hooked
+> drops DM's Reset hook (before 1.1.1), which gives exactly this crash / no-render on the next Reset.
 
 **Report** (a player, borderless and exclusive both): randomly on fullscreen toggles (or UAC), more often after the
 game has run a while, th123 crashes in the texture-size helper **`0x405200`**
