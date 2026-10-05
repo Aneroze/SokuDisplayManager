@@ -181,6 +181,11 @@ static IDirect3DSurface9      *g_captureSurf = nullptr;
 // Begin/EndScene go through other mods' vtable hooks, and the redraw some of them do there (PracticeEx's
 // 640x480 menu) must be kept off the upscaled frame. See drawSharp.
 static IDirect3DSurface9      *g_stageSurf   = nullptr;
+// Tiny render target bound while our own BeginScene/EndScene run (drawShaderQuad). PracticeEx hooks the D3D runtime's
+// EndScene CODE with Detours (whatever function the vtable slot held when it set up - the runtime's own, unless
+// another mod had hooked the slot first), so even the direct calls above run it, and it draws its 640x480 menu into
+// the bound target: on our finished frame that was the small menu copy in the top-left (KNOWN-BUGS Bug 11).
+static IDirect3DSurface9      *g_sceneGuard  = nullptr;
 // The D3D runtime's own BeginScene/EndScene, read from the device vtable right after CreateDevice (before
 // other mods patch the shared slots). Calling them directly means our Sharp pass does not re-fire every other
 // mod's per-scene hook once more per frame (double work, double-ticked mod logic, PracticeEx's menu dupe).
@@ -597,6 +602,7 @@ static void releaseCapture() {
 	if (g_ps)          { g_ps->Release();          g_ps = nullptr; }
 	if (g_psXbr)       { g_psXbr->Release();       g_psXbr = nullptr; }
 	if (g_stageSurf)   { g_stageSurf->Release();   g_stageSurf = nullptr; }
+	if (g_sceneGuard)  { g_sceneGuard->Release();  g_sceneGuard = nullptr; }
 	if (g_captureSurf) { g_captureSurf->Release(); g_captureSurf = nullptr; }
 	if (g_captureTex)  { g_captureTex->Release();  g_captureTex = nullptr; }
 }
@@ -658,6 +664,10 @@ static void createCapture(IDirect3DDevice9 *dev) {
 	if (!g_sceneDirect)
 		hrStage = dev->CreateRenderTarget(g_bbW, g_bbH, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE,
 		                                  &g_stageSurf, nullptr);
+	// Scene guard (64x64: smaller than any depth buffer, so drawing into it is valid; what lands there is discarded).
+	HRESULT hrGuard = dev->CreateRenderTarget(64, 64, g_bbFormat, D3DMULTISAMPLE_NONE, 0, FALSE, &g_sceneGuard, nullptr);
+	if (FAILED(hrGuard)) logf("scene guard: CreateRenderTarget failed (0x%08lx) - other mods' scene hooks draw on the frame",
+	                          (long)hrGuard);
 	// Sharp filter shader (falls back to StretchRect if this fails).
 	HRESULT hrPs = dev->CreatePixelShader((const DWORD *)g_sharpBilinearPS, &g_ps);
 	// xBR needs ps_2_b (any ps_3_0-class GPU takes it); if it can't be created, xBR falls back to StretchRect.
@@ -684,10 +694,11 @@ static bool g_composited = false;
 // math is a no-op, so Sharpness has NO visible effect (docs/WindowResizer-rendering-research.md L166-173).
 // Sharpness 1 = aligned bilinear; higher narrows the interpolation band toward point (~1.5 matches WR).
 //
-// Normally (g_sceneDirect) the runtime's own BeginScene/EndScene are called, so no other mod's scene hook runs
-// and the quad goes straight into the backbuffer (`target` == bb). Otherwise they go through the vtable and
-// the quad is drawn into the offscreen stage while the backbuffer is bound at BeginScene/EndScene: a mod may
-// redraw its 640x480 menu (PracticeEx) into whatever is bound then, and the caller overwrites that.
+// Normally (g_sceneDirect) the runtime's own BeginScene/EndScene are called, so no other mod's vtable scene hook
+// runs and the quad goes straight into the backbuffer (`target` == bb). Otherwise they go through the vtable and
+// the quad is drawn into the offscreen stage. Either way BeginScene/EndScene run with g_sceneGuard bound: a mod
+// that hooks the runtime's own functions inline (PracticeEx Detours EndScene) still runs, and draws its 640x480
+// menu into whatever is bound - the guard, instead of our finished frame.
 //
 // Returns false if nothing was drawn, so the caller can fall back to StretchRect instead of presenting a
 // stale or uninitialised stage.
@@ -696,10 +707,12 @@ static bool drawShaderQuad(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect
                            D3DTEXTUREFILTERTYPE samplerFilter) {
 	if (!ps || !g_captureTex || !g_stateBlock) return false;
 	g_stateBlock->Capture();
-	dev->SetRenderTarget(0, bb);
+	// Begin/EndScene run with the scene guard bound (see g_sceneGuard), the quad's target only in between.
+	IDirect3DSurface9 *guard = g_sceneGuard ? g_sceneGuard : bb;
+	dev->SetRenderTarget(0, guard);
 	HRESULT hrScene = g_sceneDirect ? g_origBeginScene(dev) : dev->BeginScene();
-	if (FAILED(hrScene)) { g_stateBlock->Apply(); return false; }
-	if (target != bb) dev->SetRenderTarget(0, target);
+	if (FAILED(hrScene)) { dev->SetRenderTarget(0, bb); g_stateBlock->Apply(); return false; }
+	dev->SetRenderTarget(0, target);
 	dev->SetPixelShader(ps);
 	dev->SetVertexShader(nullptr);
 	dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
@@ -726,8 +739,9 @@ static bool drawShaderQuad(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb, IDirect
 		{ R, B, 0.0f, 1.0f, 1.0f, 1.0f },
 	};
 	HRESULT hr = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
-	if (target != bb) dev->SetRenderTarget(0, bb);
+	dev->SetRenderTarget(0, guard);
 	if (g_sceneDirect) g_origEndScene(dev); else dev->EndScene();
+	dev->SetRenderTarget(0, bb);
 	g_stateBlock->Apply();
 	return SUCCEEDED(hr);
 }

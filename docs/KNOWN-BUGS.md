@@ -54,6 +54,8 @@ there, so it is a harmless no-op. Verified in borderless fullscreen with the ful
 test first, then the DM-built fix; user-confirmed the menu now renders with no dupe and the centered menu
 correct). Diagnosed with `tools/SokuHarness` (`pex`/`dupe`/`capafterdm`/`cfcolor`/`clearsrc` commands).
 
+**Came back as Bug 11** (2026-10-05: PracticeEx Detours the runtime EndScene, so direct calls don't avoid it).
+
 **Superseded by Bug 4:** the re-clear is gone; the upscale is now composed in an offscreen stage and the
 PracticeEx redraw lands in the (wiped) backbuffer instead. Old follow-up note, kept for history: the
 re-clear covered only the top-left grab-source rect. If another
@@ -267,6 +269,25 @@ Not tested: DXVK/Wine, alt-tab device loss in exclusive (only incidentally).
   practice match with ShaderPro's per-draw `Begin(…, 0)` forced on: no vtable reset after startup (D3DX records a
   pass's state block once), so re-hooking at Present is enough.
 - `hookSlot` keeps the page executable; the entry-hook install checks `VirtualProtect`.
+
+## Bug 11 — PracticeEx menu duplicated (small, top-left) again, with Sharp / xBR — ✅ FIXED in 1.1.2 (2026-10-05)
+**Symptom** (user, main install, windowed / borderless / exclusive): while the PracticeEx menu is open, a small
+640x480 copy of just its menu panel sits in the top-left, steady. Only with Sharp and xBR (DM's own scene); Point
+and Linear (StretchRect, no scene) are clean. Screenshot: `F:\Games\Touhou\screenshots\practiceex-dupe-bug-2.png`.
+
+**Cause:** PracticeEx (2.1.0, `PracticeEx-original.dll`) hooks the device's Reset and EndScene with Microsoft
+Detours: it reads the vtable slots (16 / 42) at setup and patches the CODE of whatever function they hold. Its
+EndScene hook renders its UI (`[renderer]->vfunc+8`) into the bound render target, then runs the real EndScene. When
+it patches the runtime's own EndScene, DM's "direct" EndScene call (Increment 3) still runs it, after DM's upscale -
+so the menu is drawn a second time, at 640x480, onto the finished frame. Not reproducible on the Copy install at
+first because SokuHarness had hooked the EndScene slot before PracticeEx set up, so PracticeEx detoured the
+harness's function instead of the runtime's (new harness switch `SOKUHARNESS_NODEVHOOKS=1` reproduces it).
+
+**Fix:** `drawShaderQuad` binds a 64x64 scratch render target (`g_sceneGuard`) around its own BeginScene and
+EndScene and the quad's target only while drawing the quad, so anything another mod's scene hook draws there lands
+in the guard. (PracticeEx's UI still renders twice per frame, as before - just not visibly.) Verified on the Copy
+install with the dupe reproducing: windowed Sharp, windowed xBR, borderless Sharp - clean; Resets (resize, Alt+Enter
+both ways) fine.
 
 ## Under investigation: random crash / frozen rendering around Alt+Enter (external report, 2026-09-28)
 > **Possibly explained by Bug 10** (2026-10-05, unconfirmed): any mod that records a state block after DM hooked
