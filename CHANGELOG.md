@@ -3,6 +3,12 @@
 ## Unreleased
 
 **Added**
+- `DpiAware=1` (default): DisplayManager handles Windows' display scaling (125%, 150%, ...) for the game window
+  instead of Windows. Windows no longer stretches the window like a picture (blurry), so window sizes are real screen
+  pixels on every monitor (`WindowScale=x2` = a 1280x960 game area) and only `Filter` decides the look. Players
+  with display scaling who didn't use the "Override high DPI scaling behavior" setting see the window get smaller and
+  sharper (at 150%, x2 used to fill 1920x1440 of the screen, often too big to fit so x1 was used); with that setting,
+  a monitor whose scale differs from the main one's is no longer stretched either. `DpiAware=0` = the old behaviour.
 - Experimental, off by default: sharp sprites. `SpriteSharpness` (characters) and `BackgroundSharpness` (stage) draw
   the sprites the game zooms with its camera through a sharp-bilinear shader instead of hard pixels, so every sprite
   pixel comes out the same size and edges stop crawling while the camera zooms. Suggested values 2.5 / 1.5; both

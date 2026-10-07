@@ -171,3 +171,18 @@ window appears, hence the 5 s wait.
     scrolling), and the shader forced CLAMP, so everything past the texture's edge repeated the edge texels. Fixed:
     CLAMP only for quads whose texture coordinates stay inside the texture; others keep the game's addressing. Dust
     Storm in Practice for 30 s: normal dust (also checked by the user). **Verified 2026-10-07.**
+
+## DpiAware (unreleased)
+
+Main monitor 2560x1440 at 150%, left monitor 1920x1080 at 125% (x -1920..0 in physical coordinates). Measured from a
+per-monitor-aware script (physical pixels); WindowScale=x2.
+
+1. Copy install - th123.exe has the HIGHDPIAWARE compatibility setting (HKLM), so the process mode is already set:
+   DM logs "through the thread mode"; window per-monitor aware; client 1280x960 on both monitors (was 1536x1152 on
+   the 125% one); exclusive fullscreen native 2560x1440; position saved / restored. The title bar keeps the main
+   monitor's size on the 125% monitor (no WM_DPICHANGED in thread mode) - cosmetic. **Verified 2026-10-07.**
+2. CC2 install - no compatibility setting: "per-monitor aware (v2)"; client 1280x960 on both monitors, WM_DPICHANGED
+   keeps the client and the position, only the frame resizes; position saved / restored. **Verified 2026-10-07.**
+3. CC2, `DpiAware=0`: unaware, stretched by Windows (x2 doesn't fit at 150%, so x1 = 960x720 physical; 800x600 on the
+   125% monitor) - the old behaviour. **Verified 2026-10-07.**
+4. Not tested: Windows 7 / 8.1 fallbacks (system aware / per-monitor v1), exclusive fullscreen on the 125% monitor.

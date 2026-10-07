@@ -167,6 +167,7 @@ static int     g_fsW       = 0;        // manual fullscreen display-mode overrid
 static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
+static bool    g_dpiAware  = true;    // [Display] DpiAware: declare per-monitor DPI awareness (see "DPI awareness")
 static bool    g_allowWinKey = false;  // [Input] AllowWinKey: drop the game's DISCL_NOWINKEY (vanilla blocks the Win key)
 static bool    g_latinPending = false; // [Input] StartInLatinInput, not done yet (see startInLatinInput)
 static volatile int g_msaaCfg = 0;     // MultiSample: requested MSAA sample count (0 = off); ToggleMSAA flips it
@@ -291,6 +292,56 @@ static void logf(const char *fmt, ...) {
 	va_end(ap);
 	fputc('\n', g_logFile);
 	fflush(g_logFile);
+}
+
+// ---- DPI awareness ([Display] DpiAware) ---------------------------------------------------------------
+// th123 (2008) declares no DPI awareness, so with display scaling Windows stretches its window as a bitmap (blurry at
+// 125% / 150%, on top of DM's own filter), or - with the "Override high DPI scaling behavior: Application"
+// compatibility setting players use against that - still on every monitor whose scale differs from the main one's.
+// DpiAware=1 (default) makes the game per-monitor DPI aware (v2) before it creates its window: window sizes are real
+// pixels on every monitor, and DM's filter alone decides the look. When the process mode is already fixed (that
+// compatibility setting, a manifest, another mod), the thread mode is used instead: a window takes its DPI mode from
+// the thread that creates it - the game's main thread, which runs Initialize - and DM's other threads that measure
+// monitors (the render thread with SokuDirectXOptimizations, the device watch) switch to it too (dpiThread).
+static const HANDLE DPI_PER_MONITOR_V2 = (HANDLE)(LONG_PTR)-4;   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+typedef BOOL (WINAPI *SetProcessDpiAwarenessContext_t)(HANDLE);
+typedef HANDLE (WINAPI *SetThreadDpiAwarenessContext_t)(HANDLE);
+typedef UINT (WINAPI *GetDpiForWindow_t)(HWND);
+typedef BOOL (WINAPI *AdjustWindowRectExForDpi_t)(LPRECT, DWORD, BOOL, DWORD, UINT);
+static SetThreadDpiAwarenessContext_t pSetThreadDpiAwarenessContext = nullptr;
+static GetDpiForWindow_t              pGetDpiForWindow = nullptr;
+static AdjustWindowRectExForDpi_t     pAdjustWindowRectExForDpi = nullptr;
+static bool g_dpiOn = false;            // per-monitor v2 is in effect for the game window
+static bool g_dpiThreadMode = false;    // ...through the thread mode: DM's other threads set it too
+
+static void dpiThread() {
+	if (g_dpiThreadMode) pSetThreadDpiAwarenessContext(DPI_PER_MONITOR_V2);
+}
+
+static void applyDpiAwareness() {
+	HMODULE u = GetModuleHandleA("user32.dll");
+	pSetThreadDpiAwarenessContext = (SetThreadDpiAwarenessContext_t)GetProcAddress(u, "SetThreadDpiAwarenessContext");
+	pGetDpiForWindow = (GetDpiForWindow_t)GetProcAddress(u, "GetDpiForWindow");
+	pAdjustWindowRectExForDpi = (AdjustWindowRectExForDpi_t)GetProcAddress(u, "AdjustWindowRectExForDpi");
+	auto setProcess = (SetProcessDpiAwarenessContext_t)GetProcAddress(u, "SetProcessDpiAwarenessContext");
+	if (setProcess && pSetThreadDpiAwarenessContext && pGetDpiForWindow && pAdjustWindowRectExForDpi) {   // Windows 10 1703+
+		if (setProcess(DPI_PER_MONITOR_V2)) {
+			g_dpiOn = true;
+			logf("DPI: per-monitor aware (v2)");
+			return;
+		}
+		DWORD err = GetLastError();
+		g_dpiOn = g_dpiThreadMode = pSetThreadDpiAwarenessContext(DPI_PER_MONITOR_V2) != nullptr;
+		logf("DPI: the process mode is already set (error %lu: the compatibility setting, a manifest or another mod) - "
+		     "%s", err, g_dpiOn ? "per-monitor aware (v2) through the thread mode" : "thread mode FAILED, left as it is");
+		return;
+	}
+	// Older Windows: per-monitor without frame scaling (8.1), else system aware (Vista / 7).
+	typedef HRESULT (WINAPI *SetProcessDpiAwareness_t)(int);
+	HMODULE shcore = LoadLibraryA("shcore.dll");
+	auto setAwareness = shcore ? (SetProcessDpiAwareness_t)GetProcAddress(shcore, "SetProcessDpiAwareness") : nullptr;
+	if (setAwareness) logf("DPI: per-monitor aware (Windows 8.1 mode): 0x%08lx", (long)setAwareness(2));
+	else              logf("DPI: system aware: %d", SetProcessDPIAware());
 }
 
 // ini names of the current Mode / Filter.
@@ -1361,6 +1412,7 @@ static void registerDeviceListener() {
 
 // Fallback (wrapper entry not hooked): the Reset vtable slot.
 static HRESULT WINAPI myReset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
+	dpiThread();
 	// Someone else's device (the vtable is shared), or DM stood down after a bypassed Reset.
 	if (dev != GAME_DEVICE || g_resetBypassed) return oReset(dev, pp);   // (the listener keeps the state in sync)
 	logf("Reset (vtable): Windowed=%d %ux%u", pp ? pp->Windowed : -1,
@@ -1398,6 +1450,7 @@ static void renderLock(bool enter) {
 }
 
 static bool __cdecl myGameReset() {
+	dpiThread();
 	IDirect3DDevice9 *dev = GAME_DEVICE;
 	// DM not attached (yet), standing down, or one of the wrapper's own early-outs: nothing to override.
 	if (!g_enabled || !g_deviceHooked || !dev || !*reinterpret_cast<void **>(ADDR_GAME_D3D) ||
@@ -1597,6 +1650,7 @@ static bool isExecutableImage(void *fn) {
 // Best-effort only: it stands down as soon as the normal CreateDevice hook is in place. Resets are caught at
 // the wrapper's entry (hooked at startup), so a late attach no longer misses them.
 static DWORD WINAPI deviceWatchThread(LPVOID) {
+	dpiThread();
 	for (int i = 0; i < 1200 && !g_deviceHooked && !g_createDeviceHooked; i++) {   // ~60s
 		IDirect3DDevice9 *dev = GAME_DEVICE;
 		void **vt = dev ? *(void ***)dev : nullptr;
@@ -1636,6 +1690,7 @@ static DWORD WINAPI deviceWatchThread(LPVOID) {
 static HRESULT WINAPI myCreateDevice(IDirect3D9 *self, UINT adapter, D3DDEVTYPE type, HWND focus,
                                      DWORD behavior, D3DPRESENT_PARAMETERS *pp,
                                      IDirect3DDevice9 **out) {
+	dpiThread();
 	// Only the game's own call (it passes &GAME_DEVICE) is ours; a device another mod or overlay creates
 	// must not touch the game window, monitor or present params.
 	if (out != &GAME_DEVICE) {
@@ -2006,6 +2061,7 @@ static void loadConfig() {
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
 	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
+	g_dpiAware     = GetPrivateProfileIntA("Display", "DpiAware", 1, g_iniPath) != 0;
 	g_latinPending = GetPrivateProfileIntA("Input", "StartInLatinInput", 0, g_iniPath) != 0;
 	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
 	g_msaaIni      = g_msaaCfg;
@@ -2129,14 +2185,18 @@ static HHOOK g_kbHook = nullptr;
 // Total non-client border size (width, height) of the game window while windowed. Its style is taken as it
 // will be then, so the window-size prediction for a new backbuffer (windowedBackbufferSize) can run before the
 // window is set up: the saved normal style while borderless, and our drag-resize border before installWndProc.
-static void windowBorders(int *bx, int *by) {
+// With DpiAware, the frame is sized for the DPI of the window's monitor (`dpi`, 0 = the window's current one).
+static void windowBordersForDpi(UINT dpi, int *bx, int *by) {
 	LONG style = g_styleSaved ? g_savedStyle : GetWindowLongA(g_hwnd, GWL_STYLE);
 	LONG ex = g_styleSaved ? g_savedExStyle : GetWindowLongA(g_hwnd, GWL_EXSTYLE);
 	if (g_resizable) style |= WS_THICKFRAME;
 	RECT r = { 0, 0, 0, 0 };
-	AdjustWindowRectEx(&r, style, GetMenu(g_hwnd) != nullptr, ex);
+	if (g_dpiOn && !dpi) dpi = pGetDpiForWindow(g_hwnd);
+	if (g_dpiOn && dpi) pAdjustWindowRectExForDpi(&r, style, GetMenu(g_hwnd) != nullptr, ex, dpi);
+	else                AdjustWindowRectEx(&r, style, GetMenu(g_hwnd) != nullptr, ex);
 	*bx = r.right - r.left; *by = r.bottom - r.top;
 }
+static void windowBorders(int *bx, int *by) { windowBordersForDpi(0, bx, by); }
 
 // Where setWindowScaled(n, pos) puts the window: returns the scale it can use (n, or the largest one that fits
 // the work area of the monitor it lands on) and the window's top-left in *px/*py (pos, or where the window is,
@@ -2373,6 +2433,23 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	if (g_latinMsg && msg == g_latinMsg) {   // StartInLatinInput: now, or from the timer once the window is foreground
 		startInLatinInput(h);
 		if (g_latinPending && !g_latinTimer) g_latinTimer = SetTimer(nullptr, 0, 200, latinTimerProc);
+		return 0;
+	}
+	if (msg == 0x02E0 /* WM_DPICHANGED */ && g_dpiOn) {
+		// DpiAware, moved to a monitor with another scale: keep the game area's pixel size - only the frame changes -
+		// and the window where it is. Windows' suggested rect (lParam) is placed for a scaled window and would move it:
+		// away from where DM (spawn position, PersistPosition) or the player's drag just put it. (Fullscreen: the
+		// window covers the monitor already; nothing to do.)
+		if (!g_wantFullscreen && !g_borderlessActive) {
+			RECT cr, wr;
+			GetClientRect(h, &cr);
+			GetWindowRect(h, &wr);
+			int bx, by; windowBordersForDpi(HIWORD(wp), &bx, &by);
+			SetWindowPos(h, nullptr, wr.left, wr.top, cr.right - cr.left + bx, cr.bottom - cr.top + by,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+			logf("DPI changed to %u: client %ldx%ld kept at (%ld,%ld)", HIWORD(wp), cr.right - cr.left,
+			     cr.bottom - cr.top, wr.left, wr.top);
+		}
 		return 0;
 	}
 	switch (msg) {
@@ -2744,6 +2821,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	loadConfig();
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
+		if (g_dpiAware) applyDpiAwareness();   // before the game creates its window (Initialize runs before WinMain)
 		installGameResetHook();
 		installSharpSpriteDetours();
 		if (g_allowWinKey) applyAllowWinKey();   // input-only; independent of the display handling
@@ -2752,11 +2830,11 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	}
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
 	     "resizable=%d persist=%d pos=%s(%d,%d) persistPos=%d borderless=%d vsync=%d allowWinKey=%d "
-	     "latinInput=%d multiSample=%d windowedFilter=%d spriteSharpness=%.2f backgroundSharpness=%.2f rest=%.2f/%.2f",
+	     "latinInput=%d multiSample=%d windowedFilter=%d spriteSharpness=%.2f backgroundSharpness=%.2f rest=%.2f/%.2f dpiAware=%d",
 	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
 	     g_resizable, g_persist, g_havePos ? "" : "unset ", g_posX, g_posY, g_persistPos, g_borderless, g_vsync,
 	     g_allowWinKey, g_latinPending, g_msaaCfg, g_winFilter, (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE],
-	     (double)g_sprRest[SPR_CHARS], (double)g_sprRest[SPR_STAGE]);
+	     (double)g_sprRest[SPR_CHARS], (double)g_sprRest[SPR_STAGE], g_dpiOn);
 	return TRUE;
 }
 
