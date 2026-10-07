@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.3 — 2026-10-07
 
 **Added**
 - `DpiAware=1` (default): DisplayManager handles Windows' display scaling (125%, 150%, ...) for the game window
