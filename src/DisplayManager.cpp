@@ -47,13 +47,19 @@
 
 #include <windows.h>
 #include <Shlwapi.h>
+#include <imm.h>
 #include <d3d9.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
+#include <cmath>
+#include <string>
+#include <vector>
 #include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
 #include "xbr.h"             // compiled ps_2_b bytecode: g_xbrPS2b[]
+#include "sharpsprite.h"     // compiled ps_2_0 bytecode: g_sharpSpritePS[]
 #include "DisplayManagerOverlay.h"
+#include "version.h"          // DM_VERSION
 
 // ---- game constants (th123 1.10a, fixed addresses - the game has no ASLR) -------------------------
 // Build hash the loader passes to CheckVersion; only this exact build is patched.
@@ -109,6 +115,7 @@ static const int VT_DEV_PRESENT       = 17;   // IDirect3DDevice9::Present      
 static const int VT_DEV_SETRT         = 37;   // IDirect3DDevice9::SetRenderTarget (+0x94)
 static const int VT_DEV_BEGINSCENE    = 41;   // IDirect3DDevice9::BeginScene      (+0xA4)
 static const int VT_DEV_ENDSCENE      = 42;   // IDirect3DDevice9::EndScene        (+0xA8)
+static const int VT_DEV_DRAWPRIMUP    = 83;   // IDirect3DDevice9::DrawPrimitiveUP (+0x14C)
 static const int VT_UNK_QUERYINTERFACE = 0;   // IUnknown::QueryInterface          (+0x00)
 static const int VT_SC_PRESENT        = 3;    // IDirect3DSwapChain9::Present     (+0x0C)
 // NOTE: the game presents via the SWAPCHAIN (0x8A0E34)->Present, not the device, so we hook that.
@@ -136,11 +143,24 @@ static float   g_xbrStrength = 0.65f;  // 0..1 blend: plain texel .. full xBR (f
 static int     g_xbrCorner   = 1;      // corner type 0..3 = A..D
 static bool    g_xbrSlopes   = false;  // also smooth 30/60-degree edges (xBR level 2); off looked better at x3
 static float   g_xbrWidth    = 2.0f;   // edge anti-aliasing band, x the original (2 = softer; picked at x3)
+// Sharp sprites (experimental): the game's POINT-sampled character sprites / stage tiles drawn through a
+// sharp-bilinear shader (see "sharp sprites"). Per layer: the live sharpness k (0 = off) and the k a toggle hotkey
+// turns back on (the ini value, else the suggested default).
+enum { SPR_CHARS = 0, SPR_STAGE = 1, SPR_LAYERS };
+static volatile float g_sprK[SPR_LAYERS]    = { 0.0f, 0.0f };
+static float          g_sprLastK[SPR_LAYERS] = { 2.5f, 1.5f };
+static const float    SPR_K_MIN = 0.5f, SPR_K_MAX = 16.0f;
+// At a whole-number scale (the resting zoom: characters x2, stage x1): 0 = the game's own POINT draw, 1 = the full
+// filter, in between a mix (SpriteRestStrength / BackgroundRestStrength). See "sharp sprites".
+static volatile float g_sprRest[SPR_LAYERS] = { 0.0f, 0.5f };
+static bool           g_sprWanted = false;   // an ini value or one of its hotkeys is set: install the hooks
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
-static int     g_posX      = -1;       // spawn position (-1 = don't move the window)
-static int     g_posY      = -1;
+static bool    g_persistPos = true;    // save the window's position to the ini on exit (next spawn position)
+static bool    g_havePos   = false;    // PositionX/Y set (not blank): move the window there on spawn
+static int     g_posX      = -1;       // spawn position (negative values are valid: monitors left of / above
+static int     g_posY      = -1;       // the primary, or a window flush with an edge)
 static bool    g_borderless = false;   // fullscreen as a borderless window instead of exclusive (higher latency)
 static bool    g_winFilter = true;     // WindowedFilter: windowed, a window-sized backbuffer + our upscale
 static int     g_fsW       = 0;        // manual fullscreen display-mode override (0 = auto / native)
@@ -148,6 +168,7 @@ static int     g_fsH       = 0;
 static int     g_fsRefresh = 0;        // manual refresh override (0 = keep the native refresh)
 static int     g_vsync     = -1;       // exclusive PresentationInterval: -1 = the game's own, 0 = immediate, 1 = vsync
 static bool    g_allowWinKey = false;  // [Input] AllowWinKey: drop the game's DISCL_NOWINKEY (vanilla blocks the Win key)
+static bool    g_latinPending = false; // [Input] StartInLatinInput, not done yet (see startInLatinInput)
 static volatile int g_msaaCfg = 0;     // MultiSample: requested MSAA sample count (0 = off); ToggleMSAA flips it
 static int     g_msaaIni   = 0;        // MultiSample as read from the ini (what ToggleMSAA turns on, 8 if it's 0)
 static volatile bool g_msaaApply = false;   // ToggleMSAA pressed: the render thread recreates the MSAA targets
@@ -158,7 +179,8 @@ static FILE   *g_logFile   = nullptr;
 // also what a commented-out / missing ini line produces).
 enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER,
               ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_XBR_STRENGTH, ACT_XBR_CORNER, ACT_XBR_SLOPES,
-              ACT_XBR_WIDTH, ACT_COUNT };
+              ACT_XBR_WIDTH, ACT_SPR_TOGGLE, ACT_SPR_DOWN, ACT_SPR_UP, ACT_BG_TOGGLE, ACT_BG_DOWN, ACT_BG_UP,
+              ACT_SPR_REST_DOWN, ACT_SPR_REST_UP, ACT_BG_REST_DOWN, ACT_BG_REST_UP, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;
@@ -248,6 +270,11 @@ static bool     g_spawnPending = false; // first-spawn window setup posted but n
 static volatile bool g_applyPending = false; // a posted window-state apply hasn't run yet
 static UINT     g_resizeMsg  = 0;       // private registered message: resize the windowed backbuffer (wndProc)
 static bool     g_inSizeMove = false;   // inside a drag-resize / move loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE)
+// PersistPosition: the window's last top-left while it was a normal window (windowed, not minimized / maximized, not in
+// a fullscreen switch or with our window setup still queued), so exiting from fullscreen or minimized saves where the
+// window really was rather than where the game or D3D9 parked it.
+static bool     g_haveLastPos = false;
+static POINT    g_lastPos     = { 0, 0 };
 
 static void logf(const char *fmt, ...) {
 	if (!g_log) return;
@@ -321,6 +348,9 @@ static SCPresent_t oSCPresent = nullptr;
 
 typedef HRESULT (WINAPI *SetRenderTarget_t)(IDirect3DDevice9 *, DWORD, IDirect3DSurface9 *);
 static SetRenderTarget_t oSetRenderTarget = nullptr;
+
+typedef HRESULT (WINAPI *DrawPrimitiveUP_t)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, const void *, UINT);
+static DrawPrimitiveUP_t oDrawPrimitiveUP = nullptr;
 
 // Overwrite one vtable slot, storing the previous entry in *orig first (so a call that goes through the
 // new slot immediately already finds the original). A single aligned pointer store, safe while the render
@@ -777,7 +807,7 @@ static void setGameViewport(IDirect3DDevice9 *dev) {
 // exclusive flip, and (unlike a DrawPrimitiveUP quad) needs no BeginScene/EndScene, so it can't
 // re-trigger a mod's per-scene overlay redraw. Rows are 5 bits, MSB = leftmost column. Only the
 // characters used by the OSD messages are defined; OSD_CHARS is the parallel lookup key (uppercase).
-static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXBMDW";
+static const char OSD_CHARS[] = "0123456789. SHARPCEFILNOTUXBMDWG";
 static const BYTE OSD_FONT[][7] = {
 	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, // 0
 	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, // 1
@@ -810,6 +840,7 @@ static const BYTE OSD_FONT[][7] = {
 	{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, // M
 	{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, // D
 	{0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, // W
+	{0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, // G
 };
 static int osdGlyph(char c) {
 	for (int i = 0; OSD_CHARS[i]; i++) if (OSD_CHARS[i] == c) return i;
@@ -989,6 +1020,194 @@ static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDir
 	    SUCCEEDED(hr))
 		setGameViewport(dev);
 	return hr;
+}
+
+// ---- sharp sprites (experimental: SpriteSharpness / BackgroundSharpness) -----------------------------
+// The game draws the characters and the stage tiles POINT-sampled at its camera zoom, which is almost never a whole
+// number: some texels come out a screen pixel wider than others, and edges crawl while the camera zooms. Those draws
+// go through sharp-bilinear instead (shader/sharpsprite.hlsl): texel interiors stay flat, texel edges get a blend
+// band of 1/(k*scale) texels, scale = the draw's own screen pixels per texel (from the quad's sides). It happens in
+// the game's own 640x480 frame, so it is independent of the upscale Filter and of whether DM composites at all.
+// Which draws: those made inside the players' draw (0x46E0D0) and the stage background (0x470500, 0x470570) and
+// foreground (0x4705D0) draws. Their entries are detoured to wrappers that mark the layer for the DrawPrimitiveUP
+// hook - entries rather than the battle render's calls to them (0x47A8D0), because mods that change the draw order
+// (CharactersInForeground) NOP the game's call to that and call these functions themselves. Only
+// XYZRHW|DIFFUSE|TEX1 quads with MAG=POINT and the plain fixed-function setup (stage 0 = texture x diffuse, stage 1
+// off, no pixel shader) are changed: the drop shadows (LINEAR) and the stage's effect pass (0x470240, which 0x470500
+// tail-jumps to; its own shaders) are left alone. Everything set is restored right after the draw: the game's
+// renderer caches its sampler state (0x896B4C) and skips setting what it thinks is already set. Prototyped in
+// SokuHarness (docs/PLAN-zoom-wobble.md).
+static volatile int g_sprLayer = -1;   // SPR_* while inside one of the wrapped draws (render thread), else -1
+static IDirect3DPixelShader9 *g_psSprite = nullptr;   // survives Reset (not a D3DPOOL_DEFAULT resource)
+static bool g_sprFailed = false;       // CreatePixelShader failed: off for the session
+static bool g_sprLogged[SPR_LAYERS] = { false, false };
+
+typedef void (__fastcall *GameDraw_t)(void *self);   // thiscall without arguments = fastcall with ecx = this
+static GameDraw_t oPlayersDraw = nullptr, oStageBgA = nullptr, oStageBgB = nullptr, oStageFg = nullptr;
+
+static void sprWrap(GameDraw_t fn, void *self, int layer) {
+	int prev = g_sprLayer;
+	g_sprLayer = layer;
+	fn(self);
+	g_sprLayer = prev;
+}
+static void __fastcall myPlayersDraw(void *self) { sprWrap(oPlayersDraw, self, SPR_CHARS); }
+static void __fastcall myStageBgA(void *self)    { sprWrap(oStageBgA, self, SPR_STAGE); }
+static void __fastcall myStageBgB(void *self)    { sprWrap(oStageBgB, self, SPR_STAGE); }
+static void __fastcall myStageFg(void *self)     { sprWrap(oStageFg, self, SPR_STAGE); }
+
+// Detour the game function at `fn` to `hook`. Its first `n` bytes must be `expect` (whole, position-independent
+// instructions; nothing jumps back into them): they move to a trampoline that continues at fn + n, which is returned
+// (nullptr = left alone, e.g. another mod already patched that entry).
+static BYTE *g_trampolines = nullptr;
+static int   g_trampolineUsed = 0;
+static GameDraw_t detourEntry(DWORD fn, const BYTE *expect, int n, void *hook) {
+	BYTE *p = (BYTE *)fn;
+	if (memcmp(p, expect, n) != 0) return nullptr;
+	if (!g_trampolines)
+		g_trampolines = (BYTE *)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!g_trampolines || g_trampolineUsed + n + 5 > 4096) return nullptr;
+	BYTE *tr = g_trampolines + g_trampolineUsed;
+	g_trampolineUsed += 16;
+	memcpy(tr, p, n);
+	tr[n] = 0xE9;
+	*(LONG *)(tr + n + 1) = (LONG)((fn + n) - ((DWORD)tr + n + 5));
+	DWORD old;
+	if (!VirtualProtect(p, n, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
+	p[0] = 0xE9;
+	*(LONG *)(p + 1) = (LONG)((DWORD)hook - (fn + 5));
+	for (int i = 5; i < n; i++) p[i] = 0xCC;
+	VirtualProtect(p, n, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), p, n);
+	return (GameDraw_t)tr;
+}
+
+// Screen pixels per texel along u and v for a 4-vertex quad (strip or fan), from two of its sides.
+static bool quadScale(D3DPRIMITIVETYPE t, UINT count, const BYTE *pb, UINT stride, UINT uvOff, UINT tw, UINT th,
+                      float *su, float *sv) {
+	int other;
+	if (t == D3DPT_TRIANGLESTRIP && count == 2) other = 2;
+	else if (t == D3DPT_TRIANGLEFAN && count == 2) other = 3;
+	else return false;
+	*su = *sv = 0.0f;
+	const int ends[2] = { 1, other };
+	const float *v0 = (const float *)pb, *t0 = (const float *)(pb + uvOff);
+	for (int e = 0; e < 2; e++) {
+		const float *v = (const float *)(pb + (size_t)ends[e] * stride);
+		const float *uv = (const float *)(pb + (size_t)ends[e] * stride + uvOff);
+		float dx = v[0] - v0[0], dy = v[1] - v0[1], du = (uv[0] - t0[0]) * tw, dv = (uv[1] - t0[1]) * th;
+		float L = sqrtf(dx * dx + dy * dy), T = sqrtf(du * du + dv * dv);
+		if (T < 0.5f) return false;
+		if (fabsf(du) >= fabsf(dv)) *su = L / T; else *sv = L / T;
+	}
+	return *su > 0.0f && *sv > 0.0f;
+}
+
+struct SprSaved { DWORD addrU, addrV; float c[8]; };
+
+// Set up the sharp-sprite shader for this draw if it is one of the plain POINT sprite quads; false = leave it alone.
+static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data, UINT stride, int layer,
+                     SprSaved *sv) {
+	DWORD fvf = 0;
+	if (!data || FAILED(dev->GetFVF(&fvf)) || (fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZRHW ||
+	    !(fvf & D3DFVF_DIFFUSE) || (fvf & D3DFVF_TEXCOUNT_MASK) != D3DFVF_TEX1)
+		return false;
+	DWORD mag = 0, cop = 0, ca1 = 0, ca2 = 0, aop = 0, aa1 = 0, aa2 = 0, cop1 = 0;
+	dev->GetSamplerState(0, D3DSAMP_MAGFILTER, &mag);
+	dev->GetTextureStageState(0, D3DTSS_COLOROP, &cop);  dev->GetTextureStageState(0, D3DTSS_COLORARG1, &ca1);
+	dev->GetTextureStageState(0, D3DTSS_COLORARG2, &ca2); dev->GetTextureStageState(0, D3DTSS_ALPHAOP, &aop);
+	dev->GetTextureStageState(0, D3DTSS_ALPHAARG1, &aa1); dev->GetTextureStageState(0, D3DTSS_ALPHAARG2, &aa2);
+	dev->GetTextureStageState(1, D3DTSS_COLOROP, &cop1);
+	bool diff2 = (ca2 == D3DTA_DIFFUSE || ca2 == D3DTA_CURRENT) && (aa2 == D3DTA_DIFFUSE || aa2 == D3DTA_CURRENT);
+	if (mag != D3DTEXF_POINT || cop != D3DTOP_MODULATE || aop != D3DTOP_MODULATE || ca1 != D3DTA_TEXTURE ||
+	    aa1 != D3DTA_TEXTURE || !diff2 || cop1 != D3DTOP_DISABLE)
+		return false;
+	IDirect3DPixelShader9 *curPs = nullptr;
+	if (SUCCEEDED(dev->GetPixelShader(&curPs)) && curPs) { curPs->Release(); return false; }
+	IDirect3DBaseTexture9 *bt = nullptr;
+	UINT tw = 0, th = 0;
+	if (FAILED(dev->GetTexture(0, &bt)) || !bt) return false;
+	if (bt->GetType() == D3DRTYPE_TEXTURE) {
+		D3DSURFACE_DESC d;
+		if (SUCCEEDED(((IDirect3DTexture9 *)bt)->GetLevelDesc(0, &d))) { tw = d.Width; th = d.Height; }
+	}
+	bt->Release();
+	float su = 0.0f, svv = 0.0f;
+	UINT uvOff = 16 + 4 + ((fvf & D3DFVF_SPECULAR) ? 4 : 0);   // after XYZRHW, DIFFUSE (and SPECULAR)
+	if (!tw || !th || stride < uvOff + 8 || !quadScale(t, count, (const BYTE *)data, stride, uvOff, tw, th, &su, &svv))
+		return false;
+	// At a whole-number scale, POINT is already even, while sharp-bilinear depends on the sprite's sub-pixel position:
+	// when the camera puts texel edges right on pixel centres (e.g. the resting x2 zoom with the camera centre on a
+	// half pixel), it blends every edge 50/50 and every other column / row comes out as a mix - visibly blurry. In
+	// exchange it moves smoothly where POINT steps a whole pixel at a time (the stage panning at x1). So a whole axis
+	// gets the layer's rest strength (0 = the nearest texel = POINT, 1 = the full filter; the shader mixes the two),
+	// and a draw that is whole on both axes with strength 0 is left to the game's own POINT draw.
+	const bool wholeU = fabsf(su - floorf(su + 0.5f)) < 0.001f, wholeV = fabsf(svv - floorf(svv + 0.5f)) < 0.001f;
+	const float rest = g_sprRest[layer];
+	if (wholeU && wholeV && rest <= 0.0f) return false;
+	if (!g_psSprite) {
+		HRESULT hr = dev->CreatePixelShader((const DWORD *)g_sharpSpritePS, &g_psSprite);
+		if (FAILED(hr)) {
+			g_psSprite = nullptr;
+			g_sprFailed = true;
+			g_sprK[SPR_CHARS] = g_sprK[SPR_STAGE] = 0.0f;
+			logf("sharp sprites: CreatePixelShader failed (0x%08lx) - off", (long)hr);
+			return false;
+		}
+	}
+	dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
+	dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
+	dev->GetPixelShaderConstantF(0, sv->c, 2);
+	const float c[8] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, wholeU ? rest : 1.0f, wholeV ? rest : 1.0f };
+	dev->SetPixelShader(g_psSprite);
+	dev->SetPixelShaderConstantF(0, c, 2);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	if (!g_sprLogged[layer]) {
+		g_sprLogged[layer] = true;
+		logf("sharp sprites: first %s draw (%ux%u texture, x%.2f/x%.2f, k=%.2f)",
+		     layer == SPR_CHARS ? "character" : "stage", tw, th, su, svv, (double)g_sprK[layer]);
+	}
+	return true;
+}
+
+static void sprEnd(IDirect3DDevice9 *dev, const SprSaved *sv) {
+	dev->SetPixelShader(nullptr);   // sprBegin only runs without a pixel shader bound
+	dev->SetPixelShaderConstantF(0, sv->c, 2);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
+	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);
+}
+
+static HRESULT WINAPI myDrawPrimitiveUP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data,
+                                       UINT stride) {
+	int layer = g_sprLayer;
+	SprSaved sv;
+	bool sharp = layer >= 0 && g_sprK[layer] > 0.0f && dev == GAME_DEVICE &&
+	             sprBegin(dev, t, count, data, stride, layer, &sv);
+	HRESULT hr = oDrawPrimitiveUP(dev, t, count, data, stride);
+	if (sharp) sprEnd(dev, &sv);
+	return hr;
+}
+
+// Only when SpriteSharpness / BackgroundSharpness or one of their hotkeys is set: with all of them commented out,
+// nothing is patched. The game-code detours from Initialize (before the game runs), the DrawPrimitiveUP hook from
+// hookDevice.
+static void installSharpSpriteDetours() {
+	if (!g_sprWanted) return;
+	static const BYTE players[] = { 0x51, 0x56, 0x8B, 0xF1, 0x8B, 0x4E, 0x40 };   // push ecx; push esi; mov esi,ecx; mov ecx,[esi+40]
+	static const BYTE bgA[]     = { 0x53, 0x55, 0x56, 0x8B, 0xE9 };               // push ebx; push ebp; push esi; mov ebp,ecx
+	static const BYTE layer[]   = { 0x8B, 0x41, 0x2C, 0x53, 0x56 };               // mov eax,[ecx+2C]; push ebx; push esi
+	oPlayersDraw = detourEntry(0x0046E0D0, players, sizeof players, (void *)myPlayersDraw);
+	oStageBgA    = detourEntry(0x00470500, bgA, sizeof bgA, (void *)myStageBgA);
+	oStageBgB    = detourEntry(0x00470570, layer, sizeof layer, (void *)myStageBgB);
+	oStageFg     = detourEntry(0x004705D0, layer, sizeof layer, (void *)myStageFg);
+	logf("sharp sprites: sprites=%.2f background=%.2f; game draws hooked: characters %s, stage %d/%d/%d",
+	     (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE], oPlayersDraw ? "ok" : "FAILED (entry already patched)",
+	     oStageBgA != nullptr, oStageBgB != nullptr, oStageFg != nullptr);
+}
+static void installSharpSprites(IDirect3DDevice9 *dev) {
+	if (!g_sprWanted) return;
+	hookSlot(*(void ***)dev, VT_DEV_DRAWPRIMUP, (void *)myDrawPrimitiveUP, (void **)&oDrawPrimitiveUP);
 }
 
 // ---- device Reset ---------------------------------------------------------------------------------
@@ -1288,31 +1507,38 @@ static bool hookDevice(IDirect3DDevice9 *dev) {
 	if (!g_gameResetHook) hookSlot(vt, VT_DEV_RESET, (void *)myReset, (void **)&oReset);
 	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
 	hookSwapChain(dev);
+	installSharpSprites(dev);
 	g_deviceHooked = true;     // before registering: a Reset that calls our owner must also find DM attached
 	registerDeviceListener();
 	logf("device vtable hooked (%sSetRenderTarget) + swapchain Present", g_gameResetHook ? "" : "Reset, ");
 	return true;
 }
 
-// Re-hook SetRenderTarget (the mid-frame viewport pin) when a vtable reset (see "device Reset") put the slot back to
-// the runtime's own function. Only then: if another mod's hook sits there, it is left alone - two mods that each
-// re-hook over the other would end up calling each other forever. Render thread, every Present; `seen` caches the
-// last foreign value checked, so moduleOf only runs when the slot changes.
+// Re-hook SetRenderTarget (the mid-frame viewport pin) and, with sharp sprites, DrawPrimitiveUP when a vtable reset
+// (see "device Reset") put the slot back to the runtime's own function. Only then: if another mod's hook sits there,
+// it is left alone - two mods that each re-hook over the other would end up calling each other forever. Render
+// thread, every Present; `seen` caches the last foreign value checked, so moduleOf only runs when the slot changes.
 // The Reset slot is deliberately NOT re-hooked in fallback mode: in-game, every Reset after such a re-hook failed
 // (D3DERR_INVALIDCALL, even straight into the runtime with DM's targets released; not reproducible outside th123),
 // while without it the bypass is detected and DM stands down cleanly.
+struct HealedSlot { int index; void *hook; void **orig; const char *name; void *seen; unsigned count; };
+static void healSlot(void **vt, HealedSlot &s) {
+	void *cur = vt[s.index];
+	if (cur == s.hook || cur == s.seen) return;
+	if (!g_runtime || moduleOf(cur) != g_runtime) { s.seen = cur; return; }
+	hookSlot(vt, s.index, s.hook, s.orig);
+	s.seen = nullptr;
+	s.count++;
+	if (s.count <= 3 || s.count % 100 == 0)   // the count shows whether it happens every frame; can't flood the log
+		logf("%s hook was dropped (device vtable reset by the runtime) - hooked again (%u so far)", s.name, s.count);
+}
 static void healSlots(IDirect3DDevice9 *dev) {
-	static void *seen = nullptr;
+	static HealedSlot setRT = { VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget, "SetRenderTarget" };
+	static HealedSlot drawUP = { VT_DEV_DRAWPRIMUP, (void *)myDrawPrimitiveUP, (void **)&oDrawPrimitiveUP,
+	                             "DrawPrimitiveUP" };
 	void **vt = *(void ***)dev;
-	void *cur = vt[VT_DEV_SETRT];
-	if (cur == (void *)mySetRenderTarget || cur == seen) return;
-	if (!g_runtime || moduleOf(cur) != g_runtime) { seen = cur; return; }
-	hookSlot(vt, VT_DEV_SETRT, (void *)mySetRenderTarget, (void **)&oSetRenderTarget);
-	seen = nullptr;
-	static unsigned count = 0;
-	count++;
-	if (count <= 3 || count % 100 == 0)   // the count shows whether it happens every frame; can't flood the log
-		logf("SetRenderTarget hook was dropped (device vtable reset by the runtime) - hooked again (%u so far)", count);
+	healSlot(vt, setRT);
+	if (g_sprWanted) healSlot(vt, drawUP);
 }
 
 // WindowResizer and the older IntegerFullscreen / ExclusiveFullscreen do the same job; together with them DM
@@ -1481,88 +1707,219 @@ static bool iniHasKey(const char *key) {
 	return lstrcmpA(v, "\x01") != 0;
 }
 
-// Line starting (after blanks) with `key`, optional blanks, '='? Case-insensitive, like GetPrivateProfileString.
-static bool isKeyLine(const char *p, const char *key) {
-	int n = lstrlenA(key);
-	if (StrCmpNIA(p, key, n) != 0) return false;
-	p += n;
-	while (*p == ' ' || *p == '\t') p++;
-	return *p == '=';
+// ---- ini upgrade -------------------------------------------------------------------------------------
+// The shipped DisplayManager.ini is embedded in the DLL (DisplayManager.rc) and IniVersion in the ini records the
+// version that last wrote it. When that is older than this build, the ini is rebuilt from the embedded one with the
+// user's settings carried over, so an upgraded ini has exactly the keys, order and comments of a fresh install. For
+// each key in the template:
+//   - set in the user's ini           -> Key=<their value> (also over a template line that ships commented out)
+//   - commented out in the user's ini -> their commented line (a commented-out hotkey stays disabled)
+//   - absent                          -> the template line (a key their version didn't have yet)
+// Keys the template doesn't have (e.g. MultiSample, which is added by hand) are kept at the end of their section and
+// unknown sections at the end of the file; the user's own comments are not kept. Values whose meaning changed are
+// fixed up first (fixupIniValues). An ini from a newer version is left alone.
+
+// "a.b.c[.d]" as one comparable number (0 for a missing / blank version: older than any).
+static ULONGLONG parseVersion(const char *s) {
+	ULONGLONG v = 0;
+	for (int i = 0; i < 4; i++) {
+		v = (v << 16) | (WORD)StrToIntA(s);
+		while (*s >= '0' && *s <= '9') s++;
+		if (*s == '.') s++;
+	}
+	return v;
+}
+#define INI_VERSION(a, b, c) (((ULONGLONG)(a) << 48) | ((ULONGLONG)(b) << 32) | ((ULONGLONG)(c) << 16))
+
+static ULONGLONG iniVersion() {
+	char v[32] = {0};
+	GetPrivateProfileStringA("Display", "IniVersion", "", v, sizeof(v), g_iniPath);
+	return parseVersion(v);
 }
 
-// One-time ini upgrades for inis from older versions (only with PersistState=1, i.e. when the user lets us
-// write the ini), done in place so values, comments and key order are kept (WritePrivateProfileString would
-// append new keys at the end of the section instead):
-//   - rename IntegerScaling (<= 1.0.3) to FullscreenScale;
-//   - add WindowScale (1.0.3+) with its comment right after it, set to the value loadConfig falls back to.
-// Skipped for UTF-16 inis and on any I/O error - the fallback reads in loadConfig keep old files working.
-static void migrateIni() {
-	const bool rename = iniHasKey(LEGACY_FS_SCALE_KEY) && !iniHasKey("FullscreenScale");
-	const bool addWin = !iniHasKey("WindowScale");
-	if (!rename && !addWin) return;
-	HANDLE f = CreateFileA(g_iniPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-	if (f == INVALID_HANDLE_VALUE) return;
-	DWORD size = GetFileSize(f, nullptr), got = 0;
-	char *buf = (size != INVALID_FILE_SIZE && size < (1u << 20)) ? (char *)malloc(size + 1) : nullptr;
-	bool ok = buf && ReadFile(f, buf, size, &got, nullptr) && got == size;
-	CloseHandle(f);
-	if (!ok || (size >= 2 && (BYTE)buf[0] == 0xFF && (BYTE)buf[1] == 0xFE)) { free(buf); return; }
-	buf[size] = 0;
-	// The fullscreen scale line in [Display], under the name it has now.
-	const char *key = rename ? LEGACY_FS_SCALE_KEY : "FullscreenScale";
-	bool inDisplay = false;
-	char *hit = nullptr;
-	for (char *line = buf; *line && !hit; ) {
-		char *p = line;
-		while (*p == ' ' || *p == '\t') p++;
-		if (*p == '[') inDisplay = StrCmpNIA(p, "[Display]", 9) == 0;
-		else if (inDisplay && isKeyLine(p, key)) hit = p;
-		char *nl = strchr(line, '\n');
-		line = nl ? nl + 1 : line + lstrlenA(line);
-	}
-	if (!hit) { free(buf); return; }
+// One ini line. Keys: `active` = Key=value, otherwise a commented-out key (";Key=value", no blank after the ';').
+struct IniLine {
+	enum Kind { OTHER, SECTION, KEY, COMMENTED_KEY } kind;
+	std::string section, key, value, raw;
+	bool used;
+};
 
-	const char *eolStr = strstr(buf, "\r\n") ? "\r\n" : "\n";   // match the file's line endings
-	char *eol = strchr(hit, '\n');
-	char *after = eol ? eol + 1 : buf + size;                    // start of the line after the scale line
-	char ins[640] = "";
-	if (addWin) {                                                // same text as the shipped ini
-		char val[32] = {0};
-		GetPrivateProfileStringA("Display", key, "x2", val, sizeof(val), g_iniPath);
-		const char *e = eolStr;
-		wsprintfA(ins, "%s%s"
-		          "; WINDOW size (windowed mode), as a whole-number scale of 640x480%s"
-		          "; (x2 = a 1280x960 client area). The Scale hotkeys change it while windowed;%s"
-		          "; it is separate from the fullscreen Mode above. Reduced to the largest scale%s"
-		          "; that fits your monitor's work area, and the window is kept on-screen. If%s"
-		          "; missing, the FullscreenScale value is used.%s"
-		          "WindowScale=%s%s",
-		          eol ? "" : e, e, e, e, e, e, e, val, e);
+static std::string trimmed(const std::string &s) {
+	size_t b = s.find_first_not_of(" \t"), e = s.find_last_not_of(" \t");
+	return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+}
+
+static std::vector<IniLine> parseIni(const char *text) {
+	std::vector<IniLine> out;
+	std::string section;
+	for (const char *p = text; *p; ) {
+		const char *nl = strchr(p, '\n');
+		std::string raw(p, nl ? nl - p : strlen(p));
+		p = nl ? nl + 1 : p + raw.size();
+		if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+		IniLine l = { IniLine::OTHER, section, "", "", raw, false };
+		std::string t = trimmed(raw);
+		if (!t.empty() && t[0] == '[') {
+			size_t close = t.find(']');
+			section = l.section = t.substr(1, close == std::string::npos ? std::string::npos : close - 1);
+			l.kind = IniLine::SECTION;
+		} else if (!t.empty()) {
+			bool commented = t[0] == ';';
+			size_t k = commented ? 1 : 0, eq = t.find('=');
+			std::string key = eq == std::string::npos ? "" : trimmed(t.substr(k, eq - k));
+			bool ident = !key.empty() && t[k] != ' ' && t[k] != '\t';
+			for (char c : key) ident = ident && (IsCharAlphaNumericA(c) || c == '_');
+			if (ident) {
+				l.kind = commented ? IniLine::COMMENTED_KEY : IniLine::KEY;
+				l.key = key;
+				l.value = trimmed(t.substr(eq + 1));
+			}
+		}
+		out.push_back(l);
 	}
-	const char *keyEnd = hit + lstrlenA(key);
+	if (!out.empty() && out.back().raw.empty()) out.pop_back();   // the file's final newline
+	return out;
+}
+
+// The first line of `kind` for section/key in `lines` (case-insensitive, like GetPrivateProfileString), or nullptr.
+static IniLine *findIniKey(std::vector<IniLine> &lines, IniLine::Kind kind, const std::string &section,
+                           const std::string &key) {
+	for (IniLine &l : lines)
+		if (l.kind == kind && !lstrcmpiA(l.section.c_str(), section.c_str()) && !lstrcmpiA(l.key.c_str(), key.c_str()))
+			return &l;
+	return nullptr;
+}
+
+// Mark every line of section/key (any kind) as carried over, so duplicates aren't appended as unknown keys.
+static void markIniKeyUsed(std::vector<IniLine> &lines, const std::string &section, const std::string &key) {
+	for (IniLine &l : lines)
+		if (l.kind != IniLine::OTHER && l.kind != IniLine::SECTION &&
+		    !lstrcmpiA(l.section.c_str(), section.c_str()) && !lstrcmpiA(l.key.c_str(), key.c_str()))
+			l.used = true;
+}
+
+// Values whose name or meaning changed, rewritten into what this version's template means by them.
+static void fixupIniValues(std::vector<IniLine> &user, ULONGLONG from) {
+	// FullscreenScale was called IntegerScaling up to 1.0.3 (if both are there, FullscreenScale wins, as in loadConfig).
+	if (IniLine *old = findIniKey(user, IniLine::KEY, "Display", LEGACY_FS_SCALE_KEY)) {
+		if (findIniKey(user, IniLine::KEY, "Display", "FullscreenScale")) markIniKeyUsed(user, "Display", LEGACY_FS_SCALE_KEY);
+		else old->key = "FullscreenScale";
+	}
+	// A missing WindowScale (before 1.0.3) means the FullscreenScale value (loadConfig's fallback).
+	IniLine *fs = findIniKey(user, IniLine::KEY, "Display", "FullscreenScale");
+	if (fs && !findIniKey(user, IniLine::KEY, "Display", "WindowScale")) {
+		IniLine ws = *fs;
+		ws.key = "WindowScale";
+		user.push_back(ws);
+	}
+	// Up to 1.1.2 a negative (or missing) PositionX/Y meant "don't move the window", which is spelled blank now.
+	if (from < INI_VERSION(1, 1, 3)) {
+		IniLine *x = findIniKey(user, IniLine::KEY, "Display", "PositionX");
+		IniLine *y = findIniKey(user, IniLine::KEY, "Display", "PositionY");
+		if (!x || !y || StrToIntA(x->value.c_str()) < 0 || StrToIntA(y->value.c_str()) < 0) {
+			if (x) x->value.clear();
+			if (y) y->value.clear();
+		}
+	}
+}
+
+// Append the user's not yet carried over keys of `section` to `out`, before the blank lines that end the section.
+static void appendLeftoverKeys(std::vector<std::string> &out, std::vector<IniLine> &user, const std::string &section) {
+	if (section.empty()) return;                                // keys before any section are never read
+	size_t at = out.size();
+	while (at > 0 && trimmed(out[at - 1]).empty()) at--;
+	std::vector<std::string> add;
+	for (IniLine &l : user)
+		if (l.kind == IniLine::KEY && !l.used && !lstrcmpiA(l.section.c_str(), section.c_str())) {
+			add.push_back(l.key + "=" + l.value);
+			markIniKeyUsed(user, l.section, l.key);
+		}
+	out.insert(out.begin() + at, add.begin(), add.end());
+}
+
+// The template merged with the user's ini (see above), as the lines of the new file.
+static std::vector<std::string> mergeIni(std::vector<IniLine> &tmpl, std::vector<IniLine> &user) {
+	std::vector<std::string> out;
+	std::string section;
+	for (IniLine &t : tmpl) {
+		if (t.kind == IniLine::SECTION) {
+			appendLeftoverKeys(out, user, section);
+			section = t.section;
+			out.push_back(t.raw);
+		} else if (t.kind == IniLine::KEY && !lstrcmpiA(t.key.c_str(), "IniVersion")) {
+			out.push_back(t.key + "=" + DM_VERSION);
+			markIniKeyUsed(user, section, t.key);
+		} else if (t.kind == IniLine::KEY || t.kind == IniLine::COMMENTED_KEY) {
+			IniLine *u = findIniKey(user, IniLine::KEY, section, t.key);
+			IniLine *c = t.kind == IniLine::KEY && !u ? findIniKey(user, IniLine::COMMENTED_KEY, section, t.key) : nullptr;
+			out.push_back(u ? t.key + "=" + u->value : c ? c->raw : t.raw);
+			markIniKeyUsed(user, section, t.key);
+		} else {
+			out.push_back(t.raw);
+		}
+	}
+	appendLeftoverKeys(out, user, section);
+	for (IniLine &s : user) {                                   // sections the template doesn't have
+		if (s.kind != IniLine::SECTION || s.used) continue;
+		bool known = false;
+		for (IniLine &t : tmpl) known = known || (t.kind == IniLine::SECTION && !lstrcmpiA(t.section.c_str(), s.section.c_str()));
+		for (IniLine &o : user) if (o.kind == IniLine::SECTION && !lstrcmpiA(o.section.c_str(), s.section.c_str())) o.used = true;
+		if (known) continue;
+		out.push_back("");
+		out.push_back("[" + s.section + "]");
+		appendLeftoverKeys(out, user, s.section);
+	}
+	return out;
+}
+
+// The ini as one NUL-terminated buffer (nullptr if it's missing, unreadable, over 1 MB or UTF-16); free() it.
+static char *readIniFile() {
+	HANDLE f = CreateFileA(g_iniPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (f == INVALID_HANDLE_VALUE) return nullptr;
+	DWORD n = GetFileSize(f, nullptr), got = 0;
+	char *buf = (n != INVALID_FILE_SIZE && n < (1u << 20)) ? (char *)malloc(n + 1) : nullptr;
+	bool ok = buf && ReadFile(f, buf, n, &got, nullptr) && got == n;
+	CloseHandle(f);
+	if (!ok || (n >= 2 && (BYTE)buf[0] == 0xFF && (BYTE)buf[1] == 0xFE)) { free(buf); return nullptr; }
+	buf[n] = 0;
+	return buf;
+}
+
+// Replace the ini with `text`, through a temp file. False (ini untouched) on any I/O error.
+static bool writeIniFile(const std::string &text) {
 	char tmp[1024 + MAX_PATH + 8];
 	wsprintfA(tmp, "%s.tmp", g_iniPath);
 	HANDLE o = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (o != INVALID_HANDLE_VALUE) {
-		struct { const char *p; DWORD n; } parts[] = {
-			{ buf,               (DWORD)(hit - buf) },            // up to the scale key
-			{ "FullscreenScale", 15 },                            // its (new) name
-			{ keyEnd,            (DWORD)(after - keyEnd) },       // the rest of that line
-			{ ins,               (DWORD)lstrlenA(ins) },          // the WindowScale block, if added
-			{ after,             (DWORD)(buf + size - after) },   // the rest of the file
-		};
-		bool wrote = true;
-		for (auto &pt : parts) {
-			DWORD w = 0;
-			if (pt.n && !(WriteFile(o, pt.p, pt.n, &w, nullptr) && w == pt.n)) { wrote = false; break; }
-		}
-		CloseHandle(o);
-		if (wrote && MoveFileExA(tmp, g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-			logf("ini migrated:%s%s", rename ? " IntegerScaling -> FullscreenScale" : "", addWin ? " added WindowScale" : "");
-		else
-			DeleteFileA(tmp);
-	}
-	free(buf);
+	if (o == INVALID_HANDLE_VALUE) return false;
+	DWORD w = 0;
+	bool wrote = WriteFile(o, text.data(), (DWORD)text.size(), &w, nullptr) && w == text.size();
+	CloseHandle(o);
+	if (wrote && MoveFileExA(tmp, g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+	DeleteFileA(tmp);
+	return false;
+}
+
+// Rebuild an ini older than this build from the embedded template (see above). Only when the user lets us write
+// the ini (PersistState or PersistPosition); skipped for UTF-16 inis and on any error, which leaves the file as it
+// is - loadConfig still reads old inis correctly.
+static void upgradeIni() {
+	const ULONGLONG from = iniVersion();
+	if (from >= parseVersion(DM_VERSION) || !(g_persist || g_persistPos)) return;
+	HRSRC res = FindResourceA(g_module, "DM_DEFAULT_INI", MAKEINTRESOURCEA(10));   // RT_RCDATA
+	HGLOBAL h = res ? LoadResource(g_module, res) : nullptr;
+	const char *data = h ? (const char *)LockResource(h) : nullptr;
+	char *cur = data ? readIniFile() : nullptr;
+	if (!cur) return;
+	std::vector<IniLine> tmpl = parseIni(std::string(data, SizeofResource(g_module, res)).c_str());
+	std::vector<IniLine> user = parseIni(cur);
+	free(cur);
+	fixupIniValues(user, from);
+	std::string text;
+	for (const std::string &l : mergeIni(tmpl, user)) text += l + "\r\n";
+	char old[32] = {0};
+	GetPrivateProfileStringA("Display", "IniVersion", "", old, sizeof(old), g_iniPath);
+	if (writeIniFile(text))
+		logf("ini upgraded from %s to %s", old[0] ? old : "an unversioned ini (1.1.2 or older)", DM_VERSION);
 }
 
 static void loadConfig() {
@@ -1570,9 +1927,11 @@ static void loadConfig() {
 	PathRemoveFileSpecA(g_iniPath);
 	PathAppendA(g_iniPath, "DisplayManager.ini");
 	g_enabled = GetPrivateProfileIntA("Display", "Enabled", 1, g_iniPath) != 0;
-	g_log = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;   // early, so migrateIni can log
+	g_log = GetPrivateProfileIntA("Display", "Log", 0, g_iniPath) != 0;   // early, so upgradeIni can log
 	g_persist = GetPrivateProfileIntA("Display", "PersistState", 1, g_iniPath) != 0;
-	if (g_persist) migrateIni();
+	g_persistPos = GetPrivateProfileIntA("Display", "PersistPosition", 1, g_iniPath) != 0;
+	upgradeIni();
+	const ULONGLONG iniVer = iniVersion();   // still older than this build if the ini couldn't be upgraded
 
 	char mode[64] = {0};
 	GetPrivateProfileStringA("Display", "Mode", "FitToScreen", mode, sizeof(mode), g_iniPath);
@@ -1581,7 +1940,7 @@ static void loadConfig() {
 	else                                              g_mode = MODE_FIT;
 
 	// FullscreenScale was called IntegerScaling up to 1.0.3: read the old name when the new one is missing
-	// (migrateIni renames it in the file when PersistState is on).
+	// (upgradeIni renames it in the file).
 	char scale[32] = {0};
 	GetPrivateProfileStringA("Display", "FullscreenScale", "", scale, sizeof(scale), g_iniPath);
 	if (!scale[0]) GetPrivateProfileStringA("Display", LEGACY_FS_SCALE_KEY, "x2", scale, sizeof(scale), g_iniPath);
@@ -1611,8 +1970,14 @@ static void loadConfig() {
 	clampSharpness();
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
-	g_posX      = GetPrivateProfileIntA("Display", "PositionX", -1, g_iniPath);
-	g_posY      = GetPrivateProfileIntA("Display", "PositionY", -1, g_iniPath);
+	{   // PositionX/Y: blank (or missing) = leave the window where the game puts it; any number is a coordinate
+		char px[16] = {0}, py[16] = {0};
+		GetPrivateProfileStringA("Display", "PositionX", "", px, sizeof(px), g_iniPath);
+		GetPrivateProfileStringA("Display", "PositionY", "", py, sizeof(py), g_iniPath);
+		g_posX = StrToIntA(px); g_posY = StrToIntA(py);
+		g_havePos = px[0] && py[0];
+		if (iniVer < INI_VERSION(1, 1, 3) && (g_posX < 0 || g_posY < 0)) g_havePos = false;   // the old "don't move"
+	}
 	g_borderless   = GetPrivateProfileIntA("Display", "Borderless", 0, g_iniPath) != 0;
 	g_winFilter    = GetPrivateProfileIntA("Display", "WindowedFilter", 1, g_iniPath) != 0;
 	g_fsW          = GetPrivateProfileIntA("Display", "FullscreenWidth", 0, g_iniPath);
@@ -1620,6 +1985,7 @@ static void loadConfig() {
 	g_fsRefresh    = GetPrivateProfileIntA("Display", "FullscreenRefresh", 0, g_iniPath);
 	g_vsync        = GetPrivateProfileIntA("Display", "VSync", -1, g_iniPath);
 	g_allowWinKey  = GetPrivateProfileIntA("Input", "AllowWinKey", 0, g_iniPath) != 0;
+	g_latinPending = GetPrivateProfileIntA("Input", "StartInLatinInput", 0, g_iniPath) != 0;
 	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
 	g_msaaIni      = g_msaaCfg;
 	{   // xBR knobs
@@ -1637,6 +2003,26 @@ static void loadConfig() {
 		if (g_xbrWidth < 0.05f) g_xbrWidth = 0.05f;
 		if (g_xbrWidth > 4.0f) g_xbrWidth = 4.0f;
 	}
+	{   // sharp sprites (experimental): commented out, blank or 0 = off
+		static const char *const keys[SPR_LAYERS] = { "SpriteSharpness", "BackgroundSharpness" };
+		for (int l = 0; l < SPR_LAYERS; l++) {
+			char v[32] = {0};
+			GetPrivateProfileStringA("Display", keys[l], "", v, sizeof(v), g_iniPath);
+			float k = (float)atof(v);
+			if (k <= 0.0f) continue;
+			if (k < SPR_K_MIN) k = SPR_K_MIN;
+			if (k > SPR_K_MAX) k = SPR_K_MAX;
+			g_sprK[l] = g_sprLastK[l] = k;
+		}
+		static const char *const restKeys[SPR_LAYERS] = { "SpriteRestStrength", "BackgroundRestStrength" };
+		for (int l = 0; l < SPR_LAYERS; l++) {   // commented out / blank = the default
+			char v[32] = {0};
+			GetPrivateProfileStringA("Display", restKeys[l], "", v, sizeof(v), g_iniPath);
+			if (!v[0]) continue;
+			float r = (float)atof(v);
+			g_sprRest[l] = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+		}
+	}
 
 	// [Hotkeys]: a missing/commented/blank key line disables that hotkey.
 	char modn[32] = {0};
@@ -1650,12 +2036,22 @@ static void loadConfig() {
 	const char *names[ACT_COUNT] = { "FitToScreen", "Scale1", "Scale2", "Scale3",
 	                                 "Scale4", "Scale5", "Scale6", "AlwaysOnTop", "CycleFilter",
 	                                 "SharpnessDown", "SharpnessUp", "ToggleMSAA", "XbrStrength", "XbrCorner",
-	                                 "XbrSlopes", "XbrWidth" };
+	                                 "XbrSlopes", "XbrWidth", "SharpSprites", "SpriteSharpnessDown",
+	                                 "SpriteSharpnessUp", "SharpBackground", "BackgroundSharpnessDown",
+	                                 "BackgroundSharpnessUp", "SpriteRestStrengthDown", "SpriteRestStrengthUp",
+	                                 "BackgroundRestStrengthDown", "BackgroundRestStrengthUp" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
 		g_hotkeyVk[a] = parseKey(k);
 	}
+	for (int a = 0; a < ACT_COUNT; a++)     // the keyboard hook runs the first match: a later duplicate never fires
+		for (int b = a + 1; b < ACT_COUNT; b++)
+			if (g_hotkeyVk[a] && g_hotkeyVk[a] == g_hotkeyVk[b])
+				logf("hotkeys: %s and %s are both %c - only %s works", names[a], names[b], g_hotkeyVk[a], names[a]);
+	g_sprWanted =g_sprK[SPR_CHARS] > 0.0f || g_sprK[SPR_STAGE] > 0.0f;
+	for (int a = ACT_SPR_TOGGLE; a <= ACT_BG_REST_UP; a++)
+		if (g_hotkeyVk[a]) g_sprWanted = true;
 }
 
 // Write "Display"/key = val only if it differs from what's already in the ini, so an unchanged session
@@ -1667,10 +2063,22 @@ static void writeIniIfChanged(const char *key, const char *val) {
 		WritePrivateProfileStringA("Display", key, val, g_iniPath);
 }
 
-// Save Mode, FullscreenScale, WindowScale, Filter and Sharpness (incl. live hotkey changes) to the ini at
-// exit. Window position is deliberately NOT saved; unchanged keys are not rewritten.
+// PersistPosition: write the window's last normal position (g_lastPos) as PositionX/Y, the next spawn position.
+static void persistPosition() {
+	if (!g_persistPos || !g_haveLastPos) return;
+	char v[16];
+	wsprintfA(v, "%d", g_lastPos.x);
+	writeIniIfChanged("PositionX", v);
+	wsprintfA(v, "%d", g_lastPos.y);
+	writeIniIfChanged("PositionY", v);
+}
+
+// Save Mode, FullscreenScale, WindowScale, Filter and Sharpness (incl. live hotkey changes) with PersistState, and the
+// window position with PersistPosition, to the ini at exit. Unchanged keys are not rewritten.
 static void persistState() {
-	if (!g_persist || !g_enabled) return;   // (g_enabled is cleared when standing down for another mod)
+	if (!g_enabled) return;                 // (g_enabled is cleared when standing down for another mod)
+	persistPosition();
+	if (!g_persist) return;
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
 	writeIniIfChanged("Mode", modeName());
@@ -1769,7 +2177,7 @@ static void applyTopmost() {
 // before fullscreen (nullptr = leave it where it is).
 static const POINT *windowedEntryPos(bool firstTime, POINT *buf) {
 	if (firstTime) {
-		if (g_posX < 0 || g_posY < 0) return nullptr;
+		if (!g_havePos) return nullptr;
 		buf->x = g_posX; buf->y = g_posY;
 		return buf;
 	}
@@ -1847,6 +2255,87 @@ static void applyWindowState() {
 
 static WNDPROC g_origWndProc = nullptr;
 
+// [Input] StartInLatinInput=1: open the game on a Latin keyboard instead of a CJK input method. CJK players usually
+// have an IME (e.g. Microsoft Pinyin) next to an English keyboard, and the game window starts with whichever is active,
+// often the IME in its native (Chinese) mode, which then composes from the game's keys (its box keeps popping up).
+// Once, when the window is first active, if the active input method is a Chinese / Japanese / Korean IME that is on in
+// its native mode: switch to an installed non-CJK keyboard layout (English US first), or, with none, put the IME where
+// its own toggle key would (off / English mode; e.g. Shift in Pinyin turns it back on). It is never disabled, so
+// players can switch back to chat. It has to wait until the window is the foreground one: with Windows' default "same
+// input method for all apps", activating a window gives it the desktop's current input method, which would undo an
+// earlier switch (and our switch becomes the desktop's, as when the player does it by hand). Activation messages can't
+// be relied on to see that (NoFocusNoBgm, for one, keeps them from our wndProc), so until then a thread timer checks
+// every 200 ms; its callback is called directly by the window thread's message loop. Runs on the window thread.
+static UINT     g_latinMsg   = 0;   // private registered message: start startInLatinInput on the window thread
+static UINT_PTR g_latinTimer = 0;
+static DWORD    g_latinSince = 0;   // GetTickCount when first seen as the foreground window (0 = not yet)
+
+static DWORD hklId(HKL hkl) { return (DWORD)(DWORD_PTR)hkl; }   // low word = language, high word = device
+
+static bool isCjkLanguage(HKL hkl) {
+	WORD lang = PRIMARYLANGID(LOWORD(hklId(hkl)));
+	return lang == LANG_CHINESE || lang == LANG_JAPANESE || lang == LANG_KOREAN;
+}
+
+// A plain keyboard layout of a non-CJK language: not a CJK language, not a legacy IMM IME (device 0xE0xx). ImmIsIME
+// can't tell: with TSF on it reports every layout as an IME.
+static bool isLatinLayout(HKL hkl) {
+	return !isCjkLanguage(hkl) && (HIWORD(hklId(hkl)) & 0xF000) != 0xE000;
+}
+
+static void startInLatinInput(HWND h) {
+	if (!g_latinPending || GetForegroundWindow() != h) return;   // not the foreground window yet: the timer retries
+	DWORD now = GetTickCount();
+	if (!g_latinSince) g_latinSince = now | 1;   // never 0 (= not yet)
+	HKL cur = GetKeyboardLayout(0);
+	if (!isCjkLanguage(cur)) {
+		g_latinPending = false;
+		logf("StartInLatinInput: input method %08lx is not Chinese / Japanese / Korean - left alone", hklId(cur));
+		return;
+	}
+	// Only an IME that is on in its native mode composes. A new window's IME takes a moment to start (it reports
+	// itself off until then), so keep checking for a few seconds before taking "off" as the answer - which it is
+	// for IMEs that start in direct input, like Microsoft's Japanese IME.
+	HIMC imc = ImmGetContext(h);
+	DWORD conv = 0, sentence = 0;
+	bool native = imc && ImmGetOpenStatus(imc) && ImmGetConversionStatus(imc, &conv, &sentence) &&
+	              (conv & IME_CMODE_NATIVE);
+	if (!native) {
+		if (now - g_latinSince > 5000) {
+			g_latinPending = false;
+			logf("StartInLatinInput: IME %08lx is off or not in native mode - left alone", hklId(cur));
+		}
+		if (imc) ImmReleaseContext(h, imc);
+		return;
+	}
+	g_latinPending = false;
+	HKL list[64], latin = nullptr;
+	int n = GetKeyboardLayoutList(64, list);
+	for (int i = 0; i < n; i++)
+		if (isLatinLayout(list[i]) && (!latin || LOWORD(hklId(list[i])) == 0x0409)) latin = list[i];   // en-US first
+	if (latin) {
+		ActivateKeyboardLayout(latin, 0);
+		logf("StartInLatinInput: IME %08lx -> keyboard layout %08lx (now %08lx)", hklId(cur), hklId(latin),
+		     hklId(GetKeyboardLayout(0)));
+	} else {
+		// No Latin keyboard: put the IME where its own toggle key would, which differs by language (tested with
+		// Microsoft's IMEs). Korean: English mode, i.e. clear the Hangul (native) bit, as the Han/Eng key does - it
+		// keeps composing Hangul when merely turned off. Chinese / Japanese: turn the IME off (direct input) - Pinyin
+		// reports a cleared native bit but keeps composing; Shift turns it back on in Chinese mode.
+		bool korean = PRIMARYLANGID(LOWORD(hklId(cur))) == LANG_KOREAN;
+		BOOL ok = korean ? ImmSetConversionStatus(imc, conv & ~IME_CMODE_NATIVE, sentence)
+		                 : ImmSetOpenStatus(imc, FALSE);
+		logf("StartInLatinInput: no non-CJK keyboard installed; IME %08lx (conversion 0x%lx) %s%s", hklId(cur), conv,
+		     korean ? "set to English mode" : "turned off", ok ? "" : " - FAILED");
+	}
+	ImmReleaseContext(h, imc);
+}
+
+static void CALLBACK latinTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+	if (g_hwnd) startInLatinInput(g_hwnd);
+	if (!g_latinPending && g_latinTimer) { KillTimer(nullptr, g_latinTimer); g_latinTimer = 0; }
+}
+
 // Subclassed window procedure: runs the deferred apply posted by postWindowApply, while windowed and resizable
 // locks a drag-resize to 4:3 (at least 640x480) so the stretched image never gets squashed, and with
 // WindowedFilter queues a backbuffer resize once a resize is over (onWindowResized): at the end of a drag, or
@@ -1860,6 +2349,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 		onWindowResized();
 		return 0;
 	}
+	if (g_latinMsg && msg == g_latinMsg) {   // StartInLatinInput: now, or from the timer once the window is foreground
+		startInLatinInput(h);
+		if (g_latinPending && !g_latinTimer) g_latinTimer = SetTimer(nullptr, 0, 200, latinTimerProc);
+		return 0;
+	}
 	switch (msg) {
 	case WM_ENTERSIZEMOVE:
 		g_inSizeMove = true;
@@ -1871,6 +2365,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_SIZE:
 		if (wp != SIZE_MINIMIZED && !g_inSizeMove) postWindowResized();
 		break;
+	case WM_WINDOWPOSCHANGED: {   // PersistPosition: track the last normal-window position (see g_lastPos)
+		RECT r;
+		if (g_persistPos && !g_wantFullscreen && !g_windowFs && !g_borderlessActive && !g_applyPending &&
+		    !IsIconic(h) && !IsZoomed(h) && GetWindowRect(h, &r)) {
+			g_lastPos.x = r.left; g_lastPos.y = r.top; g_haveLastPos = true;
+		}
+		break;
+	}
 	}
 	if (msg == WM_SIZING && g_resizable && !g_wantFullscreen) {
 		RECT *wr = (RECT *)lp;
@@ -1901,12 +2403,14 @@ static void installWndProc() {
 	}
 	if (!g_applyMsg)  g_applyMsg  = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
 	if (!g_resizeMsg) g_resizeMsg = RegisterWindowMessageA("DisplayManager.WindowResized");
+	if (!g_latinMsg)  g_latinMsg  = RegisterWindowMessageA("DisplayManager.StartInLatinInput");
 	// Record the original before swapping, so a message dispatched in between (the install can run off the
 	// window thread, from the device watch) never finds it null.
 	g_origWndProc = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
 	WNDPROC prev = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndProc);
 	if (prev) g_origWndProc = prev;
 	logf("wndproc subclassed (resizable=%d)", g_resizable);
+	if (g_latinPending) PostMessageA(g_hwnd, g_latinMsg, 0, 0);   // StartInLatinInput, on the window thread
 }
 
 // Apply the window state (applyWindowState) once the game has finished handling the current message.
@@ -2028,6 +2532,49 @@ static void doAction(int act) {
 		formatHundredths(g_xbrStrength, s);
 		formatHundredths(g_xbrWidth, w);
 		logf("hotkey: xBR XbrStrength=%s XbrCorner=%c XbrSlopes=%d XbrWidth=%s", s, 'A' + g_xbrCorner, g_xbrSlopes, w);
+		break;
+	}
+	case ACT_SPR_TOGGLE: case ACT_SPR_DOWN: case ACT_SPR_UP:
+	case ACT_BG_TOGGLE: case ACT_BG_DOWN: case ACT_BG_UP: {
+		// Experimental sharp sprites, session only (not written to the ini). Toggle: off <-> the last value (the ini's,
+		// else the suggested one). Down / Up: step k; from off they first turn it back on at the last value.
+		static const float steps[] = { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f, 6.0f, 8.0f,
+		                               12.0f, 16.0f };
+		const int n = sizeof(steps) / sizeof(steps[0]);
+		int layer = act <= ACT_SPR_UP ? SPR_CHARS : SPR_STAGE;
+		int op = act - (layer == SPR_CHARS ? ACT_SPR_TOGGLE : ACT_BG_TOGGLE);   // 0 toggle, 1 down, 2 up
+		float k = g_sprK[layer];
+		if (op == 0 || k <= 0.0f) {
+			k = k > 0.0f ? 0.0f : g_sprLastK[layer];
+		} else {
+			int j = 0;
+			while (j < n - 1 && steps[j] < k - 0.001f) j++;            // the step at or above k
+			if (op == 1) { if (j > 0) j--; }
+			else if (steps[j] <= k + 0.001f && j < n - 1) j++;
+			k = steps[j];
+		}
+		if (g_sprFailed) k = 0.0f;
+		if (k > 0.0f) g_sprLastK[layer] = k;
+		g_sprK[layer] = k;
+		char msg[32], num[16];
+		formatHundredths(k, num);
+		wsprintfA(msg, "%s %s", layer == SPR_CHARS ? "SPRITES" : "BG", k > 0.0f ? num : "OFF");
+		showOsd(msg);
+		logf("hotkey: sharp %s -> %.2f", layer == SPR_CHARS ? "sprites" : "background", (double)k);
+		break;
+	}
+	case ACT_SPR_REST_DOWN: case ACT_SPR_REST_UP: case ACT_BG_REST_DOWN: case ACT_BG_REST_UP: {
+		// Rest strength (the whole-number-scale mix) in 0.1 steps, session only.
+		int layer = act <= ACT_SPR_REST_UP ? SPR_CHARS : SPR_STAGE;
+		bool up = act == ACT_SPR_REST_UP || act == ACT_BG_REST_UP;
+		float r = floorf(g_sprRest[layer] * 10.0f + 0.5f) / 10.0f + (up ? 0.1f : -0.1f);
+		r = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+		g_sprRest[layer] = r;
+		char msg[32], num[16];
+		formatHundredths(r, num);
+		wsprintfA(msg, "%s REST %s", layer == SPR_CHARS ? "SPRITES" : "BG", num);
+		showOsd(msg);
+		logf("hotkey: %s rest strength -> %.2f", layer == SPR_CHARS ? "sprites" : "background", (double)r);
 		break;
 	}
 	case ACT_MSAA: {
@@ -2177,14 +2724,18 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	if (g_enabled) {
 		setupHooks();       // the keyboard hook + wndproc are installed later, from CreateDevice (UI thread)
 		installGameResetHook();
+		installSharpSpriteDetours();
 		if (g_allowWinKey) applyAllowWinKey();   // input-only; independent of the display handling
 		atexit(persistState);
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
 	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=(%d,%d) borderless=%d vsync=%d allowWinKey=%d multiSample=%d windowedFilter=%d",
+	     "resizable=%d persist=%d pos=%s(%d,%d) persistPos=%d borderless=%d vsync=%d allowWinKey=%d "
+	     "latinInput=%d multiSample=%d windowedFilter=%d spriteSharpness=%.2f backgroundSharpness=%.2f rest=%.2f/%.2f",
 	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_posX, g_posY, g_borderless, g_vsync, g_allowWinKey, g_msaaCfg, g_winFilter);
+	     g_resizable, g_persist, g_havePos ? "" : "unset ", g_posX, g_posY, g_persistPos, g_borderless, g_vsync,
+	     g_allowWinKey, g_latinPending, g_msaaCfg, g_winFilter, (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE],
+	     (double)g_sprRest[SPR_CHARS], (double)g_sprRest[SPR_STAGE]);
 	return TRUE;
 }
 

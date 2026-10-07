@@ -1,0 +1,3 @@
+// The shipped DisplayManager.ini, embedded as the template upgradeIni rebuilds older inis from. Found through the
+// include path (the project root: /i in build.bat, target_include_directories in CMakeLists.txt).
+DM_DEFAULT_INI RCDATA "DisplayManager.ini"

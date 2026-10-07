@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+**Added**
+- Experimental, off by default: sharp sprites. `SpriteSharpness` (characters) and `BackgroundSharpness` (stage) draw
+  the sprites the game zooms with its camera through a sharp-bilinear shader instead of hard pixels, so every sprite
+  pixel comes out the same size and edges stop crawling while the camera zooms. Suggested values 2.5 / 1.5; both
+  lines are commented out in the ini, and while they are, nothing is changed. Works with any `Filter`, fullscreen and
+  windowed. At the camera's resting zoom (exactly 2x for the characters, 1x for the stage) the game's pixels are
+  already even: `SpriteRestStrength` / `BackgroundRestStrength` (0-1, defaults 0 / 0.5) choose between the game's
+  own look there (0) and the full filter (1), which glides as the camera drifts by fractions of a pixel but softens
+  slightly at some camera positions. Hotkeys (also commented out): `SharpSprites` / `SharpBackground` (Alt+G / Alt+B)
+  turn them on and off, `SpriteSharpnessDown` / `Up` (Alt+H / J) and `BackgroundSharpnessDown` / `Up` (Alt+U / I)
+  adjust them live, and the `...RestStrengthDown` / `Up` keys (Alt+R / T, Alt+Z / X) tune the rest strengths; none of
+  it is saved.
+- With `Log=1`, two hotkeys bound to the same key are reported in the log (only the first one works).
+- `[Input] StartInLatinInput=1` (off by default): for players whose game window starts with a Chinese / Japanese /
+  Korean input method in its native mode (e.g. Microsoft Pinyin in Chinese mode), which composes from the game's keys
+  so its pop-up keeps appearing while playing. When the window first comes up, DisplayManager switches to an installed
+  non-CJK keyboard (English US first); if there is none, it sets the input method as its own toggle key would
+  (Chinese / Japanese: off; Korean: English mode). The input method stays available for chat: Shift in Pinyin,
+  Han/Eng in Korean, Hankaku/Zenkaku in Japanese, Alt+Shift / Ctrl+Shift (if enabled in Windows), or the taskbar's
+  language button. Win+Space needs `AllowWinKey=1`, because the game blocks the Windows key.
+- Ini upgrades: the ini now records the version that last updated it (`IniVersion`). When a newer DisplayManager
+  starts, it rewrites an older ini as its own default ini with your settings kept, so an upgraded ini has the same
+  options, order and notes as a fresh install. Commented-out hotkeys stay disabled, keys you added by hand (e.g.
+  `MultiSample`) and other sections are kept; your own comments are replaced. Only when `PersistState` or
+  `PersistPosition` is on; an ini from a newer version is never touched.
+- `PersistPosition=1` (default): the window's position is saved to `PositionX` / `PositionY` on exit and the window
+  opens there next launch. Exiting from fullscreen or while minimized/maximized saves the last normal window
+  position. `PersistPosition=0` = the old behaviour (the ini position is only ever read). Independent of
+  `PersistState`.
+
+**Changed**
+- `PositionX` / `PositionY`: blank now means "don't move the window" (the new default), and every number is a real
+  coordinate, including negative ones (monitors left of / above the main one, or a window flush with the screen
+  edge). Before, any negative value meant "don't move". On the ini upgrade, the old "don't move" values (`-1`) are
+  blanked; positions you had set stay as they are.
+
 ## 1.1.2 — 2026-10-05
 
 **Fixed**

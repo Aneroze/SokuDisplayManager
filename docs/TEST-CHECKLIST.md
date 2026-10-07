@@ -78,3 +78,91 @@ image; borders pure black (border-only fill).
 2. Log line `scene calls:` says `direct`. If it says `via vtable + stage`, another mod hooked BeginScene/EndScene
    before DM; the old stage path is then used (still correct, just more work per frame).
 3. Sharpness 1.25 / 1.50 / 1.75 at 2x look different from each other and sit between Linear and Point.
+
+## PersistPosition (unreleased)
+
+1. Windowed: move the window, close the game (X button, not a kill). PositionX/Y in the ini = the window's top-left;
+   next launch opens there. **Verified 2026-10-06** (automated: SetWindowPos + WM_CLOSE).
+2. Minimize, then close: the ini gets the last position before minimizing. **Verified 2026-10-06.**
+3. Exit from exclusive fullscreen and from borderless: the ini gets the pre-fullscreen window position, not the
+   monitor origin. **Verified 2026-10-07** (both modes: windowed at (500,250), the game's own Alt+Enter, WM_CLOSE while
+   fullscreen -> (500,250) saved; the log confirms real exclusive 2560x1440 @144Hz / borderless).
+4. Window on a monitor left of / above the main one (negative coordinates): saved and restored there. **Verified
+   2026-10-07** (left monitor at x -2304..0, closed at (-2000,450) -> relaunched at (-2000,450)). That monitor's
+   scale differs from the main one's, so Windows scales th123 (system-DPI aware) there: the ini holds th123's own
+   coordinates ((-1667,375) here), not screen pixels - correct, as DM reads them back the same way. A position that
+   leaves the window partly off-screen comes back moved on-screen.
+5. `PersistPosition=0`: PositionX/Y are never written. `PersistState=0` alone: the position is still saved.
+   **Verified 2026-10-07.**
+6. Ini upgrade (IniVersion): a 1.1.2 ini on first launch is rewritten so that `diff` against the shipped ini shows only
+   the user's values: `-1` positions blanked (window not moved), set positions kept, IntegerScaling -> FullscreenScale,
+   missing WindowScale = the FullscreenScale value, commented-out / blank hotkeys stay disabled, an enabled dev hotkey
+   is active in its template spot, hand-added keys (MultiSample, ToggleMSAA) at the end of their section, unknown
+   sections at the end. A current ini isn't rewritten on load; one stamped with a newer version is left alone.
+   **Verified 2026-10-06**, and again 2026-10-07 with the sharp-sprite lines in the template (they arrive commented out).
+7. Literal -1: `PositionX=-1`, `PositionY=-1` in a current ini moves the window to (-1,-1) (clamped on-screen).
+   **Verified 2026-10-07** (spawned at (-1,0)).
+
+## StartInLatinInput (unreleased)
+
+Needs a CJK IME: add Chinese (Simplified) + Microsoft Pinyin (Windows PowerShell 5.1: `Set-WinUserLanguageList`),
+back up `HKCU\Control Panel\International\User Profile` + `HKCU\Keyboard Layout` first and restore after. To start
+the game on Pinyin, switch a window to it (`WM_INPUTLANGCHANGEREQUEST` 0x08040804): with the default shared input
+method the next game window starts with it. Read the game window's state from outside: `GetKeyboardLayout(thread)`,
+and `WM_IME_CONTROL` IMC_GETOPENSTATUS / IMC_GETCONVERSIONMODE on `ImmGetDefaultIMEWnd(hwnd)` (bit 0 = native).
+
+Composition check (2026-10-06): a temporary build logging the window's key / IME messages - composing = keys
+arrive as VK_PROCESSKEY (0xE5) plus WM_IME_STARTCOMPOSITION; the box itself is a th123-owned CiceroUIWndFrame in the
+screen's top-right corner (no caret), visible while composing. Typed `nihen` (unbound keys). All **verified
+2026-10-06** with Microsoft's IMEs (option on unless noted):
+
+| Setup | At start | Result |
+| --- | --- | --- |
+| en + Pinyin, option off | Chinese mode | composes, box shown (the problem) |
+| en + Pinyin | Chinese mode | -> US layout, nothing composed |
+| Pinyin only | Chinese mode | IME off, nothing composed; Shift -> Chinese again |
+| Pinyin + Japanese (no Latin) | Pinyin, Chinese mode | IME off, nothing composed |
+| en + Japanese | off (MS-IME default) | left alone; IME forced on at start -> US layout |
+| Japanese only | off | left alone. Forcing it on (hiragana) doesn't stick in th123's window, before or after activation: it is off again within ~1 s, so the Japanese turn-off branch is unexercised (same call as the verified Pinyin one) |
+| en + Korean | English mode (default) | left alone; Hangul at start -> US layout |
+| Korean only, Hangul at start | Hangul | English mode, nothing composed; Han/Eng -> Hangul again |
+| en only | - | left alone |
+
+Lessons: clearing IME_CMODE_NATIVE doesn't stop Pinyin (reports it, keeps composing), turning it off does; turning
+the Korean IME off doesn't stop Hangul, clearing the native bit does. The IME reports "off" for ~1 s after the
+window appears, hence the 5 s wait.
+
+5. Hands-on (user, own binds, windowed): starts on Pinyin, switched to US on first focus, no candidate box while
+   playing. Win+Space doesn't switch back in-game unless `AllowWinKey=1` (the game's DISCL_NOWINKEY); after Alt+Tab
+   it does; with `AllowWinKey=1` Win+Space switches in-game. **Verified 2026-10-06.**
+6. Not tested: third-party IMEs (Sogou, Google Japanese Input - which has an initial-mode setting), exclusive fullscreen,
+   a real CJK player. Windows 10's Microsoft Japanese IME has no "start in hiragana" setting (only Windows 11's IME has
+   "Default input mode", reported unreliable), so a fresh window always starts with it off.
+
+## Sharp sprites (unreleased, experimental)
+
+1. All lines commented out (shipped ini): the four game-function entries keep their original bytes, no
+   DrawPrimitiveUP hook, log shows `spriteSharpness=0.00 backgroundSharpness=0.00`. **Verified 2026-10-07.**
+2. `SpriteSharpness=2.5`, `BackgroundSharpness=1.5`: log `first stage draw` / `first character draw`; zoomed-out frames
+   clean, HUD untouched. **Verified 2026-10-07** (Practice, CharactersInForeground + PracticeEx on - CIF calls the draw
+   functions itself, which is why DM detours their entries).
+3. Stages: shader-off vs shader-on runs (SokuHarness navat/rec, fixed seed) on stage ids 0, 1, 2, 3, 4, 5, 10, 11:
+   strongly changed pixels (|d| > 96) <= 0.12% per frame, no tile seams in the difference maps. **Verified 2026-10-07.**
+4. Exclusive fullscreen: the game's 640x480 frames are pixel-identical to the windowed run (231 frames).
+   **Verified 2026-10-07.**
+5. Replay playback (ReplayDnD): both layers applied, no hang, clean exit. **Verified 2026-10-07.**
+6. Hotkeys (`SharpSprites` / `SpriteSharpnessDown` / `Up`, `SharpBackground` / `BackgroundSharpnessDown` / `Up`):
+   uncomment, press in a match: the on-screen readout (`SPRITES 2.50`, `BG OFF`, ...) and the sprites change; a toggle
+   with its `[Display]` value commented out turns on at 2.5 / 1.5. Needs real key presses (DM's WH_KEYBOARD hook doesn't
+   see posted keys). **Verified 2026-10-07 by the user.**
+8. Whole-number scale with the camera on a half pixel (found by the user: Practice, both characters close = resting x2
+   zoom, P1 x=643 / P2 x=800 -> camera centre 721.5): every texel edge lands on a pixel centre, sharp-bilinear blended
+   them 50/50 and every other column was a mix (horizontally blurry, both characters). Fixed: an axis whose scale is a
+   whole number gets point behaviour, a draw whole on both axes is left to the game's own POINT draw. Same state after
+   the fix: clean column pairs; the shimmer run is identical except one frame where the stage (x1) was on a half pixel -
+   now vanilla, before blurred. **Verified 2026-10-07.**
+7. Testing with SokuHarness: set `SOKUHARNESS_NODEVHOOKS=1`, or the harness's DrawPrimitiveUP re-hook bypasses DM's.
+9. Rest strength (`SpriteRestStrength` / `BackgroundRestStrength`, the mix at whole-number scales; the shader mixes the
+   blend weights per axis): 0 for both = frame-identical to the item-8 fix (231/231), 1 for both = frame-identical to
+   the original full filter (231/231). Tuning hotkeys Alt+R / T, Alt+Z / X tried live by the user. Sprite step keys
+   moved from N / M to H / J (Alt+M = ToggleMSAA in the user's ini). **Verified 2026-10-07.**

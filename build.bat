@@ -20,10 +20,13 @@ set ROOT=%~dp0
 set OUT=%ROOT%build
 if not exist "%OUT%" mkdir "%OUT%"
 
+REM Embeds the shipped DisplayManager.ini (the template older inis are upgraded from).
+rc /nologo /i "%ROOT%." /fo "%OUT%\DisplayManager.res" "%ROOT%src\DisplayManager.rc" || exit /b 1
+
 cl /nologo /LD /MT /EHsc /std:c++17 /O2 ^
   /D_CRT_SECURE_NO_WARNINGS /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 ^
   /I "%ROOT%src" ^
   /Fo"%OUT%\\" /Fe"%OUT%\DisplayManager.dll" ^
-  "%ROOT%src\DisplayManager.cpp" ^
-  /link shlwapi.lib user32.lib
+  "%ROOT%src\DisplayManager.cpp" "%OUT%\DisplayManager.res" ^
+  /link shlwapi.lib user32.lib imm32.lib
 exit /b %errorlevel%

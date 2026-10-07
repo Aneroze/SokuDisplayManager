@@ -7,3 +7,4 @@ build/
 *.ilk
 *.log
 dist/
+__pycache__/

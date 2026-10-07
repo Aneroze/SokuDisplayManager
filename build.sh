@@ -13,12 +13,15 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="$ROOT/build"
 mkdir -p "$OUT"
 
+# Embeds the shipped DisplayManager.ini (the template older inis are upgraded from).
+"${WINDRES:-i686-w64-mingw32-windres}" -I"$ROOT" "$ROOT/src/DisplayManager.rc" -O coff -o "$OUT/DisplayManager.res.o"
+
 "$CXX" -std=c++17 -O2 -shared \
   -D_CRT_SECURE_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
   -I"$ROOT/src" \
-  "$ROOT/src/DisplayManager.cpp" \
+  "$ROOT/src/DisplayManager.cpp" "$OUT/DisplayManager.res.o" \
   -o "$OUT/DisplayManager.dll" \
   -static -static-libgcc -static-libstdc++ \
-  -lshlwapi -luser32
+  -lshlwapi -luser32 -limm32
 
 echo "built: $OUT/DisplayManager.dll"

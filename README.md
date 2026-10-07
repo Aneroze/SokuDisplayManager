@@ -19,6 +19,10 @@ The same frame at ×3 with each filter (a crop at 100%; open the image for full 
 
 ![Point, Linear, Sharp 1.25 / 1.50 / 1.75 and xBR at ×3](docs/images/filters-x3.png)
 
+### Sharp sprites (experimental, off by default)
+
+The game itself zooms the characters and the stage with its camera and draws them with hard pixels, so at most zoom levels some sprite pixels come out wider than others and edges crawl while the camera moves. Uncomment `SpriteSharpness` (characters, 2.5 suggested) and/or `BackgroundSharpness` (stage, 1.5 suggested) in the ini to draw them with a sharp-bilinear shader instead: each sprite pixel stays crisp inside and only its edges get a thin blend. This happens in the game's own frame, so it works with any `Filter`, in fullscreen and windowed. While the lines are commented out, nothing is changed.
+
 ## Hotkeys
 
 The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkeys]` section; a blank or commented-out line disables that hotkey.
@@ -30,6 +34,9 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | Alt+F | `CycleFilter` | Cycle the filter. |
 | Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
 | Alt+S / C / E / W | `XbrStrength` / `XbrCorner` / `XbrSlopes` / `XbrWidth` | Development, commented out in the ini by default: cycle an xBR setting (switches to xBR). Not saved. |
+| Alt+G / H / J | `SharpSprites` / `SpriteSharpnessDown` / `SpriteSharpnessUp` | Experimental, commented out in the ini by default: turn [sharp sprites](#sharp-sprites-experimental-off-by-default) on/off for the characters / lower / raise their `SpriteSharpness`. Not saved. |
+| Alt+B / U / I | `SharpBackground` / `BackgroundSharpnessDown` / `BackgroundSharpnessUp` | The same for the stage (`BackgroundSharpness`). |
+| Alt+R / T, Alt+Z / X | `SpriteRestStrengthDown` / `Up`, `BackgroundRestStrengthDown` / `Up` | Tuning, commented out by default: lower / raise `SpriteRestStrength` / `BackgroundRestStrength` in 0.1 steps. Not saved. |
 | (none) | `ToggleMSAA` | Not in the default ini (add e.g. `ToggleMSAA=M` under `[Hotkeys]`). Turn MSAA on (`MultiSample`, or ×8 if that is 0) / off, in fullscreen and (with `WindowedFilter=1`) windowed. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
@@ -50,6 +57,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `IniVersion` | the mod's version | Written by the mod: the version that last updated the ini. A newer version rewrites an older ini as its own default ini with your settings kept (new options and notes appear; your own comments don't survive). Needs `PersistState` or `PersistPosition` on. |
 | `Enabled` | `1` | Master switch. |
 | `Mode` | `FitToScreen` | Fullscreen size, see [Scaling](#scaling). |
 | `FullscreenScale` | `x2` | Scale for `Mode=IntegerScaling`. Called `IntegerScaling` before 1.0.4; old ini files are still read. |
@@ -62,15 +70,19 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `XbrCorner` | `B` | For `Filter=xBR`: `A` (roundest) to `D` (keeps more corners and small details). |
 | `XbrSlopes` | `0` | For `Filter=xBR`: `1` = also smooth 30°/60° edges, `0` = 45° diagonals only. |
 | `XbrWidth` | `2.0` | For `Filter=xBR`: width of the smoothed band at edges (`1.0` = standard xBR). |
+| `SpriteSharpness` / `BackgroundSharpness` | commented out (off) | Experimental [sharp sprites](#sharp-sprites-experimental-off-by-default) for the characters / the stage: `0.5` (smooth) to `16` (about the same as the game's hard pixels). Suggested `2.5` / `1.5`. Commented out, blank or `0` = off. |
+| `SpriteRestStrength` / `BackgroundRestStrength` | `0` / `0.5` (commented out) | With sharp sprites on, at the camera's resting zoom (exactly 2x for the characters, 1x for the stage), where the game's pixels are already even: `0` = the game's own look, `1` = the full filter (smooth as the camera drifts by fractions of a pixel, slightly soft at some camera positions), in between a mix. |
 | `Sharpness` | `1.50` | For `Filter=Sharp`: `1.0` (bilinear) to `4.0` (about the same as point). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (kept at 4:3). |
 | `WindowedFilter` | `1` | Use `Filter` in windowed mode too. The backbuffer is sized to the window, so a window resize resets the device once (a short hitch after a drag or a Scale key; the image is stretched during a drag). `0` = the game's plain bilinear stretch. |
 | `PersistState` | `1` | Save hotkey changes (mode, scales, filter, sharpness) to the ini on exit. |
-| `PositionX` / `PositionY` | `-1` | Window position at launch. `-1` = leave it where the game puts it. |
+| `PersistPosition` | `1` | Save the window's position to `PositionX` / `PositionY` on exit, so it opens in the same place next launch. Exiting from fullscreen or minimized saves the last normal window position. `0` = never write it. |
+| `PositionX` / `PositionY` | blank | Window position at launch (top-left of the frame; negative values are fine on monitors left of / above the main one). Blank = leave it where the game puts it. Kept on-screen if that monitor is gone. |
 | `Borderless` | `0` | `1` = a borderless window instead of exclusive fullscreen. Easier Alt+Tab and overlays, but frames go through the desktop compositor, which adds latency. |
 | `FullscreenWidth` / `FullscreenHeight` / `FullscreenRefresh` | `0` | Force a fullscreen display mode instead of the monitor's current one. The refresh rate is only used when width and height are set. |
 | `VSync` | `-1` | Exclusive fullscreen only. `-1` = the game's setting (off in vanilla), `0` = off, `1` = on. |
 | `Log` | `0` | Write `DisplayManager.log` next to the ini. |
+| `StartInLatinInput` (`[Input]`) | `0` | `1` = when the game window first comes up with a Chinese / Japanese / Korean input method on in its native mode (which composes from the game's keys, so its pop-up keeps appearing), switch to an installed non-CJK keyboard (English US first); with none, set the input method as its own toggle key would (Chinese / Japanese: off; Korean: English mode). Never disables it: switch back any time to chat (Shift in Pinyin, Han/Eng in Korean, Hankaku/Zenkaku in Japanese, Alt+Shift / Ctrl+Shift if enabled in Windows, the taskbar's language button; Win+Space needs `AllowWinKey=1`, since the game blocks the Windows key). With Windows' default shared input method this switches it for the whole desktop, as switching by hand does. |
 | `AllowWinKey` (`[Input]`) | `0` | `1` = let the Windows key through; the base game blocks it. Needs a restart. In exclusive fullscreen, opening the Start menu minimizes the game. |
 
 ## Notes
@@ -100,6 +112,10 @@ It only loads into the th123 1.10a executable (checked by hash) and needs nothin
 
 - **Windows (MSVC):** run `build.bat`. It finds Visual Studio with `vswhere`. Output: `build\DisplayManager.dll`.
 - **mingw-w64:** run `./build.sh` with `g++-mingw-w64-i686` installed.
+
+Both embed `DisplayManager.ini` in the DLL (`src/DisplayManager.rc`) as the template older inis are upgraded from.
+The version is set in `src/version.h`; on a release also bump `mod.json`'s `version` and `IniVersion` in
+`DisplayManager.ini` (CMake warns if they differ).
 
 ## Credits
 

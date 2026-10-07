@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.15)
 # meta
-set(DM_VERSION "1.1.2" CACHE STRING "DisplayManager version (major.minor.patch [.build])")
+# The version lives in src/version.h (shared with build.bat); mod.json and the ini's IniVersion should match it.
+file(STRINGS "${CMAKE_SOURCE_DIR}/src/version.h" _dm_version_line REGEX "#define DM_VERSION ")
+string(REGEX REPLACE ".*\"([^\"]+)\".*" "\\1" DM_VERSION "${_dm_version_line}")
+file(STRINGS "${CMAKE_SOURCE_DIR}/DisplayManager.ini" _dm_ini_version REGEX "^IniVersion=")
+if(NOT _dm_ini_version STREQUAL "IniVersion=${DM_VERSION}")
+  message(WARNING "DisplayManager.ini has '${_dm_ini_version}', expected 'IniVersion=${DM_VERSION}'")
+endif()
+file(READ "${CMAKE_SOURCE_DIR}/mod.json" _dm_mod_json)
+if(NOT _dm_mod_json MATCHES "\"version\":\"${DM_VERSION}\"")
+  message(WARNING "mod.json's version doesn't match ${DM_VERSION}")
+endif()
 set(MY_DESCRIPTION "An alternative to WindowResizer, handles fullscreen scaling and window sizing." CACHE STRINGS "description")
 project(DisplayManager 
   VERSION ${DM_VERSION}
@@ -37,11 +47,15 @@ configure_file(${CMAKE_SOURCE_DIR}/version.rc.in ${CMAKE_BINARY_DIR}/version.rc 
 # target
 add_library(DisplayManager SHARED
   src/DisplayManager.cpp
+  src/DisplayManager.rc
   ${CMAKE_BINARY_DIR}/version.rc
 )
+# the embedded ini (DisplayManager.rc) isn't a dependency CMake sees on its own
+set_source_files_properties(src/DisplayManager.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/DisplayManager.ini")
 
 target_include_directories(DisplayManager PRIVATE
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}             # DisplayManager.ini, for DisplayManager.rc
 )
 
 target_compile_definitions(DisplayManager PRIVATE
@@ -64,6 +78,7 @@ set_target_properties(DisplayManager PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_link_libraries(DisplayManager PRIVATE
   Shlwapi
   user32
+  Imm32
 )
 
 # install
