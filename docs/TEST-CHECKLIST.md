@@ -166,3 +166,8 @@ window appears, hence the 5 s wait.
    blend weights per axis): 0 for both = frame-identical to the item-8 fix (231/231), 1 for both = frame-identical to
    the original full filter (231/231). Tuning hotkeys Alt+R / T, Alt+Z / X tried live by the user. Sprite step keys
    moved from N / M to H / J (Alt+M = ToggleMSAA in the user's ini). **Verified 2026-10-07.**
+10. Tiled quads (bug report: Dust Storm with BackgroundSharpness on - the scrolling dust at the bottom turned into long
+    yellow streaks after a while): the dust is a 512x128 texture tiled through WRAP addressing (u 0.01..1.01 and
+    scrolling), and the shader forced CLAMP, so everything past the texture's edge repeated the edge texels. Fixed:
+    CLAMP only for quads whose texture coordinates stay inside the texture; others keep the game's addressing. Dust
+    Storm in Practice for 30 s: normal dust (also checked by the user). **Verified 2026-10-07.**

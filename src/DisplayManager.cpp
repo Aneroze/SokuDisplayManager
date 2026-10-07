@@ -1041,6 +1041,7 @@ static volatile int g_sprLayer = -1;   // SPR_* while inside one of the wrapped 
 static IDirect3DPixelShader9 *g_psSprite = nullptr;   // survives Reset (not a D3DPOOL_DEFAULT resource)
 static bool g_sprFailed = false;       // CreatePixelShader failed: off for the session
 static bool g_sprLogged[SPR_LAYERS] = { false, false };
+static bool g_sprTiledLogged = false;
 
 typedef void (__fastcall *GameDraw_t)(void *self);   // thiscall without arguments = fastcall with ecx = this
 static GameDraw_t oPlayersDraw = nullptr, oStageBgA = nullptr, oStageBgB = nullptr, oStageFg = nullptr;
@@ -1103,7 +1104,7 @@ static bool quadScale(D3DPRIMITIVETYPE t, UINT count, const BYTE *pb, UINT strid
 	return *su > 0.0f && *sv > 0.0f;
 }
 
-struct SprSaved { DWORD addrU, addrV; float c[8]; };
+struct SprSaved { DWORD addrU, addrV; bool clamped; float c[8]; };
 
 // Set up the sharp-sprite shader for this draw if it is one of the plain POINT sprite quads; false = leave it alone.
 static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data, UINT stride, int layer,
@@ -1155,14 +1156,32 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 			return false;
 		}
 	}
-	dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
-	dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
+	// CLAMP keeps the 4-tap blend at a sprite's edge from pulling in texels from the opposite side of its texture - but
+	// only for quads inside the texture. A quad whose texture coordinates go past it tiles the texture through the
+	// game's WRAP addressing (the scrolling Dust Storm dust): clamped, everything beyond the edge would repeat the edge
+	// texels as long streaks, so such quads keep the game's addressing (the taps wrap like the texture does).
+	float uMin = 1e9f, uMax = -1e9f, vMin = 1e9f, vMax = -1e9f;
+	for (int i = 0; i < 4; i++) {
+		const float *uv = (const float *)((const BYTE *)data + (size_t)i * stride + uvOff);
+		uMin = min(uMin, uv[0]); uMax = max(uMax, uv[0]); vMin = min(vMin, uv[1]); vMax = max(vMax, uv[1]);
+	}
+	sv->clamped = uMin > -0.001f && vMin > -0.001f && uMax < 1.001f && vMax < 1.001f;
+	if (sv->clamped) {
+		dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
+		dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
+	}
 	dev->GetPixelShaderConstantF(0, sv->c, 2);
 	const float c[8] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, wholeU ? rest : 1.0f, wholeV ? rest : 1.0f };
 	dev->SetPixelShader(g_psSprite);
 	dev->SetPixelShaderConstantF(0, c, 2);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	if (sv->clamped) {
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	} else if (!g_sprTiledLogged) {
+		g_sprTiledLogged = true;
+		logf("sharp sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f) - kept the game's addressing",
+		     layer == SPR_CHARS ? "character" : "stage", tw, th, uMin, uMax, vMin, vMax);
+	}
 	if (!g_sprLogged[layer]) {
 		g_sprLogged[layer] = true;
 		logf("sharp sprites: first %s draw (%ux%u texture, x%.2f/x%.2f, k=%.2f)",
@@ -1174,8 +1193,10 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 static void sprEnd(IDirect3DDevice9 *dev, const SprSaved *sv) {
 	dev->SetPixelShader(nullptr);   // sprBegin only runs without a pixel shader bound
 	dev->SetPixelShaderConstantF(0, sv->c, 2);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
-	dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);
+	if (sv->clamped) {
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);
+	}
 }
 
 static HRESULT WINAPI myDrawPrimitiveUP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data,
