@@ -6,12 +6,15 @@
 // c1.x = k: sharpness relative to that scale. 1 = the band is one screen pixel wide; higher = crisper.
 // c1.zw = strength along u / v: 1 = the sharp-bilinear weights, 0 = the nearest texel (exactly the game's POINT),
 // in between = a mix of the two results (the blend weights are mixed per axis; bilinear is linear in them).
+// c2 = the game's weather tint when its stage shader was bound (saturate(texture + c2) x diffuse, like that shader),
+// else 0 - a no-op, since the filtered colour is already in 0..1.
 // The sampler stays POINT; the shader fetches the 4 neighbouring texel centres itself and blends them premultiplied
 // by alpha, so the transparent texels around a sprite (whatever their colour) don't darken its edges. Output is
 // multiplied by the vertex colour, like the game's fixed-function stage 0 (MODULATE texture x diffuse).
 sampler2D s0 : register(s0);
 float4    c0 : register(c0);
 float4    c1 : register(c1);
+float4    c2 : register(c2);
 
 float4 main(float2 uv : TEXCOORD0, float4 col : COLOR0) : COLOR0 {
     float2 texSize = c0.xy;
@@ -33,5 +36,5 @@ float4 main(float2 uv : TEXCOORD0, float4 col : COLOR0) : COLOR0 {
     a.rgb *= a.a; b.rgb *= b.a; c.rgb *= c.a; d.rgb *= d.a;
     float4 m = lerp(lerp(a, b, w.x), lerp(c, d, w.x), w.y);
     m.rgb /= max(m.a, 1.0 / 512.0);
-    return m * col;
+    return saturate(m + c2) * col;
 }

@@ -1084,7 +1084,7 @@ static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDir
 // hook - entries rather than the battle render's calls to them (0x47A8D0), because mods that change the draw order
 // (CharactersInForeground) NOP the game's call to that and call these functions themselves. Only
 // XYZRHW|DIFFUSE|TEX1 quads with MAG=POINT and the plain fixed-function setup (stage 0 = texture x diffuse, stage 1
-// off, no pixel shader) are changed: the drop shadows (LINEAR) and the stage's effect pass (0x470240, which 0x470500
+// off; no pixel shader, or the game's weather tint shader - WEATHER_TINT_PS) are changed: the drop shadows (LINEAR) and the stage's effect pass (0x470240, which 0x470500
 // tail-jumps to; its own shaders) are left alone. Everything set is restored right after the draw: the game's
 // renderer caches its sampler state (0x896B4C) and skips setting what it thinks is already set. Prototyped in
 // SokuHarness (docs/PLAN-zoom-wobble.md).
@@ -1093,6 +1093,7 @@ static IDirect3DPixelShader9 *g_psSprite = nullptr;   // survives Reset (not a D
 static bool g_sprFailed = false;       // CreatePixelShader failed: off for the session
 static bool g_sprLogged[SPR_LAYERS] = { false, false };
 static bool g_sprTiledLogged = false;
+static bool g_sprTintLogged = false;
 
 typedef void (__fastcall *GameDraw_t)(void *self);   // thiscall without arguments = fastcall with ecx = this
 static GameDraw_t oPlayersDraw = nullptr, oStageBgA = nullptr, oStageBgB = nullptr, oStageFg = nullptr;
@@ -1155,7 +1156,28 @@ static bool quadScale(D3DPRIMITIVETYPE t, UINT count, const BYTE *pb, UINT strid
 	return *su > 0.0f && *sv > 0.0f;
 }
 
-struct SprSaved { DWORD addrU, addrV; bool clamped; float c[8]; };
+struct SprSaved { DWORD addrU, addrV; bool clamped; IDirect3DPixelShader9 *ps; float c[12]; };
+
+// The game's own stage shader under some weathers (Cloudy, Dust Storm, ...): `colour = saturate(texture + c0) x
+// diffuse`, c0 = the weather's colour offset (ps_1_1: tex t0 / add_sat r0, t0, c0 / mul r0, r0, v0). Our shader can
+// do the same after its own sampling (c2), so such draws are filtered too, with the game's tint. Any other shader:
+// left alone.
+static const BYTE WEATHER_TINT_PS[48] = {
+	0x01, 0x01, 0xff, 0xff, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xb0, 0x02, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x1f, 0x80, 0x00, 0x00, 0xe4, 0xb0, 0x00, 0x00, 0xe4, 0xa0, 0x05, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x0f, 0x80, 0x00, 0x00, 0xe4, 0x80, 0x00, 0x00, 0xe4, 0x90, 0xff, 0xff, 0x00, 0x00 };
+static bool isWeatherTintPS(IDirect3DPixelShader9 *ps) {
+	static IDirect3DPixelShader9 *last = nullptr;   // the game creates it once: compare the bytecode only on a change
+	static bool lastIs = false;
+	if (ps != last) {
+		BYTE code[sizeof(WEATHER_TINT_PS)];
+		UINT size = 0;
+		lastIs = SUCCEEDED(ps->GetFunction(nullptr, &size)) && size == sizeof(code) &&
+		         SUCCEEDED(ps->GetFunction(code, &size)) && memcmp(code, WEATHER_TINT_PS, sizeof(code)) == 0;
+		last = ps;
+	}
+	return lastIs;
+}
 
 // Set up the sharp-sprite shader for this draw if it is one of the plain POINT sprite quads; false = leave it alone.
 static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data, UINT stride, int layer,
@@ -1174,8 +1196,6 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 	if (mag != D3DTEXF_POINT || cop != D3DTOP_MODULATE || aop != D3DTOP_MODULATE || ca1 != D3DTA_TEXTURE ||
 	    aa1 != D3DTA_TEXTURE || !diff2 || cop1 != D3DTOP_DISABLE)
 		return false;
-	IDirect3DPixelShader9 *curPs = nullptr;
-	if (SUCCEEDED(dev->GetPixelShader(&curPs)) && curPs) { curPs->Release(); return false; }
 	IDirect3DBaseTexture9 *bt = nullptr;
 	UINT tw = 0, th = 0;
 	if (FAILED(dev->GetTexture(0, &bt)) || !bt) return false;
@@ -1197,6 +1217,13 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 	const bool wholeU = fabsf(su - floorf(su + 0.5f)) < 0.001f, wholeV = fabsf(svv - floorf(svv + 0.5f)) < 0.001f;
 	const float rest = g_sprRest[layer];
 	if (wholeU && wholeV && rest <= 0.0f) return false;
+	// No pixel shader, or the game's weather tint (its colour offset goes to our c2); anything else: left alone.
+	float tint[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	sv->ps = nullptr;
+	if (SUCCEEDED(dev->GetPixelShader(&sv->ps)) && sv->ps) {
+		if (!isWeatherTintPS(sv->ps)) { sv->ps->Release(); return false; }
+		dev->GetPixelShaderConstantF(0, tint, 1);
+	}
 	if (!g_psSprite) {
 		HRESULT hr = dev->CreatePixelShader((const DWORD *)g_sharpSpritePS, &g_psSprite);
 		if (FAILED(hr)) {
@@ -1204,6 +1231,7 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 			g_sprFailed = true;
 			g_sprK[SPR_CHARS] = g_sprK[SPR_STAGE] = 0.0f;
 			logf("sharp sprites: CreatePixelShader failed (0x%08lx) - off", (long)hr);
+			if (sv->ps) sv->ps->Release();
 			return false;
 		}
 	}
@@ -1221,10 +1249,11 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 		dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
 		dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
 	}
-	dev->GetPixelShaderConstantF(0, sv->c, 2);
-	const float c[8] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, wholeU ? rest : 1.0f, wholeV ? rest : 1.0f };
+	dev->GetPixelShaderConstantF(0, sv->c, 3);
+	const float c[12] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, wholeU ? rest : 1.0f, wholeV ? rest : 1.0f,
+	                      tint[0], tint[1], tint[2], tint[3] };
 	dev->SetPixelShader(g_psSprite);
-	dev->SetPixelShaderConstantF(0, c, 2);
+	dev->SetPixelShaderConstantF(0, c, 3);
 	if (sv->clamped) {
 		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -1232,6 +1261,11 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 		g_sprTiledLogged = true;
 		logf("sharp sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f) - kept the game's addressing",
 		     layer == SPR_CHARS ? "character" : "stage", tw, th, uMin, uMax, vMin, vMax);
+	}
+	if (sv->ps && !g_sprTintLogged) {
+		g_sprTintLogged = true;
+		logf("sharp sprites: first %s draw with the game's weather tint (%.3f, %.3f, %.3f, %.3f)",
+		     layer == SPR_CHARS ? "character" : "stage", tint[0], tint[1], tint[2], tint[3]);
 	}
 	if (!g_sprLogged[layer]) {
 		g_sprLogged[layer] = true;
@@ -1242,8 +1276,9 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 }
 
 static void sprEnd(IDirect3DDevice9 *dev, const SprSaved *sv) {
-	dev->SetPixelShader(nullptr);   // sprBegin only runs without a pixel shader bound
-	dev->SetPixelShaderConstantF(0, sv->c, 2);
+	dev->SetPixelShader(sv->ps);    // none, or the game's weather tint shader
+	if (sv->ps) sv->ps->Release();
+	dev->SetPixelShaderConstantF(0, sv->c, 3);
 	if (sv->clamped) {
 		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
 		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);

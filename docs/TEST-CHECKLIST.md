@@ -172,6 +172,13 @@ window appears, hence the 5 s wait.
     CLAMP only for quads whose texture coordinates stay inside the texture; others keep the game's addressing. Dust
     Storm in Practice for 30 s: normal dust (also checked by the user). **Verified 2026-10-07.**
 
+11. Weathers that tint the stage (user report: with Dust Storm the stage filter didn't affect the building): under
+    Cloudy, Dust Storm and others the game draws the stage tiles through its own ps_1_1 shader `saturate(texture + c0)
+    x diffuse` (c0 = the weather's colour offset, e.g. Dust Storm (0, 0, -0.019, 0)), which the filter stepped aside
+    for. Now that exact shader (compared byte for byte) is reproduced in ours (c2) and restored after the draw; other
+    shaders are still left alone. No weather: frame-identical to before (231/231). Dust Storm: tinted draws filtered,
+    building colour unchanged (mean RGB 60/63/28 off vs 61/64/29 on). **Verified 2026-10-07.**
+
 ## DpiAware (unreleased)
 
 Main monitor 2560x1440 at 150%, left monitor 1920x1080 at 125% (x -1920..0 in physical coordinates). Measured from a
