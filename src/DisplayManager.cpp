@@ -136,8 +136,9 @@ static int     g_scaleH    = 960;      // resolved output height
 static int     g_srcW      = 640;      // th123's fixed render size (grab region / pinned viewport); const
 static int     g_srcH      = 480;      // - th123 always renders 640x480, so this is not configurable
 static DWORD   g_filter    = D3DTEXF_POINT;  // resolved upscale filter for this frame
-enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_XBR, FILTER_COUNT };
-static int     g_filterCfg = FILTER_SHARP;
+// FILTER_AUTO: Sharp plus sharp characters and stage, all at the values for the output scale (SCALE_DEFAULTS).
+enum { FILTER_POINT, FILTER_LINEAR, FILTER_SHARP, FILTER_XBR, FILTER_AUTO, FILTER_COUNT };
+static int     g_filterCfg = FILTER_POINT;
 // xBR knobs (shader/xbr.hlsl c1), live-cycled by the Xbr* hotkeys.
 static float   g_xbrStrength = 0.65f;  // 0..1 blend: plain texel .. full xBR (full xBR looked too strong)
 static int     g_xbrCorner   = 1;      // corner type 0..3 = A..D
@@ -145,15 +146,45 @@ static bool    g_xbrSlopes   = false;  // also smooth 30/60-degree edges (xBR le
 static float   g_xbrWidth    = 2.0f;   // edge anti-aliasing band, x the original (2 = softer; picked at x3)
 // Sharp sprites (experimental): the game's POINT-sampled character sprites / stage tiles drawn through a
 // sharp-bilinear shader (see "sharp sprites"). Per layer: the live sharpness k (0 = off) and the k a toggle hotkey
-// turns back on (the ini value, else the suggested default).
+// turns back on (the ini value, else the output scale's default).
 enum { SPR_CHARS = 0, SPR_STAGE = 1, SPR_LAYERS };
 static volatile float g_sprK[SPR_LAYERS]    = { 0.0f, 0.0f };
-static float          g_sprLastK[SPR_LAYERS] = { 2.5f, 1.5f };
+static float          g_sprLastK[SPR_LAYERS] = { 1.5f, 1.75f };
+static bool           g_sprLastKSet[SPR_LAYERS] = { false, false };   // g_sprLastK came from the ini or a hotkey
 static const float    SPR_K_MIN = 0.5f, SPR_K_MAX = 16.0f;
-// At a whole-number scale (the resting zoom: characters x2, stage x1): 0 = the game's own POINT draw, 1 = the full
-// filter, in between a mix (SpriteRestStrength / BackgroundRestStrength). See "sharp sprites".
+// Filter strength, 0 = the game's own POINT draw, 1 = the full filter, in between a mix. See "sharp sprites".
+// Stage: g_sprRest at a whole-number scale (its resting zoom, x1; BackgroundRestStrength), else 1.
+// Characters: by the camera's zoom (how far apart they are) - g_sprRest (SpriteNearStrength) at the resting zoom 1.0,
+// g_sprFar (SpriteFarStrength) at g_sprFarZoom (SpriteFarZoom) and beyond, linear in between.
 static volatile float g_sprRest[SPR_LAYERS] = { 0.0f, 0.5f };
-static bool           g_sprWanted = false;   // an ini value or one of its hotkeys is set: install the hooks
+static volatile float g_sprFar     = 1.0f;
+static volatile float g_sprFarZoom = 0.5f;   // the game's camera zooms between 1.0 (close) and 0.5 (farthest)
+static const float    SPR_FARZOOM_MIN = 0.5f, SPR_FARZOOM_MAX = 0.95f;
+static const float    SPR_WHOLE_FADE = 0.1f;   // characters: scale distance from a whole number where the strength fades
+static bool           g_sprWanted = false;   // sharp sprites can be turned on (ini, Filter=Auto, a hotkey): hook
+static bool           g_sprFailed = false;   // CreatePixelShader failed: off for the session
+
+// Per-output-scale defaults: the values picked by eye at x2, x2.25 and x3 (docs/calibration). A setting left at Auto
+// takes the column of the nearest of those scales (x2's below x2, x3's above x3), and Filter=Auto is the Sharp
+// filter plus sharp characters and stage, all from that column. resolveSettings applies it.
+struct ScaleDefaults {
+	float scale, sharpness, xbrStrength; int xbrCorner; bool xbrSlopes; float xbrWidth, sprK, bgK, sprNear, sprFar,
+	      farZoom, bgRest;
+};
+static const ScaleDefaults SCALE_DEFAULTS[] = {
+	//  scale  Sharp  xBR str corner slopes width   chars  stage  near  far   far at bg rest
+	{ 2.0f,  2.00f, 0.65f,  1,     false, 2.00f,  1.50f, 1.75f, 0.0f, 1.0f, 0.70f, 0.30f },
+	{ 2.25f, 4.00f, 0.50f,  2,     false, 0.50f,  1.50f, 4.00f, 0.0f, 1.0f, 0.65f, 0.50f },
+	{ 3.0f,  2.50f, 0.80f,  2,     false, 0.75f,  1.75f, 2.50f, 0.0f, 1.0f, 0.70f, 0.30f },
+};
+// Settings that follow SCALE_DEFAULTS (ini value Auto, blank or missing) until a hotkey changes them.
+enum { AUTO_SHARP, AUTO_XBR_STRENGTH, AUTO_XBR_CORNER, AUTO_XBR_SLOPES, AUTO_XBR_WIDTH, AUTO_FARZOOM, AUTO_BGREST,
+       AUTO_COUNT };
+static bool  g_auto[AUTO_COUNT] = { true, true, true, true, true, true, true };
+// The chosen (ini / hotkey) values of the settings Filter=Auto overrides; the live ones (g_sharpness, g_sprK,
+// g_sprRest, g_sprFar, g_sprFarZoom) are resolved from them.
+static float g_cfgSharp = 2.0f, g_cfgFarZoom = 0.7f, g_cfgBgRest = 0.3f, g_cfgSprK[SPR_LAYERS] = { 0.0f, 0.0f };
+static float g_cfgSprNear = 0.0f, g_cfgSprFar = 1.0f;
 static D3DCOLOR g_bgColor  = D3DCOLOR_XRGB(0, 0, 0);  // fullscreen border/letterbox color
 static bool    g_resizable = true;     // add a drag-resize border to the window (hotkeys work regardless)
 static bool    g_persist   = true;     // save the current scaling settings to the ini on exit
@@ -181,7 +212,8 @@ static FILE   *g_logFile   = nullptr;
 enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_TOP, ACT_FILTER,
               ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_XBR_STRENGTH, ACT_XBR_CORNER, ACT_XBR_SLOPES,
               ACT_XBR_WIDTH, ACT_SPR_TOGGLE, ACT_SPR_DOWN, ACT_SPR_UP, ACT_BG_TOGGLE, ACT_BG_DOWN, ACT_BG_UP,
-              ACT_SPR_REST_DOWN, ACT_SPR_REST_UP, ACT_BG_REST_DOWN, ACT_BG_REST_UP, ACT_COUNT };
+              ACT_SPR_NEAR_DOWN, ACT_SPR_NEAR_UP, ACT_BG_REST_DOWN, ACT_BG_REST_UP, ACT_SPR_FAR_DOWN, ACT_SPR_FAR_UP,
+              ACT_SPR_FARZOOM_DOWN, ACT_SPR_FARZOOM_UP, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;
@@ -350,7 +382,7 @@ static const char *modeName() {
 }
 static const char *filterName() {
 	return g_filterCfg == FILTER_POINT ? "Point" : g_filterCfg == FILTER_LINEAR ? "Linear" :
-	       g_filterCfg == FILTER_XBR ? "xBR" : "Sharp";
+	       g_filterCfg == FILTER_XBR ? "xBR" : g_filterCfg == FILTER_AUTO ? "Auto" : "Sharp";
 }
 
 // g_sharpness as "X.XX" (wsprintf has no %f).
@@ -417,6 +449,38 @@ static void hookSlot(void **vtable, int index, void *hook, void **orig) {
 	VirtualProtect(&vtable[index], sizeof(void *), old, &old);
 }
 
+// The SCALE_DEFAULTS column for the current output size: the nearest of its scales.
+static const ScaleDefaults &scaleDefaults() {
+	float s = min((float)g_scaleW / g_srcW, (float)g_scaleH / g_srcH);
+	const int n = sizeof(SCALE_DEFAULTS) / sizeof(SCALE_DEFAULTS[0]);
+	int best = 0;
+	for (int i = 1; i < n; i++)
+		if (fabsf(s - SCALE_DEFAULTS[i].scale) < fabsf(s - SCALE_DEFAULTS[best].scale)) best = i;
+	return SCALE_DEFAULTS[best];
+}
+
+// Set the live values from the chosen ones: Filter=Auto takes the output scale's column for Sharpness, the sharp
+// characters / stage and their far zoom / rest strength; otherwise the chosen values, where the Auto ones (g_auto)
+// take the column too. Leaving Filter=Auto brings the chosen values back. Called when the output size, the filter or
+// a chosen value changes; a hotkey changed while Filter=Auto changes only the live value (until the next call).
+static void resolveSettings() {
+	const ScaleDefaults &d = scaleDefaults();
+	const bool af = g_filterCfg == FILTER_AUTO;
+	g_sharpness             = af || g_auto[AUTO_SHARP]   ? d.sharpness : g_cfgSharp;
+	g_sprFarZoom            = af || g_auto[AUTO_FARZOOM] ? d.farZoom   : g_cfgFarZoom;
+	g_sprRest[SPR_STAGE]    = af || g_auto[AUTO_BGREST]  ? d.bgRest    : g_cfgBgRest;
+	g_sprRest[SPR_CHARS]    = af ? d.sprNear : g_cfgSprNear;
+	g_sprFar                = af ? d.sprFar  : g_cfgSprFar;
+	g_sprK[SPR_CHARS]       = g_sprFailed ? 0.0f : af ? d.sprK : g_cfgSprK[SPR_CHARS];
+	g_sprK[SPR_STAGE]       = g_sprFailed ? 0.0f : af ? d.bgK  : g_cfgSprK[SPR_STAGE];
+	if (g_auto[AUTO_XBR_STRENGTH]) g_xbrStrength = d.xbrStrength;
+	if (g_auto[AUTO_XBR_CORNER])   g_xbrCorner   = d.xbrCorner;
+	if (g_auto[AUTO_XBR_SLOPES])   g_xbrSlopes   = d.xbrSlopes;
+	if (g_auto[AUTO_XBR_WIDTH])    g_xbrWidth    = d.xbrWidth;
+	if (!g_sprLastKSet[SPR_CHARS]) g_sprLastK[SPR_CHARS] = d.sprK;   // what a toggle hotkey turns on
+	if (!g_sprLastKSet[SPR_STAGE]) g_sprLastK[SPR_STAGE] = d.bgK;
+}
+
 // Resolve the centered output size (g_scaleW/H) and upscale filter from the current mode and the native
 // backbuffer size (g_bbW/g_bbH). Safe to call any time the native size is known (e.g. from a hotkey).
 // Windowed, the backbuffer is the (4:3) client area, so the image just fills it: the fullscreen Mode is ignored.
@@ -453,11 +517,15 @@ static void computeOutput() {
 	if (outW < 1) outW = 1;
 	if (outH < 1) outH = 1;
 	g_scaleW = outW; g_scaleH = outH;
-	// Sharp and xBR draw with their shaders; linear is only their StretchRect fallback.
+	// Sharp, xBR and Auto draw with their shaders; linear is only their StretchRect fallback.
 	g_filter = g_filterCfg == FILTER_POINT ? D3DTEXF_POINT : D3DTEXF_LINEAR;
-	logf("output -> %dx%d centered at (%d,%d), filter=%s", g_scaleW, g_scaleH,
-	     ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
-	     g_filter == D3DTEXF_POINT ? "point" : "linear");
+	resolveSettings();
+	char sh[16], ch[16], bg[16];
+	formatHundredths(g_sharpness, sh); formatHundredths(g_sprK[SPR_CHARS], ch); formatHundredths(g_sprK[SPR_STAGE], bg);
+	logf("output -> %dx%d centered at (%d,%d), filter=%s (%s), sharpness=%s sprites=%s/%s (x%d.%02d defaults)",
+	     g_scaleW, g_scaleH, ((int)g_bbW - g_scaleW) / 2, ((int)g_bbH - g_scaleH) / 2,
+	     g_filter == D3DTEXF_POINT ? "point" : "linear", filterName(), sh, ch, bg,
+	     (int)scaleDefaults().scale, (int)(scaleDefaults().scale * 100.0f + 0.5f) % 100);
 }
 
 // The native resolution/refresh of the monitor fullscreen will land on, queried live: the game's cached
@@ -1016,7 +1084,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			if (!g_stageSurf) fillBorders(dev, bb, dstRect);
 			// Sharp and xBR fall back to StretchRect (g_filter resolves to linear for them) if the shader pass
 			// couldn't draw - otherwise a stale / uninitialised frame would be shown.
-			bool drawn = g_filterCfg == FILTER_SHARP ? drawSharp(dev, bb, target, &dstRect) :
+			bool drawn = g_filterCfg == FILTER_SHARP || g_filterCfg == FILTER_AUTO ? drawSharp(dev, bb, target, &dstRect) :
 			             g_filterCfg == FILTER_XBR   ? drawXbr(dev, bb, target, &dstRect) : false;
 			if (!drawn)
 				c = dev->StretchRect(g_captureSurf, nullptr, target, &dstRect, (D3DTEXTUREFILTERTYPE)g_filter);
@@ -1090,7 +1158,6 @@ static HRESULT WINAPI mySetRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDir
 // SokuHarness (docs/PLAN-zoom-wobble.md).
 static volatile int g_sprLayer = -1;   // SPR_* while inside one of the wrapped draws (render thread), else -1
 static IDirect3DPixelShader9 *g_psSprite = nullptr;   // survives Reset (not a D3DPOOL_DEFAULT resource)
-static bool g_sprFailed = false;       // CreatePixelShader failed: off for the session
 static bool g_sprLogged[SPR_LAYERS] = { false, false };
 static bool g_sprTiledLogged = false;
 static bool g_sprTintLogged = false;
@@ -1156,7 +1223,7 @@ static bool quadScale(D3DPRIMITIVETYPE t, UINT count, const BYTE *pb, UINT strid
 	return *su > 0.0f && *sv > 0.0f;
 }
 
-struct SprSaved { DWORD addrU, addrV; bool clamped; IDirect3DPixelShader9 *ps; float c[12]; };
+struct SprSaved { DWORD addrU, addrV; bool clampU, clampV; IDirect3DPixelShader9 *ps; float c[12]; };
 
 // The game's own stage shader under some weathers (Cloudy, Dust Storm, ...): `colour = saturate(texture + c0) x
 // diffuse`, c0 = the weather's colour offset (ps_1_1: tex t0 / add_sat r0, t0, c0 / mul r0, r0, v0). Our shader can
@@ -1177,6 +1244,19 @@ static bool isWeatherTintPS(IDirect3DPixelShader9 *ps) {
 		last = ps;
 	}
 	return lastIs;
+}
+
+// The characters' filter strength for the current camera zoom (SokuLib camera.scale, 0x898614). The game zooms
+// out as the players move apart (zoom = 640 / the distance between them, from 1.0 at up to ~560 px apart down to
+// 0.5), and their sprites' pixels get more uneven the further it is from the resting 1.0: SpriteNearStrength at
+// 1.0, SpriteFarStrength at SpriteFarZoom and below, linear in between.
+static float sprStrengthByZoom() {
+	float z = *(const volatile float *)0x898614;
+	if (!(z > 0.1f && z < 4.0f)) z = 1.0f;          // not set up (never expected inside a battle draw)
+	const float nearS = g_sprRest[SPR_CHARS], farS = g_sprFar, farZ = g_sprFarZoom;
+	float t = (1.0f - z) / (1.0f - farZ);
+	t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+	return nearS + (farS - nearS) * t;
 }
 
 // Set up the sharp-sprite shader for this draw if it is one of the plain POINT sprite quads; false = leave it alone.
@@ -1208,15 +1288,29 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 	UINT uvOff = 16 + 4 + ((fvf & D3DFVF_SPECULAR) ? 4 : 0);   // after XYZRHW, DIFFUSE (and SPECULAR)
 	if (!tw || !th || stride < uvOff + 8 || !quadScale(t, count, (const BYTE *)data, stride, uvOff, tw, th, &su, &svv))
 		return false;
-	// At a whole-number scale, POINT is already even, while sharp-bilinear depends on the sprite's sub-pixel position:
-	// when the camera puts texel edges right on pixel centres (e.g. the resting x2 zoom with the camera centre on a
-	// half pixel), it blends every edge 50/50 and every other column / row comes out as a mix - visibly blurry. In
-	// exchange it moves smoothly where POINT steps a whole pixel at a time (the stage panning at x1). So a whole axis
-	// gets the layer's rest strength (0 = the nearest texel = POINT, 1 = the full filter; the shader mixes the two),
-	// and a draw that is whole on both axes with strength 0 is left to the game's own POINT draw.
-	const bool wholeU = fabsf(su - floorf(su + 0.5f)) < 0.001f, wholeV = fabsf(svv - floorf(svv + 0.5f)) < 0.001f;
-	const float rest = g_sprRest[layer];
-	if (wholeU && wholeV && rest <= 0.0f) return false;
+	// The filter strength per axis (0 = the nearest texel = POINT, 1 = the full filter; the shader mixes the two).
+	// Stage: at a whole-number scale, POINT is already even, while sharp-bilinear depends on the sprite's sub-pixel
+	// position: when the camera puts texel edges right on pixel centres (e.g. x1 with the camera on a half pixel), it
+	// blends every edge 50/50 and every other column / row comes out as a mix - visibly blurry. In exchange it moves
+	// smoothly where POINT steps a whole pixel at a time (the stage panning at x1). So a whole axis gets the rest
+	// strength. Characters: by the camera's zoom (sprStrengthByZoom), faded the same way. Strength 0 on both axes is the
+	// same image as the game's own POINT draw, so such a draw is left alone.
+	float strU, strV;
+	if (layer == SPR_CHARS) {
+		// Near a whole-number scale the same blur appears (at x1, the camera's farthest zoom 0.5, every pixel of a
+		// sprite on a half pixel is a 50/50 mix, while POINT is already even there), so the strength fades to the
+		// near strength within SPR_WHOLE_FADE of one.
+		const float s = sprStrengthByZoom(), nearS = g_sprRest[SPR_CHARS];
+		const float fu = fminf(fabsf(su - floorf(su + 0.5f)) / SPR_WHOLE_FADE, 1.0f);
+		const float fv = fminf(fabsf(svv - floorf(svv + 0.5f)) / SPR_WHOLE_FADE, 1.0f);
+		strU = nearS + (s - nearS) * fu;
+		strV = nearS + (s - nearS) * fv;
+	} else {
+		const bool wholeU = fabsf(su - floorf(su + 0.5f)) < 0.001f, wholeV = fabsf(svv - floorf(svv + 0.5f)) < 0.001f;
+		strU = wholeU ? g_sprRest[layer] : 1.0f;
+		strV = wholeV ? g_sprRest[layer] : 1.0f;
+	}
+	if (strU <= 0.0f && strV <= 0.0f) return false;
 	// No pixel shader, or the game's weather tint (its colour offset goes to our c2); anything else: left alone.
 	float tint[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 	sv->ps = nullptr;
@@ -1236,31 +1330,33 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 		}
 	}
 	// CLAMP keeps the 4-tap blend at a sprite's edge from pulling in texels from the opposite side of its texture - but
-	// only for quads inside the texture. A quad whose texture coordinates go past it tiles the texture through the
-	// game's WRAP addressing (the scrolling Dust Storm dust): clamped, everything beyond the edge would repeat the edge
-	// texels as long streaks, so such quads keep the game's addressing (the taps wrap like the texture does).
+	// only along an axis where the quad stays inside the texture. Along an axis where its texture coordinates go past
+	// it, the quad tiles the texture through the game's WRAP addressing (the scrolling Dust Storm dust, along u):
+	// clamped, everything beyond the edge would repeat the edge texels as long streaks, so that axis keeps the game's
+	// addressing (the taps wrap like the texture does). Per axis: the dust (u 0.01..1.01, v 0..1) wrapping along v too
+	// blended its top and bottom rows with each other - a 1-pixel seam at its edges when zoomed out.
 	float uMin = 1e9f, uMax = -1e9f, vMin = 1e9f, vMax = -1e9f;
 	for (int i = 0; i < 4; i++) {
 		const float *uv = (const float *)((const BYTE *)data + (size_t)i * stride + uvOff);
 		uMin = min(uMin, uv[0]); uMax = max(uMax, uv[0]); vMin = min(vMin, uv[1]); vMax = max(vMax, uv[1]);
 	}
-	sv->clamped = uMin > -0.001f && vMin > -0.001f && uMax < 1.001f && vMax < 1.001f;
-	if (sv->clamped) {
-		dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
-		dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
-	}
+	sv->clampU = uMin > -0.001f && uMax < 1.001f;
+	sv->clampV = vMin > -0.001f && vMax < 1.001f;
+	if (sv->clampU) dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &sv->addrU);
+	if (sv->clampV) dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &sv->addrV);
 	dev->GetPixelShaderConstantF(0, sv->c, 3);
-	const float c[12] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, wholeU ? rest : 1.0f, wholeV ? rest : 1.0f,
+	const float c[12] = { (float)tw, (float)th, su, svv, g_sprK[layer], 0.0f, strU, strV,
 	                      tint[0], tint[1], tint[2], tint[3] };
 	dev->SetPixelShader(g_psSprite);
 	dev->SetPixelShaderConstantF(0, c, 3);
-	if (sv->clamped) {
-		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	} else if (!g_sprTiledLogged) {
+	if (sv->clampU) dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+	if (sv->clampV) dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+	if ((!sv->clampU || !sv->clampV) && !g_sprTiledLogged) {
 		g_sprTiledLogged = true;
-		logf("sharp sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f) - kept the game's addressing",
-		     layer == SPR_CHARS ? "character" : "stage", tw, th, uMin, uMax, vMin, vMax);
+		const float *p0 = (const float *)data, *p3 = (const float *)((const BYTE *)data + (size_t)3 * stride);
+		logf("sharp sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f, at %.1f,%.1f..%.1f,%.1f) - "
+		     "kept the game's addressing along %s", layer == SPR_CHARS ? "character" : "stage", tw, th, uMin, uMax, vMin,
+		     vMax, p0[0], p0[1], p3[0], p3[1], !sv->clampU && !sv->clampV ? "u and v" : !sv->clampU ? "u" : "v");
 	}
 	if (sv->ps && !g_sprTintLogged) {
 		g_sprTintLogged = true;
@@ -1279,10 +1375,8 @@ static void sprEnd(IDirect3DDevice9 *dev, const SprSaved *sv) {
 	dev->SetPixelShader(sv->ps);    // none, or the game's weather tint shader
 	if (sv->ps) sv->ps->Release();
 	dev->SetPixelShaderConstantF(0, sv->c, 3);
-	if (sv->clamped) {
-		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
-		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);
-	}
+	if (sv->clampU) dev->SetSamplerState(0, D3DSAMP_ADDRESSU, sv->addrU);
+	if (sv->clampV) dev->SetSamplerState(0, D3DSAMP_ADDRESSV, sv->addrV);
 }
 
 static HRESULT WINAPI myDrawPrimitiveUP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, const void *data,
@@ -1848,6 +1942,18 @@ static ULONGLONG iniVersion() {
 	return parseVersion(v);
 }
 
+// Before 1.2.0, Sharpness and the Xbr* knobs had fixed defaults (shipped in every ini). Those exact values in an older
+// ini mean "the default", which is Auto (the value picked for the output size) since 1.2.0; anything else was chosen.
+static const char *const PRE_AUTO_KEYS[] = { "Sharpness", "XbrStrength", "XbrCorner", "XbrSlopes", "XbrWidth" };
+static bool isPreAutoDefault(const char *key, const char *val) {
+	if (!lstrcmpiA(key, "XbrCorner")) return !lstrcmpiA(val, "B");
+	if (!val[0] || !lstrcmpiA(val, "Auto")) return false;
+	const float v = (float)atof(val);
+	const float def = !lstrcmpiA(key, "Sharpness") ? 1.5f : !lstrcmpiA(key, "XbrStrength") ? 0.65f :
+	                  !lstrcmpiA(key, "XbrWidth") ? 2.0f : 0.0f;   // XbrSlopes: 0
+	return fabsf(v - def) < 0.001f;
+}
+
 // One ini line. Keys: `active` = Key=value, otherwise a commented-out key (";Key=value", no blank after the ';').
 struct IniLine {
 	enum Kind { OTHER, SECTION, KEY, COMMENTED_KEY } kind;
@@ -1916,6 +2022,21 @@ static void fixupIniValues(std::vector<IniLine> &user, ULONGLONG from) {
 		if (findIniKey(user, IniLine::KEY, "Display", "FullscreenScale")) markIniKeyUsed(user, "Display", LEGACY_FS_SCALE_KEY);
 		else old->key = "FullscreenScale";
 	}
+	// SpriteRestStrength (and its hotkeys), from unreleased 1.1.3 builds, is SpriteNearStrength (the new name wins, as
+	// in loadConfig).
+	static const char *const renamed[][3] = { { "Display", "SpriteRestStrength", "SpriteNearStrength" },
+	                                          { "Hotkeys", "SpriteRestStrengthDown", "SpriteNearStrengthDown" },
+	                                          { "Hotkeys", "SpriteRestStrengthUp", "SpriteNearStrengthUp" } };
+	for (const auto &r : renamed)
+		if (IniLine *old = findIniKey(user, IniLine::KEY, r[0], r[1])) {
+			if (findIniKey(user, IniLine::KEY, r[0], r[2])) markIniKeyUsed(user, r[0], r[1]);
+			else old->key = r[2];
+		}
+	// The old fixed defaults of Sharpness / Xbr* become Auto (see isPreAutoDefault). Filter is left as it is.
+	if (from < INI_VERSION(1, 2, 0))
+		for (const char *k : PRE_AUTO_KEYS)
+			if (IniLine *l = findIniKey(user, IniLine::KEY, "Display", k))
+				if (isPreAutoDefault(k, l->value.c_str())) l->value = "Auto";
 	// A missing WindowScale (before 1.0.3) means the FullscreenScale value (loadConfig's fallback).
 	IniLine *fs = findIniKey(user, IniLine::KEY, "Display", "FullscreenScale");
 	if (fs && !findIniKey(user, IniLine::KEY, "Display", "WindowScale")) {
@@ -2069,16 +2190,24 @@ static void loadConfig() {
 	g_bgColor = parseColor(color, D3DCOLOR_XRGB(0, 0, 0));
 
 	char filt[32] = {0};
-	GetPrivateProfileStringA("Display", "Filter", "Sharp", filt, sizeof(filt), g_iniPath);
-	if      (StrCmpIA(filt, "Point") == 0)  g_filterCfg = FILTER_POINT;
+	GetPrivateProfileStringA("Display", "Filter", "Point", filt, sizeof(filt), g_iniPath);
+	if      (StrCmpIA(filt, "Sharp") == 0)  g_filterCfg = FILTER_SHARP;
 	else if (StrCmpIA(filt, "Linear") == 0) g_filterCfg = FILTER_LINEAR;
 	else if (StrCmpIA(filt, "xBR") == 0)    g_filterCfg = FILTER_XBR;
-	else                                    g_filterCfg = FILTER_SHARP;   // the default; also the removed "Auto"
+	else if (StrCmpIA(filt, "Auto") == 0)   g_filterCfg = FILTER_AUTO;
+	else                                    g_filterCfg = FILTER_POINT;   // the default
 
+	// Sharpness and the Xbr* knobs: Auto (also blank or missing) = the output scale's value (SCALE_DEFAULTS).
 	char sharp[32] = {0};
-	GetPrivateProfileStringA("Display", "Sharpness", "1.50", sharp, sizeof(sharp), g_iniPath);
-	g_sharpness = (float)atof(sharp);
-	clampSharpness();
+	GetPrivateProfileStringA("Display", "Sharpness", "", sharp, sizeof(sharp), g_iniPath);
+	// An older ini that couldn't be upgraded (PersistState=0 and PersistPosition=0) still means Auto by its old default.
+	const bool preAuto = iniVersion() < INI_VERSION(1, 2, 0);
+	g_auto[AUTO_SHARP] = !sharp[0] || StrCmpIA(sharp, "Auto") == 0 || (preAuto && isPreAutoDefault("Sharpness", sharp));
+	if (!g_auto[AUTO_SHARP]) {
+		g_sharpness = (float)atof(sharp);
+		clampSharpness();
+		g_cfgSharp = g_sharpness;
+	}
 
 	g_resizable = GetPrivateProfileIntA("Display", "Resizable", 1, g_iniPath) != 0;
 	{   // PositionX/Y: blank (or missing) = leave the window where the game puts it; any number is a coordinate
@@ -2101,19 +2230,28 @@ static void loadConfig() {
 	g_msaaCfg      = GetPrivateProfileIntA("Display", "MultiSample", 0, g_iniPath);
 	g_msaaIni      = g_msaaCfg;
 	{   // xBR knobs
-		char v[32] = {0};
-		GetPrivateProfileStringA("Display", "XbrStrength", "0.65", v, sizeof(v), g_iniPath);
-		g_xbrStrength = (float)atof(v);
-		if (g_xbrStrength < 0.0f) g_xbrStrength = 0.0f;
-		if (g_xbrStrength > 1.0f) g_xbrStrength = 1.0f;
-		GetPrivateProfileStringA("Display", "XbrCorner", "B", v, sizeof(v), g_iniPath);
-		char cc = v[0] >= 'a' ? v[0] - 32 : v[0];
-		g_xbrCorner = (cc >= 'A' && cc <= 'D') ? cc - 'A' : 1;
-		g_xbrSlopes = GetPrivateProfileIntA("Display", "XbrSlopes", 0, g_iniPath) != 0;
-		GetPrivateProfileStringA("Display", "XbrWidth", "2.0", v, sizeof(v), g_iniPath);
-		g_xbrWidth = (float)atof(v);
-		if (g_xbrWidth < 0.05f) g_xbrWidth = 0.05f;
-		if (g_xbrWidth > 4.0f) g_xbrWidth = 4.0f;
+		static const char *const xbrKeys[4] = { "XbrStrength", "XbrCorner", "XbrSlopes", "XbrWidth" };
+		char v[4][32] = {};
+		for (int i = 0; i < 4; i++) {
+			GetPrivateProfileStringA("Display", xbrKeys[i], "", v[i], sizeof(v[i]), g_iniPath);
+			g_auto[AUTO_XBR_STRENGTH + i] = !v[i][0] || StrCmpIA(v[i], "Auto") == 0 ||
+			                                (preAuto && isPreAutoDefault(xbrKeys[i], v[i]));
+		}
+		if (!g_auto[AUTO_XBR_STRENGTH]) {
+			g_xbrStrength = (float)atof(v[0]);
+			if (g_xbrStrength < 0.0f) g_xbrStrength = 0.0f;
+			if (g_xbrStrength > 1.0f) g_xbrStrength = 1.0f;
+		}
+		if (!g_auto[AUTO_XBR_CORNER]) {
+			char cc = v[1][0] >= 'a' ? v[1][0] - 32 : v[1][0];
+			g_xbrCorner = (cc >= 'A' && cc <= 'D') ? cc - 'A' : 1;
+		}
+		if (!g_auto[AUTO_XBR_SLOPES]) g_xbrSlopes = StrToIntA(v[2]) != 0;
+		if (!g_auto[AUTO_XBR_WIDTH]) {
+			g_xbrWidth = (float)atof(v[3]);
+			if (g_xbrWidth < 0.05f) g_xbrWidth = 0.05f;
+			if (g_xbrWidth > 4.0f) g_xbrWidth = 4.0f;
+		}
 	}
 	{   // sharp sprites (experimental): commented out, blank or 0 = off
 		static const char *const keys[SPR_LAYERS] = { "SpriteSharpness", "BackgroundSharpness" };
@@ -2124,15 +2262,36 @@ static void loadConfig() {
 			if (k <= 0.0f) continue;
 			if (k < SPR_K_MIN) k = SPR_K_MIN;
 			if (k > SPR_K_MAX) k = SPR_K_MAX;
-			g_sprK[l] = g_sprLastK[l] = k;
+			g_cfgSprK[l] = g_sprLastK[l] = k;
+			g_sprLastKSet[l] = true;
 		}
-		static const char *const restKeys[SPR_LAYERS] = { "SpriteRestStrength", "BackgroundRestStrength" };
-		for (int l = 0; l < SPR_LAYERS; l++) {   // commented out / blank = the default
+		// Strengths, 0..1; commented out / blank = the default. SpriteNearStrength was SpriteRestStrength in unreleased
+		// 1.1.3 builds.
+		static const char *const restKeys[] = { "SpriteNearStrength", "SpriteFarStrength", "SpriteRestStrength" };
+		float *const restVals[] = { &g_cfgSprNear, &g_cfgSprFar, &g_cfgSprNear };
+		bool haveNear = false;
+		for (int i = 0; i < 3; i++) {
+			if (i == 2 && haveNear) break;
 			char v[32] = {0};
-			GetPrivateProfileStringA("Display", restKeys[l], "", v, sizeof(v), g_iniPath);
+			GetPrivateProfileStringA("Display", restKeys[i], "", v, sizeof(v), g_iniPath);
 			if (!v[0]) continue;
 			float r = (float)atof(v);
-			g_sprRest[l] = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+			*restVals[i] = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+			if (i == 0) haveNear = true;
+		}
+		// BackgroundRestStrength / SpriteFarZoom: Auto (also blank or missing) = the output scale's value.
+		char v[32] = {0};
+		GetPrivateProfileStringA("Display", "BackgroundRestStrength", "", v, sizeof(v), g_iniPath);
+		g_auto[AUTO_BGREST] = !v[0] || StrCmpIA(v, "Auto") == 0;
+		if (!g_auto[AUTO_BGREST]) {
+			float r = (float)atof(v);
+			g_cfgBgRest = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+		}
+		GetPrivateProfileStringA("Display", "SpriteFarZoom", "", v, sizeof(v), g_iniPath);
+		g_auto[AUTO_FARZOOM] = !v[0] || StrCmpIA(v, "Auto") == 0;
+		if (!g_auto[AUTO_FARZOOM]) {
+			float z = (float)atof(v);
+			g_cfgFarZoom = z < SPR_FARZOOM_MIN ? SPR_FARZOOM_MIN : z > SPR_FARZOOM_MAX ? SPR_FARZOOM_MAX : z;
 		}
 	}
 
@@ -2150,8 +2309,9 @@ static void loadConfig() {
 	                                 "SharpnessDown", "SharpnessUp", "ToggleMSAA", "XbrStrength", "XbrCorner",
 	                                 "XbrSlopes", "XbrWidth", "SharpSprites", "SpriteSharpnessDown",
 	                                 "SpriteSharpnessUp", "SharpBackground", "BackgroundSharpnessDown",
-	                                 "BackgroundSharpnessUp", "SpriteRestStrengthDown", "SpriteRestStrengthUp",
-	                                 "BackgroundRestStrengthDown", "BackgroundRestStrengthUp" };
+	                                 "BackgroundSharpnessUp", "SpriteNearStrengthDown", "SpriteNearStrengthUp",
+	                                 "BackgroundRestStrengthDown", "BackgroundRestStrengthUp", "SpriteFarStrengthDown",
+	                                 "SpriteFarStrengthUp", "SpriteFarZoomDown", "SpriteFarZoomUp" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
@@ -2161,9 +2321,13 @@ static void loadConfig() {
 		for (int b = a + 1; b < ACT_COUNT; b++)
 			if (g_hotkeyVk[a] && g_hotkeyVk[a] == g_hotkeyVk[b])
 				logf("hotkeys: %s and %s are both %c - only %s works", names[a], names[b], g_hotkeyVk[a], names[a]);
-	g_sprWanted =g_sprK[SPR_CHARS] > 0.0f || g_sprK[SPR_STAGE] > 0.0f;
-	for (int a = ACT_SPR_TOGGLE; a <= ACT_BG_REST_UP; a++)
+	// The game's draws are hooked only if sharp sprites can come on: an ini value, Filter=Auto, or a hotkey that turns
+	// them on (theirs, or CycleFilter, which reaches Auto).
+	g_sprWanted = g_cfgSprK[SPR_CHARS] > 0.0f || g_cfgSprK[SPR_STAGE] > 0.0f || g_filterCfg == FILTER_AUTO ||
+	              g_hotkeyVk[ACT_FILTER];
+	for (int a = ACT_SPR_TOGGLE; a <= ACT_SPR_FARZOOM_UP; a++)
 		if (g_hotkeyVk[a]) g_sprWanted = true;
+	resolveSettings();
 }
 
 // Write "Display"/key = val only if it differs from what's already in the ini, so an unchanged session
@@ -2201,8 +2365,8 @@ static void persistState() {
 	writeIniIfChanged("WindowScale", scale);
 
 	writeIniIfChanged("Filter", filterName());
-	char sh[16];
-	formatSharpness(sh);
+	char sh[16] = "Auto";
+	if (!g_auto[AUTO_SHARP]) formatHundredths(g_cfgSharp, sh);
 	writeIniIfChanged("Sharpness", sh);
 }
 
@@ -2589,6 +2753,18 @@ static void enterBorderlessFullscreen() {
 	     mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, g_topmost);
 }
 
+// Shift held together with a tuning hotkey: finer steps (Sharpness, sharp sprites) or the reverse direction (the
+// xBR Strength / Width cycles). Not when Shift is the hotkey modifier itself.
+static bool fineStep() {
+	return g_modifier != MODK_SHIFT && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
+// After a filter change: resolve the output's filter and the live values now (see resolveSettings).
+static void filterChanged() {
+	if (g_active) computeOutput();
+	else resolveSettings();
+}
+
 // Run a hotkey action. "Scale N" applies to the current state: fullscreen sets Mode=IntegerScaling xN;
 // windowed only resizes the window (g_winScale), so it never changes the fullscreen mode.
 static void doAction(int act) {
@@ -2618,33 +2794,42 @@ static void doAction(int act) {
 		logf("hotkey: always-on-top=%d", g_topmost);
 		break;
 	case ACT_FILTER:
-		g_filterCfg = (g_filterCfg + 1) % FILTER_COUNT;   // Point -> Linear -> Sharp -> xBR -> Point
-		if (g_active) computeOutput();                    // re-resolve g_filter now; next frame's present uses it
+		g_filterCfg = (g_filterCfg + 1) % FILTER_COUNT;   // Point -> Linear -> Sharp -> xBR -> Auto -> Point
+		filterChanged();                                  // re-resolve g_filter now; next frame's present uses it
 		if (g_filterCfg == FILTER_SHARP) showSharpnessOsd();
-		else showOsd(g_filterCfg == FILTER_POINT ? "POINT" : g_filterCfg == FILTER_XBR ? "XBR" : "LINEAR");
+		else showOsd(g_filterCfg == FILTER_POINT ? "POINT" : g_filterCfg == FILTER_XBR ? "XBR" :
+		             g_filterCfg == FILTER_AUTO ? "AUTO" : "LINEAR");
 		logf("hotkey: filter -> %s", filterName());
 		break;
 	case ACT_SHARP_DOWN:
-	case ACT_SHARP_UP:
-		g_filterCfg = FILTER_SHARP;             // sharpness only affects Sharp, so switch to it
-		if (g_active) computeOutput();
-		g_sharpness += (act == ACT_SHARP_UP) ? 0.25f : -0.25f;   // live; the shader reads it each frame
+	case ACT_SHARP_UP: {
+		const bool af = g_filterCfg == FILTER_AUTO;
+		if (!af) {                              // sharpness only affects Sharp (and Auto), so switch to it
+			g_filterCfg = FILTER_SHARP;
+			filterChanged();
+		}
+		float step = fineStep() ? 0.05f : 0.25f;                     // Shift: fine steps
+		g_sharpness += (act == ACT_SHARP_UP) ? step : -step;         // live; the shader reads it each frame
+		g_sharpness = floorf(g_sharpness / 0.05f + 0.5f) * 0.05f;
 		clampSharpness();
+		if (!af) { g_cfgSharp = g_sharpness; g_auto[AUTO_SHARP] = false; }   // Auto: this session's Auto only
 		showSharpnessOsd();
-		logf("hotkey: filter=Sharp sharpness -> %.2f", g_sharpness);
+		logf("hotkey: filter=%s sharpness -> %.2f", filterName(), g_sharpness);
 		break;
+	}
 	case ACT_XBR_STRENGTH: case ACT_XBR_CORNER: case ACT_XBR_SLOPES: case ACT_XBR_WIDTH: {
 		// Development knobs: each cycles one xBR setting and switches to xBR. Session only (not written to the ini);
-		// the log gets the resulting values so they can be copied into the ini.
-		static const float widths[] = { 0.25f, 0.5f, 1.0f, 2.0f };
-		static const float strengths[] = { 1.0f, 0.8f, 0.65f, 0.5f, 0.35f, 0.2f };
+		// the log gets the resulting values so they can be copied into the ini. With Shift: the other direction.
 		char msg[32], num[16];
+		bool back = fineStep();
 		g_filterCfg = FILTER_XBR;
-		if (g_active) computeOutput();
+		filterChanged();
+		g_auto[AUTO_XBR_STRENGTH + (act - ACT_XBR_STRENGTH)] = false;   // a fixed value from now on
 		if (act == ACT_XBR_STRENGTH) {
-			int k = 0;                                                // next step below the current value
-			while (k < 6 && strengths[k] > g_xbrStrength - 0.01f) k++;
-			g_xbrStrength = strengths[k < 6 ? k : 0];                 // 1.0 -> 0.8 -> 0.65 -> ... -> 0.2 -> 1.0
+			// 0.05 steps down, wrapping 0.05 -> 1.0 (Shift: up, wrapping 1.0 -> 0.05)
+			int s = (int)floorf(g_xbrStrength * 20.0f + 0.5f) + (back ? 1 : -1);
+			if (s < 1) s = 20; else if (s > 20) s = 1;
+			g_xbrStrength = s / 20.0f;
 			formatHundredths(g_xbrStrength, num);
 			wsprintfA(msg, "XBR STR %s", num);
 		} else if (act == ACT_XBR_CORNER) {
@@ -2654,9 +2839,10 @@ static void doAction(int act) {
 			g_xbrSlopes = !g_xbrSlopes;
 			wsprintfA(msg, "XBR 30 60 %s", g_xbrSlopes ? "ON" : "OFF");
 		} else {
-			int k = 0;
-			while (k < 3 && widths[k] < g_xbrWidth - 0.01f) k++;      // current (or next larger) step
-			g_xbrWidth = widths[(k + 1) % 4];                         // 1.0 -> 2.0 -> 0.25 -> 0.5 -> 1.0
+			// 0.25 steps up, wrapping 4.0 -> 0.25 (Shift: down, wrapping 0.25 -> 4.0)
+			int w = (int)floorf(g_xbrWidth * 4.0f + 0.5f) + (back ? -1 : 1);
+			if (w < 1) w = 16; else if (w > 16) w = 1;
+			g_xbrWidth = w / 4.0f;
 			formatHundredths(g_xbrWidth, num);
 			wsprintfA(msg, "XBR WIDTH %s", num);
 		}
@@ -2669,8 +2855,8 @@ static void doAction(int act) {
 	}
 	case ACT_SPR_TOGGLE: case ACT_SPR_DOWN: case ACT_SPR_UP:
 	case ACT_BG_TOGGLE: case ACT_BG_DOWN: case ACT_BG_UP: {
-		// Experimental sharp sprites, session only (not written to the ini). Toggle: off <-> the last value (the ini's,
-		// else the suggested one). Down / Up: step k; from off they first turn it back on at the last value.
+	// Sharp sprites, session only (not written to the ini). Toggle: off <-> the last value (the ini's, else the
+	// output scale's default). Down / Up: step k; from off they first turn it back on at the last value.
 		static const float steps[] = { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f, 6.0f, 8.0f,
 		                               12.0f, 16.0f };
 		const int n = sizeof(steps) / sizeof(steps[0]);
@@ -2679,6 +2865,9 @@ static void doAction(int act) {
 		float k = g_sprK[layer];
 		if (op == 0 || k <= 0.0f) {
 			k = k > 0.0f ? 0.0f : g_sprLastK[layer];
+		} else if (fineStep()) {                                        // Shift: 0.1 steps
+			k = floorf(k * 10.0f + 0.5f) / 10.0f + (op == 1 ? -0.1f : 0.1f);
+			k = k < steps[0] ? steps[0] : k > steps[n - 1] ? steps[n - 1] : k;
 		} else {
 			int j = 0;
 			while (j < n - 1 && steps[j] < k - 0.001f) j++;            // the step at or above k
@@ -2687,8 +2876,11 @@ static void doAction(int act) {
 			k = steps[j];
 		}
 		if (g_sprFailed) k = 0.0f;
-		if (k > 0.0f) g_sprLastK[layer] = k;
 		g_sprK[layer] = k;
+		if (g_filterCfg != FILTER_AUTO) {       // Auto: this session's Auto only; leaving it brings the chosen value back
+			g_cfgSprK[layer] = k;
+			if (k > 0.0f) { g_sprLastK[layer] = k; g_sprLastKSet[layer] = true; }
+		}
 		char msg[32], num[16];
 		formatHundredths(k, num);
 		wsprintfA(msg, "%s %s", layer == SPR_CHARS ? "SPRITES" : "BG", k > 0.0f ? num : "OFF");
@@ -2696,18 +2888,39 @@ static void doAction(int act) {
 		logf("hotkey: sharp %s -> %.2f", layer == SPR_CHARS ? "sprites" : "background", (double)k);
 		break;
 	}
-	case ACT_SPR_REST_DOWN: case ACT_SPR_REST_UP: case ACT_BG_REST_DOWN: case ACT_BG_REST_UP: {
-		// Rest strength (the whole-number-scale mix) in 0.1 steps, session only.
-		int layer = act <= ACT_SPR_REST_UP ? SPR_CHARS : SPR_STAGE;
-		bool up = act == ACT_SPR_REST_UP || act == ACT_BG_REST_UP;
-		float r = floorf(g_sprRest[layer] * 10.0f + 0.5f) / 10.0f + (up ? 0.1f : -0.1f);
+	case ACT_SPR_NEAR_DOWN: case ACT_SPR_NEAR_UP: case ACT_BG_REST_DOWN: case ACT_BG_REST_UP:
+	case ACT_SPR_FAR_DOWN: case ACT_SPR_FAR_UP: {
+		// The strengths in 0.1 steps, session only: the characters' near / far, the stage's rest.
+		bool up = act == ACT_SPR_NEAR_UP || act == ACT_BG_REST_UP || act == ACT_SPR_FAR_UP;
+		volatile float *p = act <= ACT_SPR_NEAR_UP ? &g_sprRest[SPR_CHARS]
+		                  : act <= ACT_BG_REST_UP  ? &g_sprRest[SPR_STAGE] : &g_sprFar;
+		const char *name = act <= ACT_SPR_NEAR_UP ? "SPRITES NEAR" : act <= ACT_BG_REST_UP ? "BG REST" : "SPRITES FAR";
+		float r = floorf(*p * 10.0f + 0.5f) / 10.0f + (up ? 0.1f : -0.1f);
 		r = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
-		g_sprRest[layer] = r;
+		*p = r;
+		if (g_filterCfg != FILTER_AUTO) {       // Auto: this session's Auto only; leaving it brings the chosen value back
+			if (p == &g_sprRest[SPR_STAGE]) { g_cfgBgRest = r; g_auto[AUTO_BGREST] = false; }
+			else if (p == &g_sprFar)        g_cfgSprFar = r;
+			else                            g_cfgSprNear = r;
+		}
 		char msg[32], num[16];
 		formatHundredths(r, num);
-		wsprintfA(msg, "%s REST %s", layer == SPR_CHARS ? "SPRITES" : "BG", num);
+		wsprintfA(msg, "%s %s", name, num);
 		showOsd(msg);
-		logf("hotkey: %s rest strength -> %.2f", layer == SPR_CHARS ? "sprites" : "background", (double)r);
+		logf("hotkey: %s strength -> %.2f", name, (double)r);
+		break;
+	}
+	case ACT_SPR_FARZOOM_DOWN: case ACT_SPR_FARZOOM_UP: {
+		// The camera zoom where the characters reach the far strength, in 0.05 steps, session only.
+		float z = floorf(g_sprFarZoom * 20.0f + 0.5f) / 20.0f + (act == ACT_SPR_FARZOOM_UP ? 0.05f : -0.05f);
+		z = z < SPR_FARZOOM_MIN ? SPR_FARZOOM_MIN : z > SPR_FARZOOM_MAX ? SPR_FARZOOM_MAX : z;
+		g_sprFarZoom = z;
+		if (g_filterCfg != FILTER_AUTO) { g_cfgFarZoom = z; g_auto[AUTO_FARZOOM] = false; }
+		char msg[32], num[16];
+		formatHundredths(z, num);
+		wsprintfA(msg, "SPRITES FAR AT %s", num);
+		showOsd(msg);
+		logf("hotkey: SPRITES FAR AT zoom -> %.2f", (double)z);
 		break;
 	}
 	case ACT_MSAA: {
@@ -2863,13 +3076,15 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		atexit(persistState);
 		CloseHandle(CreateThread(nullptr, 0, deviceWatchThread, nullptr, 0, nullptr));
 	}
-	logf("DisplayManager initialized: enabled=%d mode=%s fsScale=x%d winScale=x%d custom=%dx%d src=%dx%d "
-	     "resizable=%d persist=%d pos=%s(%d,%d) persistPos=%d borderless=%d vsync=%d allowWinKey=%d "
-	     "latinInput=%d multiSample=%d windowedFilter=%d spriteSharpness=%.2f backgroundSharpness=%.2f rest=%.2f/%.2f dpiAware=%d",
-	     g_enabled, modeName(), g_intScale, g_winScale, g_customW, g_customH, g_srcW, g_srcH,
-	     g_resizable, g_persist, g_havePos ? "" : "unset ", g_posX, g_posY, g_persistPos, g_borderless, g_vsync,
-	     g_allowWinKey, g_latinPending, g_msaaCfg, g_winFilter, (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE],
-	     (double)g_sprRest[SPR_CHARS], (double)g_sprRest[SPR_STAGE], g_dpiOn);
+	logf("DisplayManager initialized: enabled=%d filter=%s sharpness=%s mode=%s fsScale=x%d winScale=x%d "
+	     "custom=%dx%d src=%dx%d resizable=%d persist=%d pos=%s(%d,%d) persistPos=%d borderless=%d vsync=%d "
+	     "allowWinKey=%d latinInput=%d multiSample=%d windowedFilter=%d spriteSharpness=%.2f "
+	     "backgroundSharpness=%.2f spriteStrength=%.2f..%.2f@zoom%.2f bgRest=%.2f dpiAware=%d",
+	     g_enabled, filterName(), g_auto[AUTO_SHARP] ? "Auto" : "fixed", modeName(), g_intScale, g_winScale,
+	     g_customW, g_customH, g_srcW, g_srcH, g_resizable, g_persist, g_havePos ? "" : "unset ", g_posX, g_posY,
+	     g_persistPos, g_borderless, g_vsync, g_allowWinKey, g_latinPending, g_msaaCfg,
+	     g_winFilter, (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE], (double)g_sprRest[SPR_CHARS],
+	     (double)g_sprFar, (double)g_sprFarZoom, (double)g_sprRest[SPR_STAGE], g_dpiOn);
 	return TRUE;
 }
 

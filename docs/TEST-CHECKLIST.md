@@ -193,3 +193,28 @@ per-monitor-aware script (physical pixels); WindowScale=x2.
 3. CC2, `DpiAware=0`: unaware, stretched by Windows (x2 doesn't fit at 150%, so x1 = 960x720 physical; 800x600 on the
    125% monitor) - the old behaviour. **Verified 2026-10-07.**
 4. Not tested: Windows 7 / 8.1 fallbacks (system aware / per-monitor v1), exclusive fullscreen on the 125% monitor.
+
+## 1.2.0 — Auto filter, per-scale defaults, zoom-following characters
+
+Values picked 2026-10-08 (docs/calibration/CALIBRATION.md).
+
+1. Ini upgrade from the v1.1.2 ini (Copy install, launched windowed): as shipped -> `Filter=Sharp`, `Sharpness=Auto`,
+   `Xbr*=Auto`, IniVersion 1.2.0; `Filter=Point` + `Sharpness=2.25` -> both kept;
+   `PersistState=0` + `PersistPosition=0` (no rewrite) -> ini untouched, loaded as Sharpness Auto (2.00 at x1/x2).
+   **Verified 2026-10-08.**
+2. `Filter=Auto`, windowed x1 (x2 column): Sharpness 2.00, characters 1.50 / stage 1.75, both layers drawn in
+   Practice. x2.25 and x3 columns in the README captures (4.00, 1.50 / 4.00; 2.50, 1.75 / 2.50). **Verified
+   2026-10-08.**
+3. Alt+F into and out of Auto restores your own Sharpness / sprite / stage values; the Sharpness and sprite keys in
+   Auto change only Auto's live values (until the output size, the filter or fullscreen changes). (User test.)
+4. Characters at the farthest zoom (Reisen idle in a corner, the other player in the opposite one): no blur (the
+   strength fades to the near strength within 0.1 of a whole-number scale). **Verified by the user 2026-10-08.**
+   Also watch for a visible switch near the resting zoom (x2). (User test.)
+5. Sprite hooks are now installed by default (`CycleFilter` is bound and reaches Auto): netplay, a replay and the
+   PracticeEx menu on the MAIN install with its usual mods. (User test.)
+6. Dust Storm seam (user report: with Auto, a 1-pixel dust-coloured line along the scrolling dust when zoomed out,
+   not at zoom 1.0): the dust quad (512x128, u 0.01..1.01, v 0..1) kept WRAP on both axes, so at its top edge the
+   vertical blend wrapped to the texture's bottom row. CLAMP vs the game's addressing is now chosen per axis (dust:
+   v clamped, u wraps). Practice, Dust Storm forced, P1 at the left wall (zoom 0.762, quad top at y 316): row 316
+   yellower than its neighbours on 154 px (mean +1.83) before, 86 px (+0.36, the texture's own noise) after.
+   **Verified 2026-10-08.**

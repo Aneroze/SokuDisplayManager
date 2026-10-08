@@ -10,18 +10,23 @@ Fullscreen size (`Mode`):
 - `CustomResolution`: an exact size in pixels.
 
 Upscale filter (`Filter`), in fullscreen and, with `WindowedFilter=1` (default), windowed:
-- `Sharp` (default): sharp-bilinear with adjustable `Sharpness`. At the default 1.5 it closely matches WindowResizer's look.
-- `Point`: hard pixels. Pixels are only even at integer scales.
+- `Point` (default): hard pixels. Pixels are only even at integer scales.
 - `Linear`: bilinear.
+- `Sharp`: sharp-bilinear with adjustable `Sharpness`. Pixels stay crisp, with a thin blend at their edges so they all come out the same size. `Sharpness=Auto` (default) uses the value picked for the output size: 2.00 at ×2, 4.00 at ×2.25, 2.50 at ×3. Around 1.5 it closely matches WindowResizer's look.
 - `xBR`: the xBR-lv2 pixel-art upscaler. It smooths diagonal and curved sprite edges and keeps flat areas crisp.
+- `Auto`: `Sharp` plus the (experimental) [sharp sprites](#sharp-sprites-experimental) for the characters and the stage, all with the values picked for the output size (the nearest of ×2, ×2.25 and ×3). Your own `Sharpness` and sprite settings aren't used while it is on and come back when you switch to another filter.
 
-The same frame at ×3 with each filter (a crop at 100%; open the image for full size):
+The same frame with each filter at its default values, at ×2.25 (1080p fullscreen) and ×3 (1440p fullscreen). The players are far apart, so the camera is zoomed out (0.76) and `Auto`'s character filter is mostly in. Crops at 100%; open an image for full size.
 
-![Point, Linear, Sharp 1.25 / 1.50 / 1.75 and xBR at ×3](docs/images/filters-x3.png)
+![Point, Linear, Sharp 4.00, xBR and Auto at ×2.25](docs/images/filters-x2.25.png)
 
-### Sharp sprites (experimental, off by default)
+![Point, Linear, Sharp 2.50, xBR and Auto at ×3](docs/images/filters-x3.png)
 
-The game itself zooms the characters and the stage with its camera and draws them with hard pixels, so at most zoom levels some sprite pixels come out wider than others and edges crawl while the camera moves. Uncomment `SpriteSharpness` (characters, 2.5 suggested) and/or `BackgroundSharpness` (stage, 1.5 suggested) in the ini to draw them with a sharp-bilinear shader instead: each sprite pixel stays crisp inside and only its edges get a thin blend. This happens in the game's own frame, so it works with any `Filter`, in fullscreen and windowed. While the lines are commented out, nothing is changed.
+### Sharp sprites (experimental)
+
+The game itself zooms the characters and the stage with its camera and draws them with hard pixels, so at most zoom levels some sprite pixels come out wider than others and edges crawl while the camera moves. Sharp sprites draw them with a sharp-bilinear shader instead: each sprite pixel stays crisp inside and only its edges get a thin blend. This happens in the game's own frame, so it works with any `Filter`, in fullscreen and windowed. `Filter=Auto` turns them on; with any other filter, uncomment `SpriteSharpness` (characters) and/or `BackgroundSharpness` (stage) in the ini. While those lines are commented out, nothing is changed.
+
+The characters' filter follows the camera: close together (the resting zoom, where they are drawn at exactly 2×) they keep the game's hard pixels, and the further apart they are, the more the filter takes over (`SpriteNearStrength`, `SpriteFarStrength`, `SpriteFarZoom`). Near a whole-number scale (2× at rest, 1× at the farthest zoom) it fades back to the near strength, because there the hard pixels are already even and the filter could only blur them.
 
 ## Hotkeys
 
@@ -31,12 +36,12 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | --- | --- | --- |
 | Alt+1…6 | `Scale1`…`Scale6` | Fullscreen: `IntegerScaling` at ×N. Windowed: resize the window to ×N. |
 | Alt+0 | `FitToScreen` | Switch to `FitToScreen`. |
-| Alt+F | `CycleFilter` | Cycle the filter. |
-| Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` (switches to Sharp). |
-| Alt+S / C / E / W | `XbrStrength` / `XbrCorner` / `XbrSlopes` / `XbrWidth` | Development, commented out in the ini by default: cycle an xBR setting (switches to xBR). Not saved. |
-| Alt+G / H / J | `SharpSprites` / `SpriteSharpnessDown` / `SpriteSharpnessUp` | Experimental, commented out in the ini by default: turn [sharp sprites](#sharp-sprites-experimental-off-by-default) on/off for the characters / lower / raise their `SpriteSharpness`. Not saved. |
+| Alt+F | `CycleFilter` | Cycle the filter: Point → Linear → Sharp → xBR → Auto. |
+| Alt+K / Alt+L | `SharpnessDown` / `SharpnessUp` | Lower / raise `Sharpness` by 0.25 (with Shift: 0.05). Switches to Sharp, except from Auto, where it changes only Auto's value until the output size or the filter changes. |
+| Alt+S / C / E / W | `XbrStrength` / `XbrCorner` / `XbrSlopes` / `XbrWidth` | Development, commented out in the ini by default: cycle an xBR setting (switches to xBR; Shift reverses Strength and Width). Not saved. |
+| Alt+G / H / J | `SharpSprites` / `SpriteSharpnessDown` / `SpriteSharpnessUp` | Experimental, commented out in the ini by default: turn [sharp sprites](#sharp-sprites-experimental) on/off for the characters / lower / raise their `SpriteSharpness` (with Shift: 0.1 steps). Not saved. |
 | Alt+B / U / I | `SharpBackground` / `BackgroundSharpnessDown` / `BackgroundSharpnessUp` | The same for the stage (`BackgroundSharpness`). |
-| Alt+R / T, Alt+Z / X | `SpriteRestStrengthDown` / `Up`, `BackgroundRestStrengthDown` / `Up` | Tuning, commented out by default: lower / raise `SpriteRestStrength` / `BackgroundRestStrength` in 0.1 steps. Not saved. |
+| Alt+R / T, Alt+V / N, Alt+Y / O, Alt+Z / X | `SpriteNearStrengthDown` / `Up`, `SpriteFarStrengthDown` / `Up`, `SpriteFarZoomDown` / `Up`, `BackgroundRestStrengthDown` / `Up` | Tuning, commented out by default: lower / raise `SpriteNearStrength`, `SpriteFarStrength`, `SpriteFarZoom` and `BackgroundRestStrength`. Not saved. |
 | (none) | `ToggleMSAA` | Not in the default ini (add e.g. `ToggleMSAA=M` under `[Hotkeys]`). Turn MSAA on (`MultiSample`, or ×8 if that is 0) / off, in fullscreen and (with `WindowedFilter=1`) windowed. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
 
@@ -64,15 +69,17 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `WindowScale` | `x2` | Window size as a multiple of 640×480, capped to the monitor's work area. Falls back to `FullscreenScale` if missing. |
 | `CustomWidth` / `CustomHeight` | `1280` / `960` | Size for `Mode=CustomResolution`. |
 | `BackgroundColor` | `000000` | Border color, `RRGGBB`. |
-| `Filter` | `Sharp` | Upscale filter, see [Scaling](#scaling). |
+| `Filter` | `Point` | Upscale filter, see [Scaling](#scaling). |
 | `MultiSample` | `0` | Not in the default ini (add it under `[Display]`). MSAA (fullscreen, and windowed with `WindowedFilter=1`): `0` (off), `2`, `4` or `8`. Only smooths polygon edges; the game's sprites and stages aren't noticeably affected. |
-| `XbrStrength` | `0.65` | For `Filter=xBR`: `0.0` (plain pixels) to `1.0` (full xBR). |
-| `XbrCorner` | `B` | For `Filter=xBR`: `A` (roundest) to `D` (keeps more corners and small details). |
-| `XbrSlopes` | `0` | For `Filter=xBR`: `1` = also smooth 30°/60° edges, `0` = 45° diagonals only. |
-| `XbrWidth` | `2.0` | For `Filter=xBR`: width of the smoothed band at edges (`1.0` = standard xBR). |
-| `SpriteSharpness` / `BackgroundSharpness` | commented out (off) | Experimental [sharp sprites](#sharp-sprites-experimental-off-by-default) for the characters / the stage: `0.5` (smooth) to `16` (about the same as the game's hard pixels). Suggested `2.5` / `1.5`. Commented out, blank or `0` = off. |
-| `SpriteRestStrength` / `BackgroundRestStrength` | `0` / `0.5` (commented out) | With sharp sprites on, at the camera's resting zoom (exactly 2x for the characters, 1x for the stage), where the game's pixels are already even: `0` = the game's own look, `1` = the full filter (smooth as the camera drifts by fractions of a pixel, slightly soft at some camera positions), in between a mix. |
-| `Sharpness` | `1.50` | For `Filter=Sharp`: `1.0` (bilinear) to `4.0` (about the same as point). |
+| `XbrStrength` | `Auto` | For `Filter=xBR`: `0.0` (plain pixels) to `1.0` (full xBR). `Auto`: 0.65 at ×2, 0.50 at ×2.25, 0.80 at ×3. |
+| `XbrCorner` | `Auto` | For `Filter=xBR`: `A` (roundest) to `D` (keeps more corners and small details). `Auto`: B at ×2, C at ×2.25 and ×3. |
+| `XbrSlopes` | `Auto` | For `Filter=xBR`: `1` = also smooth 30°/60° edges, `0` = 45° diagonals only. `Auto`: 0. |
+| `XbrWidth` | `Auto` | For `Filter=xBR`: width of the smoothed band at edges (`1.0` = standard xBR). `Auto`: 2.0 at ×2, 0.50 at ×2.25, 0.75 at ×3. |
+| `SpriteSharpness` / `BackgroundSharpness` | commented out (off) | Experimental [sharp sprites](#sharp-sprites-experimental) for the characters / the stage: `0.5` (smooth) to `16` (about the same as the game's hard pixels). Picked: 1.5 / 1.75 at ×2, 1.5 / 4.0 at ×2.25, 1.75 / 2.5 at ×3 (what `Filter=Auto` uses, and what the toggle hotkeys turn on while these are commented out). Commented out, blank or `0` = off. |
+| `SpriteNearStrength` / `SpriteFarStrength` | `0` / `1` (commented out) | The characters' filter strength (`0` = the game's own hard pixels, `1` = the full filter, in between a mix) at the camera's resting zoom 1.0, and at `SpriteFarZoom` and further out; linear in between. |
+| `SpriteFarZoom` | `Auto` (commented out) | The camera zoom (1.0 = players close together, 0.5 = as far out as it goes) where `SpriteFarStrength` is reached, `0.5`-`0.95`. `Auto`: 0.70 at ×2 and ×3, 0.65 at ×2.25. |
+| `BackgroundRestStrength` | `Auto` (commented out) | The stage's filter strength at its resting zoom (exactly 1×), where its hard pixels are already even: `0` = the game's own look, `1` = the full filter (smooth as the camera drifts by fractions of a pixel, slightly soft at some camera positions). `Auto`: 0.3 at ×2 and ×3, 0.5 at ×2.25. |
+| `Sharpness` | `Auto` | For `Filter=Sharp`: `1.0` (bilinear) to `4.0` (about the same as point). `Auto`: 2.00 at ×2, 4.00 at ×2.25, 2.50 at ×3 (the nearest of those). |
 | `Resizable` | `1` | Allow resizing the window by dragging its edges (kept at 4:3). |
 | `DpiAware` | `1` | Who handles Windows' display scaling (125%, 150%, ...) for the game window: `1` = DisplayManager (Windows never stretches the window, sizes are real screen pixels on every monitor), `0` = Windows (stretches the whole window, blurry; also on a monitor with a different scale when th123.exe has the "Override high DPI scaling behavior" setting). Needs a restart. |
 | `WindowedFilter` | `1` | Use `Filter` in windowed mode too. The backbuffer is sized to the window, so a window resize resets the device once (a short hitch after a drag or a Scale key; the image is stretched during a drag). `0` = the game's plain bilinear stretch. |
@@ -83,7 +90,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `FullscreenWidth` / `FullscreenHeight` / `FullscreenRefresh` | `0` | Force a fullscreen display mode instead of the monitor's current one. The refresh rate is only used when width and height are set. |
 | `VSync` | `-1` | Exclusive fullscreen only. `-1` = the game's setting (off in vanilla), `0` = off, `1` = on. |
 | `Log` | `0` | Write `DisplayManager.log` next to the ini. |
-| `StartInLatinInput` (`[Input]`) | `0` | `1` = when the game window first comes up with a Chinese / Japanese / Korean input method on in its native mode (which composes from the game's keys, so its pop-up keeps appearing), switch to an installed non-CJK keyboard (English US first); with none, set the input method as its own toggle key would (Chinese / Japanese: off; Korean: English mode). Never disables it: switch back any time to chat (Shift in Pinyin, Han/Eng in Korean, Hankaku/Zenkaku in Japanese, Alt+Shift / Ctrl+Shift if enabled in Windows, the taskbar's language button; Win+Space needs `AllowWinKey=1`, since the game blocks the Windows key). With Windows' default shared input method this switches it for the whole desktop, as switching by hand does. |
+| `StartInLatinInput` (`[Input]`) | `0` | Very experimental. `1` = when the game window first comes up with a Chinese / Japanese / Korean input method on in its native mode (which composes from the game's keys, so its pop-up keeps appearing), switch to an installed non-CJK keyboard (English US first); with none, set the input method as its own toggle key would (Chinese / Japanese: off; Korean: English mode). Never disables it: switch back any time to chat (Shift in Pinyin, Han/Eng in Korean, Hankaku/Zenkaku in Japanese, Alt+Shift / Ctrl+Shift if enabled in Windows, the taskbar's language button; Win+Space needs `AllowWinKey=1`, since the game blocks the Windows key). With Windows' default shared input method this switches it for the whole desktop, as switching by hand does. |
 | `AllowWinKey` (`[Input]`) | `0` | `1` = let the Windows key through; the base game blocks it. Needs a restart. In exclusive fullscreen, opening the Start menu minimizes the game. |
 
 ## Notes
