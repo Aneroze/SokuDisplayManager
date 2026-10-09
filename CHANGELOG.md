@@ -3,6 +3,9 @@
 ## 1.2.0 — 2026-10-08
 
 **Added**
+- Settings menu (Alt+M, `Menu` in `[Hotkeys]`; `[Menu] Scale` sets its size): a mouse-driven in-game menu (Dear ImGui)
+  for the size, filter, `Sharpness`, `Xbr*`, sharp sprites and MSAA settings, with a Save button. Drawn on the finished
+  frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened.
 - `PersistPosition=1` (default): the window position is saved on exit and restored at launch.
 - `Filter=Auto`: Sharp plus sharp sprites, with values picked for the output size (the nearest of x2, x2.25 = 1080p
   and x3 = 1440p fullscreen). Your own Sharpness and sprite settings come back when you switch to another filter.

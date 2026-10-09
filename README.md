@@ -28,6 +28,10 @@ The game itself zooms the characters and the stage with its camera and draws the
 
 The characters' filter follows the camera: close together (the resting zoom, where they are drawn at exactly 2×) they keep the game's hard pixels, and the further apart they are, the more the filter takes over (`SpriteNearStrength`, `SpriteFarStrength`, `SpriteFarZoom`). Near a whole-number scale (2× at rest, 1× at the farthest zoom) it fades back to the near strength, because there the hard pixels are already even and the filter could only blur them.
 
+## Settings menu
+
+Alt+M opens an in-game menu ([Dear ImGui](https://github.com/ocornut/imgui)) with the settings the hotkeys change and more: the fullscreen size (`Mode`, scales, custom size), the window scale, always-on-top, the border color, the filter and its `Sharpness`, the `Xbr*` settings, the [sharp sprites](#sharp-sprites-experimental), MSAA and the menu's own size. Changes apply at once. It is mouse-only (the game keeps reading the keyboard while it is open, so the menu takes no keys), and the mouse doesn't reach the game while it is shown. **Save settings** writes them to the ini, whatever `PersistState` says; with `PersistState=1` they are also saved when the game exits. The menu is drawn on DisplayManager's finished frame, so it is available wherever DisplayManager composites (fullscreen, and windowed with `WindowedFilter=1`). Never opened, it costs nothing.
+
 ## Hotkeys
 
 The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkeys]` section; a blank or commented-out line disables that hotkey.
@@ -42,8 +46,9 @@ The modifier is Alt by default. Keys and modifier can be changed in the `[Hotkey
 | Alt+G / H / J | `SharpSprites` / `SpriteSharpnessDown` / `SpriteSharpnessUp` | Experimental, commented out in the ini by default: turn [sharp sprites](#sharp-sprites-experimental) on/off for the characters / lower / raise their `SpriteSharpness` (with Shift: 0.1 steps). Not saved. |
 | Alt+B / U / I | `SharpBackground` / `BackgroundSharpnessDown` / `BackgroundSharpnessUp` | The same for the stage (`BackgroundSharpness`). |
 | Alt+R / T, Alt+V / N, Alt+Y / O, Alt+Z / X | `SpriteNearStrengthDown` / `Up`, `SpriteFarStrengthDown` / `Up`, `SpriteFarZoomDown` / `Up`, `BackgroundRestStrengthDown` / `Up` | Tuning, commented out by default: lower / raise `SpriteNearStrength`, `SpriteFarStrength`, `SpriteFarZoom` and `BackgroundRestStrength`. Not saved. |
-| (none) | `ToggleMSAA` | Not in the default ini (add e.g. `ToggleMSAA=M` under `[Hotkeys]`). Turn MSAA on (`MultiSample`, or ×8 if that is 0) / off, in fullscreen and (with `WindowedFilter=1`) windowed. Not saved. |
+| (none) | `ToggleMSAA` | Not in the default ini (add e.g. `ToggleMSAA=A` under `[Hotkeys]`). Turn MSAA on (`MultiSample`, or ×8 if that is 0) / off, in fullscreen and (with `WindowedFilter=1`) windowed. Not saved. |
 | Alt+P | `AlwaysOnTop` | Toggle always-on-top. |
+| Alt+M | `Menu` | Open / close the [settings menu](#settings-menu). |
 
 Scale and filter changes are shown briefly on screen (windowed only with `WindowedFilter=1`).
 
@@ -91,6 +96,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 | `VSync` | `-1` | Exclusive fullscreen only. `-1` = the game's setting (off in vanilla), `0` = off, `1` = on. |
 | `Log` | `0` | Write `DisplayManager.log` next to the ini. |
 | `StartInLatinInput` (`[Input]`) | `0` | Very experimental. `1` = when the game window first comes up with a Chinese / Japanese / Korean input method on in its native mode (which composes from the game's keys, so its pop-up keeps appearing), switch to an installed non-CJK keyboard (English US first); with none, set the input method as its own toggle key would (Chinese / Japanese: off; Korean: English mode). Never disables it: switch back any time to chat (Shift in Pinyin, Han/Eng in Korean, Hankaku/Zenkaku in Japanese, Alt+Shift / Ctrl+Shift if enabled in Windows, the taskbar's language button; Win+Space needs `AllowWinKey=1`, since the game blocks the Windows key). With Windows' default shared input method this switches it for the whole desktop, as switching by hand does. |
+| `Scale` (`[Menu]`) | `Auto` | The [settings menu](#settings-menu)'s size: `Auto` (by screen height: ×1 below 900 px, ×1.25 from 900, ×1.5 from 1300, ×2 from 2000) or a factor from `0.75` to `3`. |
 | `AllowWinKey` (`[Input]`) | `0` | `1` = let the Windows key through; the base game blocks it. Needs a restart. In exclusive fullscreen, opening the Start menu minimizes the game. |
 
 ## Notes
@@ -120,6 +126,8 @@ It only loads into the th123 1.10a executable (checked by hash) and needs nothin
 
 - **Windows (MSVC):** run `build.bat`. It finds Visual Studio with `vswhere`. Output: `build\DisplayManager.dll`.
 - **mingw-w64:** run `./build.sh` with `g++-mingw-w64-i686` installed.
+
+The settings menu needs [Dear ImGui](https://github.com/ocornut/imgui) in `third_party/imgui` (see its [README](third_party/imgui/README.md)); all builds compile it in.
 
 Both embed `DisplayManager.ini` in the DLL (`src/DisplayManager.rc`) as the template older inis are upgraded from.
 The version is set in `src/version.h`; on a release also bump `mod.json`'s `version` and `IniVersion` in

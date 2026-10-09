@@ -218,3 +218,25 @@ Values picked 2026-10-08 (docs/calibration/CALIBRATION.md).
    v clamped, u wraps). Practice, Dust Storm forced, P1 at the left wall (zoom 0.762, quad top at y 316): row 316
    yellower than its neighbours on 154 px (mean +1.83) before, 86 px (+0.36, the texture's own noise) after.
    **Verified 2026-10-08.**
+
+## Settings menu (Alt+M)
+
+Build with Dear ImGui in `third_party/imgui` (see its README). Set `Log=1`; `menu: open` / `menu: closed` are logged.
+
+1. **Open / close**: Alt+M, the Close button and the window's X close it. Fullscreen (exclusive and borderless) and
+   windowed with `WindowedFilter=1`; windowed with `WindowedFilter=0` logs `menu: not available`.
+2. **Mouse**: the cursor is drawn (the Windows one is hidden over the client); clicks, drags and the wheel work; the game
+   gets none of them. Drag a slider and let go outside the window: the button isn't stuck (release capture).
+3. **Alt+Tab / lock screen while open**, then back: no stuck button, the menu still draws (Reset recreates ImGui's buffers).
+4. **Alt+Enter with the menu open**, both ways, and a windowed drag-resize: the menu survives the Reset at the new size.
+5. **Size** (`Mode`, scales, custom size, window scale), **Always on top**, **Border color**: apply live, like the hotkeys.
+6. **Filter** Point/Linear/Sharp/xBR/Auto: the output changes at once; Auto greys out the Sharpness and sprite controls.
+   With the default ini (no sprite hotkeys, `CycleFilter` bound) the sharp sprites can be switched on from the menu.
+7. **xBR / Sharp sprites / MSAA**: the Auto checkboxes keep the live value when unticked; MSAA x2/x4/x8 recreate the targets
+   without a hitch or a black frame.
+8. **Menu size**: Auto by screen height; the slider rescales fonts and widgets; `[Menu] Scale` applies at startup.
+9. **Save settings**: with `PersistState=0` the button still writes `Mode`, scales, `Filter`, `Sharpness` and the menu's
+   keys (`BackgroundColor`, `Custom*`, `Xbr*`, sprite values, `MultiSample`); an ini the menu never touched stays
+   byte-identical after exit; with `PersistState=1` a touched menu is saved on exit.
+10. **Other mods**: PracticeEx's menu doesn't show a copy in the top-left while the menu is open; SokuDirectXOptimizations
+    (rendering on its own thread) with `use_d3d9ex=0`; `DisplayManager_AddOverlay` overlays still draw under the menu.

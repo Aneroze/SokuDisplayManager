@@ -44,9 +44,20 @@ endif()
 configure_file(${CMAKE_SOURCE_DIR}/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 
+# Dear ImGui (the in-game settings menu, src/DisplayManagerMenu.h): vendored in third_party/imgui, see its README.
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp" OR NOT EXISTS "${IMGUI_DIR}/backends/imgui_impl_dx9.cpp")
+  message(FATAL_ERROR "Dear ImGui is missing: copy it to third_party/imgui (see third_party/imgui/README.md)")
+endif()
+
 # target
 add_library(DisplayManager SHARED
   src/DisplayManager.cpp
+  ${IMGUI_DIR}/imgui.cpp
+  ${IMGUI_DIR}/imgui_draw.cpp
+  ${IMGUI_DIR}/imgui_tables.cpp
+  ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
   src/DisplayManager.rc
   ${CMAKE_BINARY_DIR}/version.rc
 )
@@ -55,6 +66,7 @@ set_source_files_properties(src/DisplayManager.rc PROPERTIES OBJECT_DEPENDS "${C
 
 target_include_directories(DisplayManager PRIVATE
   ${CMAKE_SOURCE_DIR}/src
+  ${IMGUI_DIR}
   ${CMAKE_SOURCE_DIR}             # DisplayManager.ini, for DisplayManager.rc
 )
 

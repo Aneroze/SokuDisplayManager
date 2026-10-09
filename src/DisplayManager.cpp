@@ -43,7 +43,8 @@
 // If WindowResizer, IntegerFullscreen or ExclusiveFullscreen is loaded, DM detects it at device creation
 // and passes everything through.
 //
-// Self-contained: Windows SDK headers only, no d3d9.lib import (Direct3DCreate9 is hooked via the IAT).
+// Self-contained: Windows SDK headers and Dear ImGui (third_party/imgui, compiled in, for the settings menu in
+// DisplayManagerMenu.h), no d3d9.lib import (Direct3DCreate9 is hooked via the IAT).
 
 #include <windows.h>
 #include <Shlwapi.h>
@@ -55,6 +56,8 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include "imgui.h"                     // the settings menu (DisplayManagerMenu.h)
+#include "backends/imgui_impl_dx9.h"
 #include "sharpbilinear.h"   // compiled ps_2_0 bytecode: g_sharpBilinearPS[]
 #include "xbr.h"             // compiled ps_2_b bytecode: g_xbrPS2b[]
 #include "sharpsprite.h"     // compiled ps_2_0 bytecode: g_sharpSpritePS[]
@@ -213,10 +216,25 @@ enum Action { ACT_FIT = 0, ACT_S1, ACT_S2, ACT_S3, ACT_S4, ACT_S5, ACT_S6, ACT_T
               ACT_SHARP_DOWN, ACT_SHARP_UP, ACT_MSAA, ACT_XBR_STRENGTH, ACT_XBR_CORNER, ACT_XBR_SLOPES,
               ACT_XBR_WIDTH, ACT_SPR_TOGGLE, ACT_SPR_DOWN, ACT_SPR_UP, ACT_BG_TOGGLE, ACT_BG_DOWN, ACT_BG_UP,
               ACT_SPR_NEAR_DOWN, ACT_SPR_NEAR_UP, ACT_BG_REST_DOWN, ACT_BG_REST_UP, ACT_SPR_FAR_DOWN, ACT_SPR_FAR_UP,
-              ACT_SPR_FARZOOM_DOWN, ACT_SPR_FARZOOM_UP, ACT_COUNT };
+              ACT_SPR_FARZOOM_DOWN, ACT_SPR_FARZOOM_UP, ACT_MENU, ACT_COUNT };
 enum ModKey { MODK_ALT = 0, MODK_CTRL, MODK_SHIFT, MODK_WIN, MODK_NONE }; // MOD_* are taken by winuser.h
 static int g_hotkeyVk[ACT_COUNT];      // filled by loadConfig
 static int g_modifier = MODK_ALT;
+
+// The in-game settings menu (Dear ImGui): DisplayManagerMenu.h, included after doAction. Declared here for the code
+// that comes before it (the Present hook, releaseCapture, wndProc, persistState).
+static volatile bool g_menuOpen  = false;   // shown (window thread toggles it, the render thread draws it)
+static bool          g_menuTouched = false; // the menu changed something: persistState also writes what it sets
+static float         g_menuScaleCfg = 0.0f; // [Menu] Scale / the menu's size slider; 0 = Auto (by screen height)
+static UINT          g_menuMsg   = 0;       // private registered message: a menu command for the window thread
+static bool menuShown();
+static void menuToggle();
+static bool menuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res);
+static void menuCommand(int cmd, LPARAM value);
+static void menuRender(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb);
+static void menuInvalidate();
+static void menuPersist();
+static void persistSettings();
 
 // ---- runtime state -------------------------------------------------------------------------------
 static volatile bool g_createDeviceHooked = false;   // (volatile: polled by the device-watch thread)
@@ -745,6 +763,7 @@ static void releaseMsaa() {
 }
 
 static void releaseCapture() {
+	menuInvalidate();               // ImGui's D3DPOOL_DEFAULT buffers / font texture go too (it makes them again)
 	releaseMsaa();
 	g_bbSurf = nullptr;
 	if (g_stateBlock)  { g_stateBlock->Release();  g_stateBlock = nullptr; }
@@ -1102,6 +1121,7 @@ static HRESULT WINAPI mySCPresent(IDirect3DSwapChain9 *sc, const RECT *src, cons
 			}
 			runOverlays(DM_OVERLAY_DRAW, dev, bb, &dstRect);
 			if (GetTickCount() < g_osdUntil) drawOsd(dev, bb, &dstRect);   // hotkey readout (Alt+K/L/F/0-6)
+			if (menuShown()) menuRender(dev, bb);                         // the settings menu, on top of everything
 			g_inPost = false;
 			bb->Release();
 			g_composited = true;
@@ -2311,7 +2331,7 @@ static void loadConfig() {
 	                                 "SpriteSharpnessUp", "SharpBackground", "BackgroundSharpnessDown",
 	                                 "BackgroundSharpnessUp", "SpriteNearStrengthDown", "SpriteNearStrengthUp",
 	                                 "BackgroundRestStrengthDown", "BackgroundRestStrengthUp", "SpriteFarStrengthDown",
-	                                 "SpriteFarStrengthUp", "SpriteFarZoomDown", "SpriteFarZoomUp" };
+	                                 "SpriteFarStrengthUp", "SpriteFarZoomDown", "SpriteFarZoomUp", "Menu" };
 	for (int a = 0; a < ACT_COUNT; a++) {
 		char k[16] = {0};
 		GetPrivateProfileStringA("Hotkeys", names[a], "", k, sizeof(k), g_iniPath);
@@ -2327,6 +2347,13 @@ static void loadConfig() {
 	              g_hotkeyVk[ACT_FILTER];
 	for (int a = ACT_SPR_TOGGLE; a <= ACT_SPR_FARZOOM_UP; a++)
 		if (g_hotkeyVk[a]) g_sprWanted = true;
+	if (g_hotkeyVk[ACT_MENU]) g_sprWanted = true;   // the menu can turn the sharp sprites on
+	{   // [Menu] Scale: Auto (also blank or missing) = by screen height, else a factor 0.75..3
+		char v[32] = {0};
+		GetPrivateProfileStringA("Menu", "Scale", "", v, sizeof(v), g_iniPath);
+		float f = (float)atof(v);
+		g_menuScaleCfg = f < 0.75f ? 0.0f : f > 3.0f ? 3.0f : f;
+	}
 	resolveSettings();
 }
 
@@ -2355,6 +2382,13 @@ static void persistState() {
 	if (!g_enabled) return;                 // (g_enabled is cleared when standing down for another mod)
 	persistPosition();
 	if (!g_persist) return;
+	persistSettings();
+	if (g_menuTouched) menuPersist();       // the rest of what the menu sets (DisplayManagerMenu.h)
+}
+
+// Mode, FullscreenScale, WindowScale, Filter and Sharpness: PersistState's part, also what the menu's Save button writes
+// (whatever PersistState says).
+static void persistSettings() {
 	char scale[16];
 	wsprintfA(scale, "x%d", g_intScale);
 	writeIniIfChanged("Mode", modeName());
@@ -2629,6 +2663,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 		onWindowResized();
 		return 0;
 	}
+	if (g_menuMsg && msg == g_menuMsg) {     // a command from the menu (the render thread): wp = command, lp = value
+		menuCommand((int)wp, lp);
+		return 0;
+	}
+	{   // the settings menu takes the mouse while it is shown
+		LRESULT mres = 0;
+		if (menuWndProc(h, msg, wp, lp, &mres)) return mres;
+	}
 	if (g_latinMsg && msg == g_latinMsg) {   // StartInLatinInput: now, or from the timer once the window is foreground
 		startInLatinInput(h);
 		if (g_latinPending && !g_latinTimer) g_latinTimer = SetTimer(nullptr, 0, 200, latinTimerProc);
@@ -2701,6 +2743,7 @@ static void installWndProc() {
 	if (!g_applyMsg)  g_applyMsg  = RegisterWindowMessageA("DisplayManager.ApplyWindowState");
 	if (!g_resizeMsg) g_resizeMsg = RegisterWindowMessageA("DisplayManager.WindowResized");
 	if (!g_latinMsg)  g_latinMsg  = RegisterWindowMessageA("DisplayManager.StartInLatinInput");
+	if (!g_menuMsg)   g_menuMsg   = RegisterWindowMessageA("DisplayManager.MenuCommand");
 	// Record the original before swapping, so a message dispatched in between (the install can run off the
 	// window thread, from the device watch) never finds it null.
 	g_origWndProc = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
@@ -2935,8 +2978,14 @@ static void doAction(int act) {
 		logf("hotkey: MSAA -> %d", (int)g_msaaCfg);
 		break;
 	}
+	case ACT_MENU:
+		menuToggle();
+		break;
 	}
 }
+
+// The settings menu. After doAction: it reads and writes the same settings the hotkeys do.
+#include "DisplayManagerMenu.h"
 
 static bool modifierDown() {
 	switch (g_modifier) {
