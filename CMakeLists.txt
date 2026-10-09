@@ -46,9 +46,6 @@ configure_file(${CMAKE_SOURCE_DIR}/version.rc.in ${CMAKE_BINARY_DIR}/version.rc 
 
 # Dear ImGui (the in-game settings menu, src/DisplayManagerMenu.h): vendored in third_party/imgui, see its README.
 set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
-if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp" OR NOT EXISTS "${IMGUI_DIR}/backends/imgui_impl_dx9.cpp")
-  message(FATAL_ERROR "Dear ImGui is missing: copy it to third_party/imgui (see third_party/imgui/README.md)")
-endif()
 
 # target
 add_library(DisplayManager SHARED
@@ -74,6 +71,10 @@ target_compile_definitions(DisplayManager PRIVATE
   _CRT_SECURE_NO_WARNINGS
   WINVER=0x0601
   _WIN32_WINNT=0x0601
+  IMGUI_DISABLE_WIN32_FUNCTIONS          # see third_party/imgui/README.md
+  IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS
+  IMGUI_DISABLE_DEMO_WINDOWS
+  IMGUI_DISABLE_DEBUG_TOOLS
 )
 # generator specified
 if(MSVC)

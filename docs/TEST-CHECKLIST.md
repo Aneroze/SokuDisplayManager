@@ -234,7 +234,9 @@ Build with Dear ImGui in `third_party/imgui` (see its README). Set `Log=1`; `men
    With the default ini (no sprite hotkeys, `CycleFilter` bound) the sharp sprites can be switched on from the menu.
 7. **xBR / Sharp sprites / MSAA**: the Auto checkboxes keep the live value when unticked; MSAA x2/x4/x8 recreate the targets
    without a hitch or a black frame.
-8. **Menu size**: Auto by screen height; the slider rescales fonts and widgets; `[Menu] Scale` applies at startup.
+8. **Menu size**: Auto by screen height; the slider rescales fonts and widgets when let go; `[Menu] Scale` applies at
+   startup. The text is crisp at every size (`menu: font Segoe UI <n> px` logged); with `segoeui.ttf` missing (Wine),
+   `menu: font built-in` at 13 / 26 / 39 px.
 9. **Save settings**: with `PersistState=0` the button still writes `Mode`, scales, `Filter`, `Sharpness` and the menu's
    keys (`BackgroundColor`, `Custom*`, `Xbr*`, sprite values, `MultiSample`); an ini the menu never touched stays
    byte-identical after exit; with `PersistState=1` a touched menu is saved on exit.

@@ -13,15 +13,16 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="$ROOT/build"
 mkdir -p "$OUT"
 
-# Dear ImGui (the settings menu), vendored in third_party/imgui - see its README.
+# Dear ImGui (the settings menu), vendored in third_party/imgui - see its README for the IMGUI_* defines.
 IMGUI="$ROOT/third_party/imgui"
-[ -f "$IMGUI/imgui.cpp" ] || { echo "Dear ImGui is missing: copy it to third_party/imgui, see third_party/imgui/README.md" >&2; exit 1; }
 
 # Embeds the shipped DisplayManager.ini (the template older inis are upgraded from).
 "${WINDRES:-i686-w64-mingw32-windres}" -I"$ROOT" "$ROOT/src/DisplayManager.rc" -O coff -o "$OUT/DisplayManager.res.o"
 
 "$CXX" -std=c++17 -O2 -shared \
-  -D_CRT_SECURE_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
+  -D_CRT_SECURE_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 -DNDEBUG \
+  -DIMGUI_DISABLE_WIN32_FUNCTIONS -DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS \
+  -DIMGUI_DISABLE_DEMO_WINDOWS -DIMGUI_DISABLE_DEBUG_TOOLS \
   -I"$ROOT/src" -I"$IMGUI" \
   "$ROOT/src/DisplayManager.cpp" "$OUT/DisplayManager.res.o" \
   "$IMGUI/imgui.cpp" "$IMGUI/imgui_draw.cpp" "$IMGUI/imgui_tables.cpp" "$IMGUI/imgui_widgets.cpp" \

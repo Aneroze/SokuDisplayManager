@@ -29,6 +29,7 @@ static MenuEvent g_menuQ[MENU_QUEUE];
 static int       g_menuQN = 0;
 static SRWLOCK   g_menuQLock = SRWLOCK_INIT;
 static int       g_menuBtnMask = 0;      // mouse buttons held while the menu is shown (window thread)
+static bool      g_menuTracking = false; // TrackMouseEvent asked for the WM_MOUSELEAVE (window thread)
 
 static void menuPush(int type, float a = 0.0f, float b = 0.0f) {
 	AcquireSRWLockExclusive(&g_menuQLock);
@@ -60,6 +61,7 @@ static bool menuShown() {
 
 // Window thread. True = handled, *res is the message's result; false = the game gets it.
 static bool menuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res) {
+	if (msg == WM_MOUSELEAVE) g_menuTracking = false;   // (one-shot, whether or not the menu is still shown)
 	if (!menuShown()) {
 		if (g_menuBtnMask) {                       // the menu went away with a button down: let go of the mouse
 			g_menuBtnMask = 0;
@@ -74,9 +76,20 @@ static bool menuWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, LRESULT *res) {
 		*res = TRUE;
 		return true;
 	case WM_MOUSEMOVE:
+		if (!g_menuTracking) {                     // windowed: hear when the cursor leaves the client area
+			TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, h, 0 };
+			g_menuTracking = TrackMouseEvent(&t) != FALSE;
+		}
 		menuPushPos(h, lp);
 		*res = 0;
 		return true;
+	case WM_MOUSELEAVE:                            // hide ImGui's cursor, or it stays drawn at the edge
+		menuPush(MEV_POS, -FLT_MAX, -FLT_MAX);
+		*res = 0;
+		return true;
+	case WM_CAPTURECHANGED:                        // lost the capture mid-drag (e.g. another window took it)
+		if (g_menuBtnMask && (HWND)lp != h) { g_menuBtnMask = 0; menuPush(MEV_RELEASE_ALL); }
+		return false;
 	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
 	case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: {
@@ -167,6 +180,35 @@ static DWORD            g_menuSavedAt  = 0;         // GetTickCount() of the las
 // The menu's size when [Menu] Scale is Auto: the screen height decides (1.0 below 900 px up to 2.0 from 2000 px).
 static float menuAutoScale() {
 	return g_bbH >= 2000 ? 2.0f : g_bbH >= 1300 ? 1.5f : g_bbH >= 900 ? 1.25f : 1.0f;
+}
+
+// The menu's font, rasterized at its size on screen (stretching a 1x atlas with io.FontGlobalScale blurs it): Segoe UI
+// (every Windows since Vista), else - Wine, usually - ImGui's built-in pixel font at the nearest whole multiple of its
+// 13 px, the only sizes where it stays crisp. Render thread, outside NewFrame..Render; the backend's font texture is
+// dropped so the next NewFrame uploads the new atlas.
+static void menuBuildFont(float scale) {
+	ImFontAtlas *fonts = ImGui::GetIO().Fonts;
+	fonts->Clear();
+	ImFontConfig cfg;
+	cfg.PixelSnapH = true;                         // glyphs on whole pixels: no 1x atlas is ever stretched
+	cfg.OversampleH = cfg.OversampleV = 1;         // (oversampling only helps sub-pixel positions)
+	const float size = floorf(15.0f * scale + 0.5f), builtinSize = 13.0f * floorf(scale + 0.5f);   // (scale >= 0.75)
+	char path[MAX_PATH * 3] = {0};
+	wchar_t dir[MAX_PATH + 32];
+	UINT n = GetWindowsDirectoryW(dir, MAX_PATH);  // ImGui opens files by UTF-8 path
+	if (n && n < MAX_PATH) {
+		lstrcatW(dir, L"\\Fonts\\segoeui.ttf");
+		if (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES)
+			WideCharToMultiByte(CP_UTF8, 0, dir, -1, path, sizeof path, nullptr, nullptr);
+	}
+	const ImFont *f = path[0] ? fonts->AddFontFromFileTTF(path, size, &cfg) : nullptr;
+	if (!f) {
+		ImFontConfig def;
+		def.SizePixels = builtinSize;
+		fonts->AddFontDefault(&def);
+	}
+	ImGui_ImplDX9_InvalidateDeviceObjects();
+	logf("menu: font %s %d px (scale %.2f)", f ? "Segoe UI" : "built-in", (int)(f ? size : builtinSize), (double)scale);
 }
 
 static bool menuInit(IDirect3DDevice9 *dev) {
@@ -387,15 +429,15 @@ static void menuBody() {
 		}
 	}
 
-	if (ImGui::CollapsingHeader("Sharp sprites (experimental)")) {
+	if (ImGui::CollapsingHeader("Filtered sprites (experimental)")) {
 		ImGui::PushTextWrapPos(0.0f);
 		if (g_sprFailed)
 			ImGui::TextDisabled("Not available: the sprite shader could not be created.");
 		else if (af)
 			ImGui::TextDisabled("Filter is Auto: it sets these. Pick another filter to change them.");
 		else
-			ImGui::TextDisabled("Draws the characters and the stage with a sharp-bilinear shader instead of the "
-			                    "game's hard pixels.");
+			ImGui::TextDisabled("Filters the characters and the stage (sharp-bilinear) instead of drawing the game's "
+			                    "hard, uneven pixels.");
 		ImGui::PopTextWrapPos();
 		ImGui::BeginDisabled(af || g_sprFailed);
 		menuSpriteRow("Characters", SPR_CHARS, af);
@@ -415,7 +457,7 @@ static void menuBody() {
 		ImGui::EndDisabled();
 	}
 
-	if (ImGui::CollapsingHeader("Anti-aliasing")) {
+	if (ImGui::CollapsingHeader("Anti-aliasing (presently, mostly does nothing)")) {
 		int cur = 0;
 		for (int i = 0; i < 4; i++) if (MENU_MSAA[i] == (int)g_msaaCfg) cur = i;
 		if (ImGui::Combo("MSAA", &cur, "Off\0x2\0x4\0x8\0")) {
@@ -434,8 +476,16 @@ static void menuBody() {
 		if (ImGui::Checkbox("Auto", &a)) g_menuScaleCfg = a ? 0.0f : g_menuScale;
 		ImGui::SameLine();
 		ImGui::BeginDisabled(a);
-		float v = a ? g_menuScale : g_menuScaleCfg;
-		if (ImGui::SliderFloat("Menu size", &v, 0.75f, 3.0f, "x%.2f", ImGuiSliderFlags_AlwaysClamp)) g_menuScaleCfg = v;
+		// Applied on release: rescaling mid-drag would move the slider under the mouse and rebuild the font each frame.
+		static float drag = 0.0f;
+		static bool  dragging = false;
+		float v = dragging ? drag : a ? g_menuScale : g_menuScaleCfg;
+		ImGui::SliderFloat("Menu size", &v, 0.75f, 3.0f, "x%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (ImGui::IsItemActive()) { drag = v; dragging = true; }
+		if (ImGui::IsItemDeactivated()) {
+			dragging = false;
+			if (ImGui::IsItemDeactivatedAfterEdit()) g_menuScaleCfg = drag;
+		}
 		ImGui::EndDisabled();
 		ImGui::PopID();
 		ImGui::TextDisabled("For a size at startup: [Menu] Scale in the ini.");
@@ -465,6 +515,18 @@ static void menuBody() {
 	ImGui::PopTextWrapPos();
 }
 
+// The menu window as of the last frame, and the display size / menu size it was placed for (0 = never shown).
+static ImVec2 g_menuWinPos, g_menuWinSize, g_menuLastDisp;
+static float  g_menuLastScale = 0.0f;
+static bool   g_menuWinCollapsed = false;
+
+// Where a window edge goes when the free space beside it changes from oldFree to newFree: the same fraction of it, so
+// a window against the right / bottom edge stays there.
+static float menuKeepPlace(float pos, float oldFree, float newFree) {
+	if (newFree <= 0.0f) return 0.0f;
+	return oldFree > 0.0f ? pos * newFree / oldFree : 0.0f;
+}
+
 static void menuBuild() {
 	const float s = g_menuScale;
 	const ImVec2 disp = ImGui::GetIO().DisplaySize;
@@ -472,11 +534,38 @@ static void menuBuild() {
 	if (h > 640.0f * s) h = 640.0f * s;
 	ImGui::SetNextWindowPos(ImVec2(24.0f * s, 24.0f * s), ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(480.0f * s, h), ImGuiCond_FirstUseEver);
+	// The display (windowed Alt+1..6, fullscreen <-> windowed) or the menu size changed since the last frame shown: the
+	// window keeps its place relative to the screen and its size relative to the menu's. ImGui would keep its absolute
+	// position, which can leave it mostly off a smaller screen.
+	if (g_menuLastScale > 0.0f &&
+	    (disp.x != g_menuLastDisp.x || disp.y != g_menuLastDisp.y || s != g_menuLastScale)) {
+		ImVec2 size = g_menuWinSize;
+		if (!g_menuWinCollapsed) {                 // (collapsed, its size is the title bar's: leave the full size alone)
+			size = ImVec2(size.x * s / g_menuLastScale, size.y * s / g_menuLastScale);
+			if (size.x > disp.x) size.x = disp.x;
+			if (size.y > disp.y) size.y = disp.y;
+			ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+		}
+		ImGui::SetNextWindowPos(ImVec2(menuKeepPlace(g_menuWinPos.x, g_menuLastDisp.x - g_menuWinSize.x, disp.x - size.x),
+		                               menuKeepPlace(g_menuWinPos.y, g_menuLastDisp.y - g_menuWinSize.y, disp.y - size.y)),
+		                        ImGuiCond_Always);
+	}
 	ImGui::SetNextWindowSizeConstraints(ImVec2(320.0f * s, 160.0f * s), disp);
 	bool open = true;
 	if (ImGui::Begin("DisplayManager " DM_VERSION "###DisplayManagerMenu", &open, ImGuiWindowFlags_NoSavedSettings))
 		menuBody();
+	{   // Always entirely on screen, so it can't be dragged (or left) out of reach.
+		const ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+		const float maxX = disp.x - sz.x > 0.0f ? disp.x - sz.x : 0.0f, maxY = disp.y - sz.y > 0.0f ? disp.y - sz.y : 0.0f;
+		const ImVec2 c(p.x < 0.0f ? 0.0f : p.x > maxX ? maxX : p.x, p.y < 0.0f ? 0.0f : p.y > maxY ? maxY : p.y);
+		if (c.x != p.x || c.y != p.y) ImGui::SetWindowPos(c);
+		g_menuWinPos = c;
+		g_menuWinSize = sz;
+		g_menuWinCollapsed = ImGui::IsWindowCollapsed();
+	}
 	ImGui::End();
+	g_menuLastDisp = disp;
+	g_menuLastScale = s;
 	if (!open) menuPost(MCMD_CLOSE, 0);
 }
 
@@ -523,10 +612,11 @@ static void menuRender(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb) {
 		ImGuiStyle &st = ImGui::GetStyle();
 		st = g_menuBaseStyle;
 		st.ScaleAllSizes(want);
-		io.FontGlobalScale = want;
+		menuBuildFont(want);
 	}
 
-	ImGui_ImplDX9_NewFrame();
+	ImGui_ImplDX9_NewFrame();                      // (re)creates the backend's buffers / font texture after a Reset
+	if (!io.Fonts->TexID) return;                  // couldn't (device lost?): try again next frame
 	ImGui::NewFrame();
 	menuBuild();
 	ImGui::Render();
@@ -552,6 +642,13 @@ static void menuRender(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb) {
 // The settings persistState doesn't write (it has Mode, the scales, Filter and Sharpness): the border color, the
 // custom size, the xBR knobs, the sharp sprites' values and MSAA. Only called once the menu changed something (or by
 // its Save button), so an ini the menu never touched stays as it is. Auto values are written as Auto.
+// A key the ini doesn't have (commented out, as most of these ship) is only added when its value isn't what the
+// missing key already means (`asMissing`): WritePrivateProfileString would append it at the end of [Display].
+static void menuWriteKey(const char *key, const char *val, bool asMissing) {
+	if (asMissing && !iniHasKey(key)) return;
+	writeIniIfChanged(key, val);
+}
+
 static void menuPersist() {
 	char v[32];
 	wsprintfA(v, "%02X%02X%02X", (UINT)((g_bgColor >> 16) & 0xFF), (UINT)((g_bgColor >> 8) & 0xFF), (UINT)(g_bgColor & 0xFF));
@@ -561,29 +658,30 @@ static void menuPersist() {
 	wsprintfA(v, "%d", g_customH);
 	writeIniIfChanged("CustomHeight", v);
 
-	struct Num { const char *key; bool autoVal; float val; };
+	// Missing = Auto, or the fixed value `missing` (asAuto false).
+	struct Num { const char *key; bool autoVal; float val; bool asAuto; float missing; };
 	const Num nums[] = {
-		{ "XbrStrength",            g_auto[AUTO_XBR_STRENGTH], g_xbrStrength },
-		{ "XbrWidth",               g_auto[AUTO_XBR_WIDTH],    g_xbrWidth },
-		{ "SpriteFarZoom",          g_auto[AUTO_FARZOOM],      g_cfgFarZoom },
-		{ "BackgroundRestStrength", g_auto[AUTO_BGREST],       g_cfgBgRest },
-		{ "SpriteNearStrength",     false,                     g_cfgSprNear },
-		{ "SpriteFarStrength",      false,                     g_cfgSprFar },
+		{ "XbrStrength",            g_auto[AUTO_XBR_STRENGTH], g_xbrStrength, true,  0.0f },
+		{ "XbrWidth",               g_auto[AUTO_XBR_WIDTH],    g_xbrWidth,    true,  0.0f },
+		{ "SpriteFarZoom",          g_auto[AUTO_FARZOOM],      g_cfgFarZoom,  true,  0.0f },
+		{ "BackgroundRestStrength", g_auto[AUTO_BGREST],       g_cfgBgRest,   true,  0.0f },
+		{ "SpriteNearStrength",     false,                     g_cfgSprNear,  false, 0.0f },
+		{ "SpriteFarStrength",      false,                     g_cfgSprFar,   false, 1.0f },
 	};
 	for (const Num &n : nums) {
 		if (n.autoVal) lstrcpyA(v, "Auto"); else formatHundredths(n.val, v);
-		writeIniIfChanged(n.key, v);
+		menuWriteKey(n.key, v, n.asAuto ? n.autoVal : fabsf(n.val - n.missing) < 0.005f);
 	}
 	if (g_auto[AUTO_XBR_CORNER]) lstrcpyA(v, "Auto"); else { v[0] = (char)('A' + g_xbrCorner); v[1] = 0; }
-	writeIniIfChanged("XbrCorner", v);
+	menuWriteKey("XbrCorner", v, g_auto[AUTO_XBR_CORNER]);
 	if (g_auto[AUTO_XBR_SLOPES]) lstrcpyA(v, "Auto"); else lstrcpyA(v, g_xbrSlopes ? "1" : "0");
-	writeIniIfChanged("XbrSlopes", v);
+	menuWriteKey("XbrSlopes", v, g_auto[AUTO_XBR_SLOPES]);
 
-	const char *const sprKeys[SPR_LAYERS] = { "SpriteSharpness", "BackgroundSharpness" };   // 0 = off
+	const char *const sprKeys[SPR_LAYERS] = { "SpriteSharpness", "BackgroundSharpness" };   // 0 / missing = off
 	for (int l = 0; l < SPR_LAYERS; l++) {
 		if (g_cfgSprK[l] > 0.0f) formatHundredths(g_cfgSprK[l], v); else lstrcpyA(v, "0");
-		writeIniIfChanged(sprKeys[l], v);
+		menuWriteKey(sprKeys[l], v, g_cfgSprK[l] <= 0.0f);
 	}
 	wsprintfA(v, "%d", (int)g_msaaCfg);
-	writeIniIfChanged("MultiSample", v);
+	menuWriteKey("MultiSample", v, g_msaaCfg == 0);
 }
