@@ -4,8 +4,9 @@
 
 **Added**
 - Settings menu (Alt+M, `Menu` in `[Hotkeys]`; `[Menu] Scale` sets its size): a mouse-driven in-game menu (Dear ImGui)
-  for the size, filter, `Sharpness`, `Xbr*`, filtered sprites and MSAA settings, with a Save button. Drawn on the finished
-  frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened. Contributed by Burukyu.
+  for the size, filter, `Sharpness`, `Xbr*`, filtered sprites, MSAA, `PersistState` and `PersistPosition` settings, with
+  a Save button. Drawn on the finished frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened.
+  Contributed by Burukyu.
 
 **Changed**
 - Ini upgrades now happen whatever `PersistState` / `PersistPosition` say (with both off, an older ini was never

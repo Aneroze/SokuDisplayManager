@@ -2706,9 +2706,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_SIZE:
 		if (wp != SIZE_MINIMIZED && !g_inSizeMove) postWindowResized();
 		break;
-	case WM_WINDOWPOSCHANGED: {   // PersistPosition: track the last normal-window position (see g_lastPos)
-		RECT r;
-		if (g_persistPos && !g_wantFullscreen && !g_windowFs && !g_borderlessActive && !g_applyPending &&
+	case WM_WINDOWPOSCHANGED: {   // PersistPosition: track the last normal-window position (see g_lastPos) - also while
+		RECT r;                   // it is off, as the menu can turn it on
+		if (!g_wantFullscreen && !g_windowFs && !g_borderlessActive && !g_applyPending &&
 		    !IsIconic(h) && !IsZoomed(h) && GetWindowRect(h, &r)) {
 			g_lastPos.x = r.left; g_lastPos.y = r.top; g_haveLastPos = true;
 		}

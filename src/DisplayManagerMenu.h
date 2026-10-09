@@ -492,6 +492,39 @@ static void menuBody() {
 	}
 
 	ImGui::Separator();
+	// PersistState / PersistPosition: written to the ini at once (they decide what happens at exit, so they can't wait
+	// for it). Turning PersistState off asks first: from then on the menu's changes are only kept with Save settings.
+	bool ps = g_persist;
+	if (ImGui::Checkbox("Save settings on exit (PersistState)", &ps)) {
+		if (ps) {
+			g_persist = true;
+			writeIniIfChanged("PersistState", "1");
+		} else {
+			ImGui::OpenPopup("Turn off PersistState?");
+		}
+	}
+	bool pp = g_persistPos;
+	if (ImGui::Checkbox("Remember the window position (PersistPosition)", &pp)) {
+		g_persistPos = pp;
+		writeIniIfChanged("PersistPosition", pp ? "1" : "0");
+	}
+	ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+	if (ImGui::BeginPopupModal("Turn off PersistState?", nullptr,
+	                           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+		ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+		ImGui::TextUnformatted("Changes made in this menu (or with the hotkeys) will no longer be saved when the game "
+		                       "exits. They will only be kept if you press Save settings before quitting.");
+		ImGui::PopTextWrapPos();
+		if (ImGui::Button("Turn off")) {
+			g_persist = false;
+			writeIniIfChanged("PersistState", "0");
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+		ImGui::EndPopup();
+	}
+
 	if (ImGui::Button("Save settings")) {
 		persistSettings();                         // Mode, scales, Filter, Sharpness...
 		menuPersist();                             // ...and the rest of what is set here
@@ -504,8 +537,8 @@ static void menuBody() {
 		ImGui::TextDisabled("Saved.");
 	}
 	ImGui::PushTextWrapPos(0.0f);
-	ImGui::TextDisabled("%s", g_persist ? "The settings are saved when the game exits (PersistState=1)."
-	                                    : "PersistState=0: the settings are only saved with the button above.");
+	ImGui::TextDisabled("%s", g_persist ? "The settings are saved when the game exits."
+	                                    : "The settings are only saved with Save settings.");
 	ImGui::TextDisabled("Borderless, VSync, DPI handling and the other options are in DisplayManager.ini.");
 	if (g_hotkeyVk[ACT_MENU]) {
 		static const char *const mods[] = { "Alt", "Ctrl", "Shift", "Win", "" };
