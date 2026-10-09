@@ -67,7 +67,7 @@ Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `IniVersion` | the mod's version | Written by the mod: the version that last updated the ini. A newer version rewrites an older ini as its own default ini with your settings kept (new options and notes appear; your own comments don't survive). Needs `PersistState` or `PersistPosition` on. |
+| `IniVersion` | the mod's version | Written by the mod: the version that last updated the ini. A newer version rewrites an older ini as its own default ini with your settings kept (new options and notes appear; your own comments don't survive). Done whatever `PersistState` / `PersistPosition` say; a read-only ini is left alone. |
 | `Enabled` | `1` | Master switch. |
 | `Mode` | `FitToScreen` | Fullscreen size, see [Scaling](#scaling). |
 | `FullscreenScale` | `x2` | Scale for `Mode=IntegerScaling`. Called `IntegerScaling` before 1.0.4; old ini files are still read. |

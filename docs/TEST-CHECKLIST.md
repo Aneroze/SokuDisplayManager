@@ -240,5 +240,7 @@ Build with Dear ImGui in `third_party/imgui` (see its README). Set `Log=1`; `men
 9. **Save settings**: with `PersistState=0` the button still writes `Mode`, scales, `Filter`, `Sharpness` and the menu's
    keys (`BackgroundColor`, `Custom*`, `Xbr*`, sprite values, `MultiSample`); an ini the menu never touched stays
    byte-identical after exit; with `PersistState=1` a touched menu is saved on exit.
-10. **Other mods**: PracticeEx's menu doesn't show a copy in the top-left while the menu is open; SokuDirectXOptimizations
+10. **Ini upgrade with both Persist keys at 0**: an older ini (IniVersion below the build) is still rebuilt and gets
+    `Menu=M`.
+11. **Other mods**: PracticeEx's menu doesn't show a copy in the top-left while the menu is open; SokuDirectXOptimizations
     (rendering on its own thread) with `use_d3d9ex=0`; `DisplayManager_AddOverlay` overlays still draw under the menu.

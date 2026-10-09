@@ -8,6 +8,8 @@
   frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened. Contributed by Burukyu.
 
 **Changed**
+- Ini upgrades now happen whatever `PersistState` / `PersistPosition` say (with both off, an older ini was never
+  upgraded, so it never got new hotkeys such as `Menu`).
 - Sharp sprites are now called filtered sprites: with them off, the game's own hard pixels are the uneven ones, so
   "sharp" was misleading. Only the name changed; the ini keys (`SpriteSharpness`, `BackgroundSharpness`,
   `SharpSprites`...) are the same.

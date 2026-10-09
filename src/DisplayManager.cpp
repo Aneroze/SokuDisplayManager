@@ -2151,12 +2151,14 @@ static bool writeIniFile(const std::string &text) {
 	return false;
 }
 
-// Rebuild an ini older than this build from the embedded template (see above). Only when the user lets us write
-// the ini (PersistState or PersistPosition); skipped for UTF-16 inis and on any error, which leaves the file as it
-// is - loadConfig still reads old inis correctly.
+// Rebuild an ini older than this build from the embedded template (see above). Whatever PersistState and
+// PersistPosition say: they are about saving the session's settings, while this is a one-time update of the file's
+// format that keeps every value - and the only way an existing ini gets a new hotkey (a missing one is disabled).
+// Skipped for UTF-16 inis and on any error (e.g. a read-only file), which leaves the file as it is - loadConfig still
+// reads old inis correctly.
 static void upgradeIni() {
 	const ULONGLONG from = iniVersion();
-	if (from >= parseVersion(DM_VERSION) || !(g_persist || g_persistPos)) return;
+	if (from >= parseVersion(DM_VERSION)) return;
 	HRSRC res = FindResourceA(g_module, "DM_DEFAULT_INI", MAKEINTRESOURCEA(10));   // RT_RCDATA
 	HGLOBAL h = res ? LoadResource(g_module, res) : nullptr;
 	const char *data = h ? (const char *)LockResource(h) : nullptr;
