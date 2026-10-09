@@ -231,8 +231,8 @@ Build with Dear ImGui in `third_party/imgui` (see its README). Set `Log=1`; `men
 4. **Alt+Enter with the menu open**, both ways, and a windowed drag-resize: the menu survives the Reset at the new size.
 5. **Size** (`Mode`, scales, custom size, window scale), **Always on top**, **Border color**: apply live, like the hotkeys.
 6. **Filter** Point/Linear/Sharp/xBR/Auto: the output changes at once; Auto greys out the Sharpness and sprite controls.
-   With the default ini (no sprite hotkeys, `CycleFilter` bound) the sharp sprites can be switched on from the menu.
-7. **xBR / Sharp sprites / MSAA**: the Auto checkboxes keep the live value when unticked; MSAA x2/x4/x8 recreate the targets
+   With the default ini (no sprite hotkeys, `CycleFilter` bound) the filtered sprites can be switched on from the menu.
+7. **xBR / Filtered sprites / MSAA**: the Auto checkboxes keep the live value when unticked; MSAA x2/x4/x8 recreate the targets
    without a hitch or a black frame.
 8. **Menu size**: Auto by screen height; the slider rescales fonts and widgets when let go; `[Menu] Scale` applies at
    startup. The text is crisp at every size (`menu: font Segoe UI <n> px` logged); with `segoeui.ttf` missing (Wine),

@@ -1344,7 +1344,7 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 			g_psSprite = nullptr;
 			g_sprFailed = true;
 			g_sprK[SPR_CHARS] = g_sprK[SPR_STAGE] = 0.0f;
-			logf("sharp sprites: CreatePixelShader failed (0x%08lx) - off", (long)hr);
+			logf("filtered sprites: CreatePixelShader failed (0x%08lx) - off", (long)hr);
 			if (sv->ps) sv->ps->Release();
 			return false;
 		}
@@ -1374,18 +1374,18 @@ static bool sprBegin(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT count, cons
 	if ((!sv->clampU || !sv->clampV) && !g_sprTiledLogged) {
 		g_sprTiledLogged = true;
 		const float *p0 = (const float *)data, *p3 = (const float *)((const BYTE *)data + (size_t)3 * stride);
-		logf("sharp sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f, at %.1f,%.1f..%.1f,%.1f) - "
+		logf("filtered sprites: first tiled %s draw (%ux%u texture, u %.2f..%.2f, v %.2f..%.2f, at %.1f,%.1f..%.1f,%.1f) - "
 		     "kept the game's addressing along %s", layer == SPR_CHARS ? "character" : "stage", tw, th, uMin, uMax, vMin,
 		     vMax, p0[0], p0[1], p3[0], p3[1], !sv->clampU && !sv->clampV ? "u and v" : !sv->clampU ? "u" : "v");
 	}
 	if (sv->ps && !g_sprTintLogged) {
 		g_sprTintLogged = true;
-		logf("sharp sprites: first %s draw with the game's weather tint (%.3f, %.3f, %.3f, %.3f)",
+		logf("filtered sprites: first %s draw with the game's weather tint (%.3f, %.3f, %.3f, %.3f)",
 		     layer == SPR_CHARS ? "character" : "stage", tint[0], tint[1], tint[2], tint[3]);
 	}
 	if (!g_sprLogged[layer]) {
 		g_sprLogged[layer] = true;
-		logf("sharp sprites: first %s draw (%ux%u texture, x%.2f/x%.2f, k=%.2f)",
+		logf("filtered sprites: first %s draw (%ux%u texture, x%.2f/x%.2f, k=%.2f)",
 		     layer == SPR_CHARS ? "character" : "stage", tw, th, su, svv, (double)g_sprK[layer]);
 	}
 	return true;
@@ -1422,7 +1422,7 @@ static void installSharpSpriteDetours() {
 	oStageBgA    = detourEntry(0x00470500, bgA, sizeof bgA, (void *)myStageBgA);
 	oStageBgB    = detourEntry(0x00470570, layer, sizeof layer, (void *)myStageBgB);
 	oStageFg     = detourEntry(0x004705D0, layer, sizeof layer, (void *)myStageFg);
-	logf("sharp sprites: sprites=%.2f background=%.2f; game draws hooked: characters %s, stage %d/%d/%d",
+	logf("filtered sprites: sprites=%.2f background=%.2f; game draws hooked: characters %s, stage %d/%d/%d",
 	     (double)g_sprK[SPR_CHARS], (double)g_sprK[SPR_STAGE], oPlayersDraw ? "ok" : "FAILED (entry already patched)",
 	     oStageBgA != nullptr, oStageBgB != nullptr, oStageFg != nullptr);
 }

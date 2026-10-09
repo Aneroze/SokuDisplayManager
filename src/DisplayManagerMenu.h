@@ -374,7 +374,7 @@ static void menuBody() {
 		}
 		if (af) {
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextDisabled("Auto is Sharp plus sharp sprites, with values picked for the output size. "
+			ImGui::TextDisabled("Auto is Sharp plus filtered sprites, with values picked for the output size. "
 			                    "Pick another filter to set them yourself.");
 			ImGui::PopTextWrapPos();
 		}

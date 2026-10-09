@@ -4,8 +4,13 @@
 
 **Added**
 - Settings menu (Alt+M, `Menu` in `[Hotkeys]`; `[Menu] Scale` sets its size): a mouse-driven in-game menu (Dear ImGui)
-  for the size, filter, `Sharpness`, `Xbr*`, sharp sprites and MSAA settings, with a Save button. Drawn on the finished
+  for the size, filter, `Sharpness`, `Xbr*`, filtered sprites and MSAA settings, with a Save button. Drawn on the finished
   frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened. Contributed by Burukyu.
+
+**Changed**
+- Sharp sprites are now called filtered sprites: with them off, the game's own hard pixels are the uneven ones, so
+  "sharp" was misleading. Only the name changed; the ini keys (`SpriteSharpness`, `BackgroundSharpness`,
+  `SharpSprites`...) are the same.
 
 ## 1.2.0 — 2026-10-08
 
