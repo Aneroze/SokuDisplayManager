@@ -1,19 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-10-10
 
 **Added**
-- Settings menu (Alt+M, `Menu` in `[Hotkeys]`; `[Menu] Scale` sets its size): a mouse-driven in-game menu (Dear ImGui)
-  for the size, filter, `Sharpness`, `Xbr*`, filtered sprites, MSAA, `PersistState` and `PersistPosition` settings, with
-  a Save button. Drawn on the finished frame, fullscreen and windowed (`WindowedFilter=1`); costs nothing until opened.
-  Contributed by Burukyu.
+- Settings menu: Alt+M opens an in-game, mouse-driven menu (Dear ImGui) for the size, filter, sharpness, xBR,
+  filtered sprites, MSAA and Persist settings, with a Save button. Fullscreen, and windowed with `WindowedFilter=1`.
+  `[Menu] Scale` sets its size. Contributed by Burukyu.
 
 **Changed**
-- Ini upgrades now happen whatever `PersistState` / `PersistPosition` say (with both off, an older ini was never
-  upgraded, so it never got new hotkeys such as `Menu`).
-- Sharp sprites are now called filtered sprites: with them off, the game's own hard pixels are the uneven ones, so
-  "sharp" was misleading. Only the name changed; the ini keys (`SpriteSharpness`, `BackgroundSharpness`,
-  `SharpSprites`...) are the same.
+- Sharp sprites are renamed filtered sprites. The ini keys are unchanged.
+- Improved .ini management.
 
 ## 1.2.0 — 2026-10-08
 

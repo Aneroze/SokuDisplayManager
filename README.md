@@ -54,10 +54,9 @@ Scale and filter changes are shown briefly on screen (windowed only with `Window
 
 ## Install
 
-1. Extract the `DisplayManager` folder from the latest [release](https://github.com/Aneroze/SokuDisplayManager/releases/latest) into Soku's `modules` folder.
-2. Enable it in SokuLauncher, or add it to `SWRSToys.ini`.
-3. Disable WindowResizer, IntegerFullscreen and ExclusiveFullscreen. If any of them is loaded, DisplayManager turns itself off.
-4. In-game, Alt+Enter toggles fullscreen.
+1. Install it from SokuLauncher. Or extract the `DisplayManager` folder from the latest [release](https://github.com/Aneroze/SokuDisplayManager/releases/latest) into Soku's `modules` folder and enable it in SokuLauncher, or add it to `SWRSToys.ini`.
+2. Disable WindowResizer, IntegerFullscreen and ExclusiveFullscreen. If any of them is loaded, DisplayManager turns itself off.
+3. In-game, Alt+Enter toggles fullscreen.
 
 Changes between versions are in [CHANGELOG.md](CHANGELOG.md).
 
@@ -140,4 +139,4 @@ The version is set in `src/version.h`; on a release also bump `mod.json`'s `vers
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). Dear ImGui (compiled in for the settings menu) is MIT too: its notice is in `LICENSE-imgui.txt`.
