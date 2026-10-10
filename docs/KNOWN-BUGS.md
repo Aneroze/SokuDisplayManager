@@ -289,6 +289,22 @@ in the guard. (PracticeEx's UI still renders twice per frame, as before - just n
 install with the dupe reproducing: windowed Sharp, windowed xBR, borderless Sharp - clean; Resets (resize, Alt+Enter
 both ways) fine.
 
+## Observed: `Reset failed (0x88760868)` (device lost) when fullscreen is lost (2026-10-10)
+
+Seen once on MAIN (feat/settings-menu build), as the last line of a session: `Reset: Windowed=1 640x480`, then
+`Reset failed (0x88760868)` (D3DERR_DEVICELOST), the ini saved in the same second, the game closed by the user.
+
+**Not caused by closing.** Copy install, 2560x1440@144: closing from exclusive fullscreen (`WM_SYSCOMMAND SC_CLOSE`,
+like the X / Alt+F4) logs no Reset at all; closing from windowed is clean too (MAIN, same day). What logs a
+`Reset: Windowed=1` is **losing exclusive fullscreen**: minimizing the game (`SC_MINIMIZE`, like Alt+Tab or closing
+it from the taskbar) makes the game switch itself to windowed. That Reset succeeded in the test; the failure on MAIN
+fits a race where it runs before the lost device can be reset (TestCooperativeLevel not yet NOTRESET). Not
+reproduced on demand.
+
+**Harmless at exit.** In play it would leave the game's lost-device listeners' textures released (see "What the game
+does on Reset" below), which is the crash / no-render mechanism under investigation: a lead for that report (focus
+loss in exclusive fullscreen, e.g. Alt+Tab or a click on another monitor), not proof.
+
 ## Under investigation: random crash / frozen rendering around Alt+Enter (external report, 2026-09-28)
 > **Possibly explained by Bug 10** (2026-10-05, unconfirmed): any mod that records a state block after DM hooked
 > drops DM's Reset hook (before 1.1.1), which gives exactly this crash / no-render on the next Reset.

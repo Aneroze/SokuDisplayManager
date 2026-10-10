@@ -676,7 +676,7 @@ static void menuRender(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb) {
 // custom size, the xBR knobs, the sharp sprites' values and MSAA. Only called once the menu changed something (or by
 // its Save button), so an ini the menu never touched stays as it is. Auto values are written as Auto.
 // A key the ini doesn't have (commented out, as most of these ship) is only added when its value isn't what the
-// missing key already means (`asMissing`): WritePrivateProfileString would append it at the end of [Display].
+// missing key already means (`asMissing`); it then replaces its commented-out line (writeIniIfChanged).
 static void menuWriteKey(const char *key, const char *val, bool asMissing) {
 	if (asMissing && !iniHasKey(key)) return;
 	writeIniIfChanged(key, val);

@@ -2359,13 +2359,47 @@ static void loadConfig() {
 	resolveSettings();
 }
 
+// A key [Display] doesn't have but has commented out (";SpriteSharpness=1.5", as optional keys ship): write
+// "key=val" over that line, so the value sits under its explanation. False when there's no such line, or the file
+// can't be rewritten (UTF-16, I/O error).
+static bool uncommentIniKey(const char *key, const char *val) {
+	char *cur = readIniFile();
+	if (!cur) return false;
+	std::string text(cur);
+	free(cur);
+	const size_t keyLen = (size_t)lstrlenA(key);
+	bool inDisplay = false;
+	for (size_t pos = 0; pos < text.size();) {
+		size_t end = text.find('\n', pos);
+		if (end == std::string::npos) end = text.size();
+		size_t lineEnd = end > pos && text[end - 1] == '\r' ? end - 1 : end;
+		size_t i = text.find_first_not_of(" \t", pos);
+		if (i < lineEnd && text[i] == '[') {
+			inDisplay = lineEnd - i >= 9 && _strnicmp(text.c_str() + i, "[Display]", 9) == 0;
+		} else if (inDisplay && i < lineEnd && text[i] == ';') {
+			// ";Key=": no space after the ';' (prose comments have one, e.g. "; Filter=xBR tuning.")
+			size_t k = i + 1;
+			if (lineEnd - k > keyLen && _strnicmp(text.c_str() + k, key, keyLen) == 0) {
+				size_t eq = text.find_first_not_of(" \t", k + keyLen);
+				if (eq < lineEnd && text[eq] == '=') {
+					text.replace(pos, lineEnd - pos, std::string(key) + "=" + val);
+					return writeIniFile(text);
+				}
+			}
+		}
+		pos = end + 1;
+	}
+	return false;
+}
+
 // Write "Display"/key = val only if it differs from what's already in the ini, so an unchanged session
 // doesn't re-serialize the file (which would change its timestamp and prompt editors to reload it).
 static void writeIniIfChanged(const char *key, const char *val) {
 	char cur[64] = {0};
 	GetPrivateProfileStringA("Display", key, "\x01", cur, sizeof(cur), g_iniPath);  // sentinel default
-	if (lstrcmpA(cur, val) != 0)
-		WritePrivateProfileStringA("Display", key, val, g_iniPath);
+	if (lstrcmpA(cur, val) == 0) return;
+	if (lstrcmpA(cur, "\x01") == 0 && uncommentIniKey(key, val)) return;   // missing: over its commented line
+	WritePrivateProfileStringA("Display", key, val, g_iniPath);
 }
 
 // PersistPosition: write the window's last normal position (g_lastPos) as PositionX/Y, the next spawn position.
