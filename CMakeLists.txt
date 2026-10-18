@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
+cmake_policy(SET CMP0091 NEW) # in case
 # meta
 # The version lives in src/version.h (shared with build.bat); mod.json and the ini's IniVersion should match it.
 file(STRINGS "${CMAKE_SOURCE_DIR}/src/version.h" _dm_version_line REGEX "#define DM_VERSION ")
@@ -25,6 +26,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT WIN32)
     message(FATAL_ERROR "This project can only be build as x86(Win32).")
+endif()
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # generates version.rc
@@ -78,7 +82,6 @@ target_compile_definitions(DisplayManager PRIVATE
 )
 # generator specified
 if(MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   target_compile_options(DisplayManager PRIVATE /EHsc /nologo)
   target_compile_options(DisplayManager PRIVATE $<$<CONFIG:Release>:/O2>)
 else()
